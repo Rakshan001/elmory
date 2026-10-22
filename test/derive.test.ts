@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { RecordRow } from '../src/cache.js';
-import { Deriver, type DeriveInput } from '../src/derive.js';
+import { Deriver, type DeriveInput, FORGET_UNTRUSTED } from '../src/derive.js';
 import type { EvidenceDetail, EvidenceReport, Outcome } from '../src/evidence.js';
 import type { AddedBy } from '../src/git.js';
 import type { RecordType, Source } from '../src/record.js';
@@ -49,8 +49,15 @@ interface SetupOpts {
   untrusted?: string[];
   trust?: Partial<Trust>;
   addedBy?: Map<string, AddedBy>;
-  /** per-id evidence outcome (every source), `holds` by default */
-  outcomes?: Record<string, Outcome | { outcome: Outcome; detail: EvidenceDetail }>;
+  /** per-id evidence outcome: one for every source, or one per source; `holds` by default */
+  outcomes?: Record<string, OutcomeSpec | OutcomeSpec[]>;
+}
+
+type OutcomeSpec = Outcome | { outcome: Outcome; detail: EvidenceDetail };
+
+function report(set: OutcomeSpec, path: string): EvidenceReport {
+  const { outcome, detail } = typeof set === 'string' ? { outcome: set, detail: set === 'holds' ? 'found' : 'not-found' } : set;
+  return { outcome, detail, path } as EvidenceReport;
 }
 
 function setup(rows: RecordRow[], o: SetupOpts = {}): { d: Deriver; calls: string[] } {
@@ -66,9 +73,7 @@ function setup(rows: RecordRow[], o: SetupOpts = {}): { d: Deriver; calls: strin
   const evidence = async (row: RecordRow): Promise<EvidenceReport[]> => {
     calls.push(row.id);
     const set = o.outcomes?.[row.id] ?? 'holds';
-    const { outcome, detail }: { outcome: Outcome; detail: EvidenceDetail } =
-      typeof set === 'string' ? { outcome: set, detail: set === 'holds' ? 'found' : 'not-found' } : set;
-    return row.sources.map((s) => ({ outcome, detail, path: s.resource }));
+    return row.sources.map((s, i) => report(Array.isArray(set) ? (set[i] ?? 'holds') : set, s.resource));
   };
   const input: DeriveInput = {
     records: new Map(rows.map((r) => [r.id, r])),
@@ -206,6 +211,39 @@ describe('derive', () => {
     expect((await d.state('A')).state).toBe('superseded');
   });
 
+  it('a record that supersedes and cites the same id is suspect, and the older value is served', async () => {
+    const { d } = setup([rec('Y'), rec('X', { supersedes: ['Y'], cites: ['Y'] })]);
+    expect(await d.state('X')).toMatchObject({ state: 'suspect', reason: 'basis replaced', head: true });
+    const y = await d.state('Y');
+    expect(y).toMatchObject({ state: 'active', reason: null, head: false });
+    expect(y.labels).toContain(NEWER_FAILS);
+  });
+
+  it('cites that evaluation never follows do not make a cycle', async () => {
+    // T supersedes Y and cites U; U cites Y. Y is not a head, so U never waits on Y.
+    for (const untrusted of [['U'], []]) {
+      const { d } = setup(
+        [rec('Y'), rec('T', { supersedes: ['Y'], cites: ['U'] }), rec('U', { area: 'facts', cites: ['Y'] })],
+        { untrusted },
+      );
+      const y = await d.state('Y');
+      expect(y).toMatchObject({ state: 'active', reason: null });
+      expect(y.labels).toContain(NEWER_FAILS);
+      expect((await d.state('T')).reason).not.toBe('cycle');
+      expect((await d.state('U')).reason).not.toBe('cycle');
+    }
+    // An untrusted record's cites never change a trusted record's answer.
+    const without = setup([rec('Y'), rec('T', { supersedes: ['Y'], cites: ['U'] }), rec('U', { area: 'facts' })], {
+      untrusted: ['U'],
+    });
+    const withCite = setup(
+      [rec('Y'), rec('T', { supersedes: ['Y'], cites: ['U'] }), rec('U', { area: 'facts', cites: ['Y'] })],
+      { untrusted: ['U'] },
+    );
+    expect(await withCite.d.state('Y')).toEqual(await without.d.state('Y'));
+    expect(await withCite.d.state('T')).toEqual(await without.d.state('T'));
+  });
+
   it('citation pin: cited head replaced → suspect basis replaced; cited record forgotten → stale', async () => {
     const pinned = setup([rec('C', { title: 'the base' }), rec('X', { cites: ['C'] })]);
     const ok = await pinned.d.state('X');
@@ -222,6 +260,12 @@ describe('derive', () => {
       tombstones: [{ id: 'C', supersedes: [], committed: false }],
     });
     expect(await forgottenButPresent.d.state('X')).toMatchObject({ state: 'stale', reason: 'cited record gone' });
+
+    // Forgotten and also superseded: gone wins over basis replaced (stale before suspect).
+    const forgottenAndReplaced = setup([rec('C'), rec('C2', { supersedes: ['C'] }), rec('X', { cites: ['C'] })], {
+      tombstones: [{ id: 'C', supersedes: [], committed: false }],
+    });
+    expect(await forgottenAndReplaced.d.state('X')).toMatchObject({ state: 'stale', reason: 'cited record gone' });
 
     const failing = setup([rec('C'), rec('X', { cites: ['C'] })], { outcomes: { C: 'suspect' } });
     expect((await failing.d.state('X')).state).toBe('suspect');
@@ -266,9 +310,76 @@ describe('derive', () => {
     expect(signed.d.tombstoneTrusted(t)).toBe(true);
     expect((await signed.d.state('A')).state).toBe('forgotten');
 
+    // The local twin is what makes A forgotten; the committed copy is still judged on its own.
     const twin = setup([rec('A', { area: 'facts' })], { tombstones: [t, { id: 'A', supersedes: [], committed: false }] });
-    expect(twin.d.tombstoneTrusted(t)).toBe(true);
+    expect(twin.d.tombstoneTrusted(t)).toBe(false);
     expect((await twin.d.state('A')).state).toBe('forgotten');
+  });
+
+  it('an unsigned edit of a committed tombstone with a local twin does not supersede anything', async () => {
+    // F was forgotten and committed; an unsigned commit then edits .elmory/tombstones/F to name V.
+    const committed: Tombstone = { id: 'F', supersedes: ['V'], committed: true };
+    const local: Tombstone = { id: 'F', supersedes: [], committed: false };
+    for (const tombstones of [
+      [committed, local],
+      [local, committed],
+    ]) {
+      const { d } = setup([rec('V', { area: 'facts' })], { tombstones });
+      expect(d.chainOf('V')).toEqual(['V']);
+      expect(await d.state('V')).toMatchObject({ state: 'active', head: true, reason: null });
+    }
+    // Without the edit the local text still carries its own edges.
+    const honest = setup([rec('V')], { tombstones: [{ ...committed }, { ...local, supersedes: ['V'] }] });
+    expect(await honest.d.state('V')).toMatchObject({ state: 'superseded', reason: 'superseded by F' });
+  });
+
+  it('an untrusted tombstone on a head withholds it but does not bring back the older value', async () => {
+    const tomb: Tombstone = { id: 'X', supersedes: ['A'], committed: true };
+    const rows = [rec('A', { area: 'facts' }), rec('X', { area: 'facts', supersedes: ['A'] })];
+    const { d } = setup(rows, { tombstones: [tomb] });
+    expect(await d.state('X')).toMatchObject({ state: 'candidate', reason: FORGET_UNTRUSTED, trusted: true });
+    const a = await d.state('A');
+    expect(a).toMatchObject({ state: 'superseded', reason: 'superseded by X', head: false });
+    expect(a.labels).not.toContain(UNREVIEWED);
+    expect(d.heads(d.chainOf('A'))).toEqual(['X']);
+    expect(d.liveHeads(d.chainOf('A'))).toEqual([]);
+    const served = [...(await d.all()).values()].filter((s) => s.state === 'active' || s.state === 'conflict');
+    expect(served).toEqual([]);
+
+    // X is judged on its own evidence for its slot: when it fails here, A is served with the
+    // newer-value label, not the unreviewed one.
+    const failing = setup(rows, { tombstones: [tomb], outcomes: { X: 'stale' } });
+    const a2 = await failing.d.state('A');
+    expect(a2).toMatchObject({ state: 'active', head: false });
+    expect(a2.labels).toContain(NEWER_FAILS);
+    expect(a2.labels).not.toContain(UNREVIEWED);
+
+    // A co-head withheld this way still holds its slot: the other head stays in conflict.
+    const fork = setup([...rows, rec('Y', { supersedes: ['A'] })], { tombstones: [tomb] });
+    expect((await fork.d.state('Y')).state).toBe('conflict');
+    expect((await fork.d.state('X')).state).toBe('candidate');
+  });
+
+  it('liveHeads leaves out candidates, rejected records and forgotten heads', async () => {
+    const keyed = setup(
+      [rec('A', { key: 'k' }), rec('U', { key: 'k', area: 'facts' }), rec('R', { key: 'k' }), rec('E', { key: 'k', candidate: 'edited' })],
+      { untrusted: ['U'], trust: { rejected: new Set(['R']) } },
+    );
+    const chain = keyed.d.chainOf('k');
+    expect(keyed.d.heads(chain)).toEqual(['A', 'E', 'R', 'U']);
+    expect(keyed.d.liveHeads(chain)).toEqual(['A']);
+
+    // Forget the head C of a keyed chain: its file is gone and only the tombstone node is left.
+    const gone = setup([rec('A', { key: 'k' })], { tombstones: [{ id: 'C', supersedes: ['A'], committed: false }] });
+    expect(gone.d.heads(gone.d.chainOf('k'))).toEqual(['C']);
+    expect(gone.d.liveHeads(gone.d.chainOf('k'))).toEqual([]);
+
+    // Forgotten but still visible (e.g. in this worktree's committed facts): not live either.
+    const present = setup([rec('A', { key: 'k' }), rec('C', { key: 'k', supersedes: ['A'] })], {
+      tombstones: [{ id: 'C', supersedes: ['A'], committed: false }],
+    });
+    expect(present.d.heads(present.d.chainOf('k'))).toEqual(['C']);
+    expect(present.d.liveHeads(present.d.chainOf('k'))).toEqual([]);
   });
 
   it('signed commit by a trusted signer is trusted; forged author is not', async () => {
@@ -301,14 +412,79 @@ describe('derive', () => {
     expect(calls).toEqual([]);
   });
 
-  it('own evidence: stale beats suspect beats unknown, reason from detail', async () => {
-    const { d } = setup([rec('A'), rec('B'), rec('C')], {
-      outcomes: { A: { outcome: 'suspect', detail: 'not-unique' }, B: { outcome: 'unknown', detail: 'too-large' } },
-    });
-    expect(await d.state('A')).toMatchObject({ state: 'suspect', reason: 'not-unique' });
-    expect(await d.state('B')).toMatchObject({ state: 'unknown', reason: 'too-large' });
+  it('stale beats suspect beats unknown across own sources and cites, reason from detail', async () => {
+    const q = (resource: string): Source => ({ ...QUOTE, resource });
+    const three = [q('a.ts'), q('b.ts'), q('c.ts')];
+    const UNKNOWN = { outcome: 'unknown', detail: 'too-large' } as const;
+    const SUSPECT = { outcome: 'suspect', detail: 'not-unique' } as const;
+    const STALE = { outcome: 'stale', detail: 'deleted' } as const;
+    const { d } = setup(
+      [
+        rec('A', { sources: three }),
+        rec('B', { sources: three }),
+        rec('C', { sources: three }),
+        rec('S'),
+        rec('K'),
+        rec('X', { sources: [q('x.ts')], cites: ['S'] }),
+        rec('Y', { sources: [q('y.ts')], cites: ['K'] }),
+      ],
+      {
+        outcomes: {
+          A: [UNKNOWN, SUSPECT, STALE],
+          B: [UNKNOWN, 'holds', SUSPECT],
+          C: ['holds', UNKNOWN, 'holds'],
+          S: STALE,
+          K: UNKNOWN,
+          X: UNKNOWN,
+          Y: SUSPECT,
+        },
+      },
+    );
+    expect(await d.state('A')).toMatchObject({ state: 'stale', reason: 'deleted' });
+    expect(await d.state('B')).toMatchObject({ state: 'suspect', reason: 'not-unique' });
+    expect(await d.state('C')).toMatchObject({ state: 'unknown', reason: 'too-large' });
+    // Own evidence and a cite fail differently: the more severe one wins, whichever side it is on.
+    expect(await d.state('X')).toMatchObject({ state: 'stale', reason: 'cited record does not hold' });
+    expect(await d.state('Y')).toMatchObject({ state: 'suspect', reason: 'not-unique' });
     const legacy = setup([rec('L', { sources: [{ resource: 'a.txt', legacyFile: '0123456789ab' }] })]);
     expect((await legacy.d.state('L')).labels).toEqual(['whole file unchanged since 2026-10-21']);
+  });
+
+  it('two non-head members can both be served beside the label; only co-heads conflict', async () => {
+    // (a) X ← A, X ← B, R supersedes A and B but fails here: the fork shows again, each with the label.
+    const a = setup(
+      [rec('X'), rec('A', { supersedes: ['X'] }), rec('B', { supersedes: ['X'] }), rec('R', { supersedes: ['A', 'B'] })],
+      { outcomes: { R: 'stale' } },
+    );
+    expect(a.d.heads(a.d.chainOf('X'))).toEqual(['R']);
+    for (const id of ['A', 'B']) {
+      const s = await a.d.state(id);
+      expect(s).toMatchObject({ state: 'active', head: false });
+      expect(s.labels).toContain(NEWER_FAILS);
+    }
+    expect((await a.d.state('X')).state).toBe('superseded');
+
+    // (b) X ← A (a head that holds) and X ← B ← C with C failing: A is the only head that holds.
+    const b = setup(
+      [rec('X'), rec('A', { supersedes: ['X'] }), rec('B', { supersedes: ['X'] }), rec('C', { supersedes: ['B'] })],
+      { outcomes: { C: 'stale' } },
+    );
+    expect(b.d.heads(b.d.chainOf('X'))).toEqual(['A', 'C']);
+    const aHead = await b.d.state('A');
+    expect(aHead).toMatchObject({ state: 'active', head: true });
+    expect(aHead.labels).not.toContain(NEWER_FAILS);
+    const bOld = await b.d.state('B');
+    expect(bOld).toMatchObject({ state: 'active', head: false });
+    expect(bOld.labels).toContain(NEWER_FAILS);
+    expect((await b.d.state('C')).state).toBe('stale');
+
+    // Two heads that hold are never both active.
+    const c = setup(
+      [rec('X'), rec('A', { supersedes: ['X'] }), rec('B', { supersedes: ['X'] }), rec('C', { supersedes: ['B'] })],
+    );
+    expect((await c.d.state('A')).state).toBe('conflict');
+    expect((await c.d.state('C')).state).toBe('conflict');
+    expect((await c.d.state('B')).state).toBe('superseded');
   });
 
   it('unknown supersedes ids are ignored, and state is memoised', async () => {

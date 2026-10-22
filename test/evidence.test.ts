@@ -202,6 +202,47 @@ describe('Evidence', () => {
     expect(report).toEqual({ outcome: 'unknown', detail: 'unreachable-commit', path: 'src/price.ts' });
   });
 
+  it('an unknown rename is looked up once per request and never persisted', async () => {
+    const { wt, src } = await setup();
+    const cache = openCache();
+    fs.rmSync(path.join(wt, 'src/price.ts'));
+    const g = new Git(defaultExec, wt);
+    const lookup = vi.spyOn(g, 'renameLookup');
+    const ev = new Evidence({ worktree: wt, cache, git: g });
+    const gone = { ...src, commit: '0'.repeat(40) };
+    const expected = { outcome: 'unknown', detail: 'unreachable-commit', path: 'src/price.ts' };
+    expect(await ev.check(gone)).toEqual(expected);
+    expect(await ev.check(gone)).toEqual(expected);
+    expect(lookup).toHaveBeenCalledTimes(1);
+    const tree = (await git(wt, 'rev-parse', 'HEAD^{tree}')).trim();
+    expect(cache.getRename(gone.commit, tree)).toBeNull();
+    // A new request asks again: the commit may have become reachable.
+    ev.resetMemo();
+    expect(await ev.check(gone)).toEqual(expected);
+    expect(lookup).toHaveBeenCalledTimes(2);
+
+    // No HEAD tree (no commits yet): still one lookup per request.
+    const empty = await repo();
+    const g2 = new Git(defaultExec, empty);
+    const lookup2 = vi.spyOn(g2, 'renameLookup');
+    const ev2 = new Evidence({ worktree: empty, cache, git: g2 });
+    expect(await ev2.check(gone)).toEqual(expected);
+    expect(await ev2.check(gone)).toEqual(expected);
+    expect(lookup2).toHaveBeenCalledTimes(1);
+  });
+
+  it('resetMemo makes an edit visible to the next check', async () => {
+    const { wt, src } = await setup();
+    const cache = openCache();
+    const ev = evidence(wt, cache);
+    expect(await ev.check(src)).toMatchObject({ outcome: 'holds', detail: 'found' });
+    fs.writeFileSync(path.join(wt, 'src/price.ts'), FILE.replace('totalPrice', 'grandTotal'));
+    // Within one request the memo answers.
+    expect(await ev.check(src)).toMatchObject({ outcome: 'holds', detail: 'found' });
+    ev.resetMemo();
+    expect(await ev.check(src)).toEqual({ outcome: 'suspect', detail: 'not-found', path: 'src/price.ts' });
+  });
+
   it('a deleted file is stale', async () => {
     const { wt, src } = await setup();
     const cache = openCache();
