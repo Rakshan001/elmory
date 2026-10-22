@@ -497,6 +497,25 @@ export class Store {
     return out;
   }
 
+  /**
+   * Every id with a tombstone, and where: 'local' when the local dir has one, else 'committed'
+   * (without git both dirs are one, and it is local, as in `readTombstones`). The same files
+   * `readTombstones` counts (regular files named by a record id, malformed bodies included),
+   * found by listing and lstat only, without reading them.
+   */
+  tombstoneIds(): Map<string, 'local' | 'committed'> {
+    const l = this.layout;
+    const out = new Map<string, 'local' | 'committed'>();
+    const dirs: [string, 'local' | 'committed'][] =
+      l.tombstones === l.localTombstones ? [[l.localTombstones, 'local']] : [[l.localTombstones, 'local'], [l.tombstones, 'committed']];
+    for (const [dir, where] of dirs) {
+      for (const name of this.names(dir)) {
+        if (!out.has(name) && isRecordId(name) && kindOf(path.join(dir, name)) === 'file') out.set(name, where);
+      }
+    }
+    return out;
+  }
+
   /** Move pending records into the worktree facts dir (all pending when `ids` is omitted). */
   publish(ids?: string[]): string[] {
     this.writable(this.layout.facts);

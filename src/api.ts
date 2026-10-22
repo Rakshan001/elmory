@@ -190,7 +190,7 @@ export class Elmory implements Context {
   }
 
   view(): RecordRow[] {
-    return gate.viewOf(this.store, this.cache.allRecords());
+    return gate.viewOfCache(this.store, this.cache);
   }
 
   fetchAddedBy(): Promise<Map<string, AddedBy>> {
@@ -224,7 +224,7 @@ export class Elmory implements Context {
       const git = new Git(this.#exec, layout.worktree);
       const evidence = new Evidence({ worktree: layout.worktree, cache: this.cache, git });
       const deriver = new Deriver({
-        records: new Map(gate.viewOf(store, this.cache.allRecords()).map((r) => [r.id, r])),
+        records: new Map(gate.viewOfCache(store, this.cache).map((r) => [r.id, r])),
         tombstones: store.readTombstones(),
         trust: store.readTrust(),
         addedBy: await signedAddedBy(this.#exec, git, layout.worktree),

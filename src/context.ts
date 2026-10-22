@@ -22,7 +22,7 @@ export interface Context {
    * `full` re-reads every record file even when nothing seems to have changed.
    */
   sync(opts?: { full?: boolean }): Promise<string[]>;
-  /** The records this worktree sees (§5): gate.viewOf over the shared cache rows. */
+  /** The records this worktree sees (§5): gate.viewOf over the shared cache rows and their file stamps. */
   view(): RecordRow[];
   /**
    * Deriver over `rows` (default view()), store.readTombstones(), store.readTrust(),

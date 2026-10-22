@@ -198,52 +198,177 @@ export function indexRecord(sr: StoredRecord): RecordRow {
   };
 }
 
+/** Ids with a tombstone, and where: 'local' when a local one exists (always trusted), else 'committed'. */
+type Tombstoned = ReadonlyMap<string, 'local' | 'committed'>;
+
+/**
+ * The row for a record file whose id has a tombstone: the index-time result and the fields its
+ * state is derived from (id, area, type, recorded, supersedes, cites, candidate, flagged), with
+ * no text: title, body, observer, sources, paths and the file text are empty, so forgotten
+ * bytes never re-enter the cache. The key is kept only under a committed tombstone alone: that
+ * one may be unsigned, and an untrusted forget must keep the key's slot (§8 V3, N1); a local
+ * tombstone is always trusted, so the record is forgotten and the key goes too.
+ */
+function withoutText(row: RecordRow, tomb: 'local' | 'committed'): RecordRow {
+  const key = tomb === 'committed' ? row.key : null;
+  return { ...row, title: '', body: '', observer: '', key, tag: null, sources: [], paths: [], text: '' };
+}
+
+/** indexRecord, emptied of text when the id is tombstoned. */
+function indexFile(sr: StoredRecord, tombstoned: Tombstoned): RecordRow {
+  const row = indexRecord(sr);
+  const tomb = tombstoned.get(sr.id);
+  return tomb === undefined ? row : withoutText(row, tomb);
+}
+
+/** Whether `row` is what indexFile would give for `sr` (same area and text; emptied as withoutText says). */
+function rowIsFor(row: RecordRow, sr: StoredRecord, tombstoned: Tombstoned): boolean {
+  if (row.area !== sr.area) return false;
+  const tomb = tombstoned.get(sr.id);
+  if (tomb === undefined) return row.text === sr.text;
+  return row.text === '' && row.title === '' && (tomb === 'committed' || row.key === null);
+}
+
+// ---------------------------------------------------------------------------
+// file stamps: which file each row was indexed from (R7)
+
+/** meta key holding { id: [stamp, at] } for the rows: the file each row was read from. */
+const STAMPS_KEY = 'sync:files';
+/** A file stamp is trusted only when taken at least this long after the file's mtime (racy-clean, V14). */
+const STAMP_RACY_MS = 2000;
+
+type Stamps = Map<string, [stamp: string, at: number]>;
+
+/** `<area>:<size>:<mtimeNs>:<ino>` of a regular record file (not followed), and its mtime in ms; null otherwise. */
+function fileStamp(file: string, area: string): { stamp: string; mtimeMs: number } | null {
+  try {
+    const st = fs.lstatSync(file, { bigint: true });
+    if (!st.isFile()) return null;
+    return { stamp: `${area}:${st.size}:${st.mtimeNs}:${st.ino}`, mtimeMs: Number(st.mtimeMs) };
+  } catch {
+    return null;
+  }
+}
+
+/** The stamps the cache holds; an unreadable value counts as none (every row is then checked by reading). */
+export function readStamps(cache: Cache): Stamps {
+  const out: Stamps = new Map();
+  const raw = cache.getMeta(STAMPS_KEY);
+  if (raw === null) return out;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (typeof parsed !== 'object' || parsed === null) return out;
+    for (const [id, v] of Object.entries(parsed)) {
+      if (Array.isArray(v) && typeof v[0] === 'string' && typeof v[1] === 'number') out.set(id, [v[0], v[1]]);
+    }
+  } catch {
+    // a torn value: no stamps
+  }
+  return out;
+}
+
+function writeStamps(cache: Cache, stamps: Stamps): void {
+  cache.setMeta(STAMPS_KEY, JSON.stringify(Object.fromEntries(stamps)));
+}
+
+/** Record that the row for `sr.id` was indexed from (or checked equal to) the file at `sr.path`. Under the lock. */
+function stampInto(stamps: Stamps, sr: StoredRecord, at: number): void {
+  const st = fileStamp(sr.path, sr.area);
+  if (st === null) stamps.delete(sr.id);
+  else stamps.set(sr.id, [st.stamp, at]);
+}
+
+/**
+ * The shared rows and their stamps read from one cache generation (a rebuild in another
+ * process between the two reads would pair rows with another generation's stamps).
+ */
+export function rowsAndStamps(cache: Cache): { rows: RecordRow[]; stamps: Stamps } {
+  for (let attempt = 0; ; attempt++) {
+    const rows = cache.allRecords();
+    const gen = cache.generation;
+    const stamps = readStamps(cache);
+    if (cache.generation === gen || attempt > 0) return { rows, stamps };
+  }
+}
+
 /**
  * Incremental load, synchronous so it can run inside the write lock: every record file in
  * facts, pending and local against the cache rows. A file whose id is new, or whose area or text
- * differs from its row (published, or edited by hand in place), is (re)indexed; a row whose file
- * is gone is deleted. When one id is in several areas the first of facts, pending, local wins,
- * as in `Store.readRecord`. `force` re-indexes every file (the index rules changed). The caller
- * holds the write lock (or owns a fresh rebuild cache).
+ * differs from its row (published, or edited by hand in place), is (re)indexed, without its text
+ * when the id has a tombstone (M3); a row whose file is gone is deleted. When one id is in
+ * several areas the first of facts, pending, local wins, as in `Store.readRecord`. `force`
+ * re-indexes every file (the index rules changed). Every file seen is stamped (size, mtime,
+ * inode) as the one its row now stands for, so viewOf can tell when a worktree's file is not
+ * that one. The caller holds the write lock (or owns a fresh rebuild cache).
  */
 export function syncStore(store: Store, cache: Cache, force = false): void {
   const files = new Map<string, StoredRecord>();
   for (const sr of store.listRecords()) if (!files.has(sr.id)) files.set(sr.id, sr);
+  const tombstoned = store.tombstoneIds();
   const rows = new Map(cache.allRecords().map((r) => [r.id, r]));
+  const old = readStamps(cache);
+  const stamps: Stamps = new Map();
+  const at = Date.now();
   for (const [id, sr] of files) {
     const row = rows.get(id);
-    if (force || row === undefined || row.area !== sr.area || row.text !== sr.text) cache.upsertRecord(indexRecord(sr));
+    if (force || row === undefined || !rowIsFor(row, sr, tombstoned)) cache.upsertRecord(indexFile(sr, tombstoned));
+    stampInto(stamps, sr, at);
   }
   // pending/ and local/ are shared, so a row for a file gone from them is gone for everyone. A
   // facts row may belong to another worktree's branch (the table is shared by every worktree of
-  // the clone): it stays, and each read keeps only its own worktree's records (viewOf).
-  for (const [id, row] of rows) if (!files.has(id) && row.area !== 'facts') cache.deleteRecord(id);
+  // the clone): it stays, with the stamp of the file it was read from, and each read keeps only
+  // its own worktree's records (viewOf).
+  for (const [id, row] of rows) {
+    if (files.has(id)) continue;
+    if (row.area !== 'facts') cache.deleteRecord(id);
+    else {
+      const kept = old.get(id);
+      if (kept !== undefined) stamps.set(id, kept);
+    }
+  }
+  writeStamps(cache, stamps);
   cache.setMeta(INDEX_RULES_KEY, INDEX_RULES);
 }
 
 /**
  * §5: the records this worktree sees, from `rows` (the shared table): its own `.elmory/facts`
  * plus pending plus local, by directory names (facts first, as `Store.readRecord`). A row of
- * another worktree's facts is dropped; a record whose row is missing or sits in another area is
- * indexed in memory from this worktree's file. Sorted by id, like `Cache.allRecords`.
+ * another worktree's facts is dropped. A row is used as it is only when its area matches and
+ * this worktree's file still has the size, mtime and inode the row was read from (`stamps`,
+ * taken at least 2 s after that mtime); otherwise the file is read, and the row is used when
+ * its text is the file's, else the file is indexed in memory. So the same id edited differently
+ * in two worktrees is judged per worktree, and a file rewritten in place whose size or mtime
+ * moved is caught without a full sync. Sorted by id, like `Cache.allRecords`.
  */
-export function viewOf(store: Store, rows: readonly RecordRow[]): RecordRow[] {
+export function viewOf(store: Store, rows: readonly RecordRow[], stamps: Stamps = new Map()): RecordRow[] {
   const want = new Map<string, 'facts' | 'pending' | 'local'>();
   for (const area of ['facts', 'pending', 'local'] as const) {
     for (const id of store.ids(area)) if (!want.has(id)) want.set(id, area);
   }
+  const tombstoned = store.tombstoneIds();
   const byId = new Map(rows.map((r) => [r.id, r]));
   const out: RecordRow[] = [];
   for (const [id, area] of want) {
     const row = byId.get(id);
     if (row !== undefined && row.area === area) {
-      out.push(row);
-      continue;
+      const known = stamps.get(id);
+      const now = known === undefined ? null : fileStamp(path.join(store.layout[area], `${id}.md`), area);
+      if (known !== undefined && now !== null && known[0] === now.stamp && known[1] - now.mtimeMs >= STAMP_RACY_MS) {
+        out.push(row);
+        continue;
+      }
     }
     const sr = store.readRecord(id);
-    if (sr !== null) out.push(indexRecord(sr));
+    if (sr === null) continue;
+    out.push(row !== undefined && rowIsFor(row, sr, tombstoned) ? row : indexFile(sr, tombstoned));
   }
   return out.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+}
+
+/** viewOf over the cache as it is now (rows and stamps from one generation). */
+export function viewOfCache(store: Store, cache: Cache): RecordRow[] {
+  const { rows, stamps } = rowsAndStamps(cache);
+  return viewOf(store, rows, stamps);
 }
 
 // ---------------------------------------------------------------------------
@@ -631,7 +756,7 @@ async function write(ctx: Context, type: RecordType, input: RememberInput): Prom
         syncIfChanged(ctx.store, ctx.cache);
         const tombstones = ctx.store.readTombstones();
         if (attempt === 0 && committedSignature(ctx.layout, tombstones) !== before) throw new StaleAddedBy();
-        const records = new Map(viewOf(ctx.store, ctx.cache.allRecords()).map((r) => [r.id, r]));
+        const records = new Map(viewOfCache(ctx.store, ctx.cache).map((r) => [r.id, r]));
         const trust = ctx.store.readTrust();
         const d = new Deriver({
           records,
@@ -686,8 +811,11 @@ async function write(ctx: Context, type: RecordType, input: RememberInput): Prom
           path: path.join(ctx.layout[area], `${newId}.md`),
           text: serialize(record),
         };
-        const row = indexRecord(stored);
+        const row = indexFile(stored, tombstones.length === 0 ? new Map() : ctx.store.tombstoneIds());
         ctx.cache.upsertRecord(row);
+        const stamps = readStamps(ctx.cache);
+        stampInto(stamps, stored, Date.now());
+        writeStamps(ctx.cache, stamps);
         crashPoint('index');
         // The reply derives from this snapshot, never from a later read of the cache.
         records.set(newId, row);

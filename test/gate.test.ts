@@ -4,7 +4,7 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { afterEach, describe, expect, it } from 'vitest';
 import { Elmory, type ElmoryEvent } from '../src/api.js';
-import { FORGET_UNTRUSTED } from '../src/derive.js';
+import { type Deriver, FORGET_UNTRUSTED } from '../src/derive.js';
 import { type Exec, defaultExec } from '../src/exec.js';
 import { ConflictError, RefusedError, indexRecord, injectionFlag } from '../src/gate.js';
 import { type ElmoryRecord, type QuoteSource, recordId, serialize } from '../src/record.js';
@@ -103,6 +103,23 @@ function pulled(e: Elmory, over: Partial<ElmoryRecord> = {}): string {
   fs.mkdirSync(e.layout.facts, { recursive: true });
   fs.writeFileSync(path.join(e.layout.facts, `${id}.md`), serialize(r));
   return id;
+}
+
+/**
+ * Push every directory the sync fingerprint stats (and, with `files`, every record file) out of
+ * the 2 s racy window, so a later in-place edit leaves the fingerprint as it was.
+ */
+function settle(e: Elmory, files = false): void {
+  const past = new Date(Date.now() - 60_000);
+  const l = e.layout;
+  for (const p of [l.facts, l.tombstones, l.pending, l.local, l.localTombstones, l.trust]) {
+    if (fs.existsSync(p)) fs.utimesSync(p, past, past);
+  }
+  if (!files) return;
+  for (const dir of [l.facts, l.pending, l.local]) {
+    if (!fs.existsSync(dir)) continue;
+    for (const n of fs.readdirSync(dir)) if (n.endsWith('.md')) fs.utimesSync(path.join(dir, n), past, past);
+  }
 }
 
 async function refusal(p: Promise<unknown>): Promise<RefusedError> {
@@ -330,9 +347,16 @@ describe('index-time checks on every path', () => {
     const { e } = await setup();
     const res = await e.remember(fact('Will be edited'));
     expect(e.publish([res.id])).toEqual([res.id]);
+    // Settle the directories and the file past the 2 s racy window and sync, so the fingerprint
+    // is stored and the edit below (in place: no directory changes) does not move it (R3).
+    settle(e, true);
+    await e.sync();
     const file = path.join(e.layout.facts, `${res.id}.md`);
     fs.appendFileSync(file, 'x');
     await e.sync();
+    // The sync was a no-op: the row is still the clean one. The view sees the file's size and
+    // mtime moved, reads it and judges this worktree's bytes (R7).
+    expect(e.cache.getRecord(res.id)?.candidate).toBeNull();
     expect(await e.review()).toEqual([{ id: res.id, reason: 'edited', title: 'Will be edited' }]);
     expect(await stateOf(e, res.id)).toBe('candidate');
   });
@@ -708,6 +732,42 @@ describe('write gate: one-line fields (I2/M7)', () => {
   });
 });
 
+describe('tombstoned record files (M3)', () => {
+  const hits = (e: Elmory, q: string) => e.cache.search(q, { limit: 10, offset: 0 }).map((h) => h.id);
+
+  it('a record file whose id has a tombstone is indexed without its text', async () => {
+    const { e } = await setup();
+    // A local tombstone with the file still there (it came back after a forget: a restore, a checkout).
+    const gone = await e.note({ title: 'Zebra plan', text: 'The zebracode lives here.', key: 'zebra.plan' });
+    expect(hits(e, 'zebracode')).toEqual([gone.id]);
+    e.store.writeTombstone(gone.id, [], 'local');
+    await e.sync();
+    expect(e.cache.getRecord(gone.id)).toMatchObject({ area: 'pending', title: '', body: '', observer: '', key: null, text: '', paths: [], sources: [] });
+    expect(hits(e, 'zebracode')).toEqual([]);
+    expect(hits(e, 'Zebra')).toEqual([]);
+    expect(e.view().find((r) => r.id === gone.id)).toMatchObject({ title: '', body: '', text: '' });
+    expect(await stateOf(e, gone.id)).toBe('forgotten');
+    expect((await e.recall({ query: 'zebracode' })).abstain).toBe(true);
+
+    // An untrusted committed tombstone: candidate, its key's slot still held, and still no text.
+    const held = await e.note({ title: 'Okapi plan', text: 'The okapicode lives here.', key: 'okapi.plan' });
+    const tomb = path.join(e.layout.tombstones, held.id);
+    fs.mkdirSync(e.layout.tombstones, { recursive: true });
+    fs.writeFileSync(tomb, 'supersedes: []\n');
+    await e.sync();
+    expect(e.cache.getRecord(held.id)).toMatchObject({ title: '', body: '', text: '', key: 'okapi.plan' });
+    expect(hits(e, 'okapicode')).toEqual([]);
+    expect(await (await e.deriver()).state(held.id)).toMatchObject({ state: 'candidate', reason: FORGET_UNTRUSTED });
+    expect((await conflict(e.note({ title: 'Okapi', text: 'x', key: 'okapi.plan' }))).heads).toEqual([held.id]);
+
+    // The tombstone goes away (a checkout away from it): the record is indexed in full again.
+    fs.rmSync(tomb);
+    await e.sync();
+    expect(e.cache.getRecord(held.id)?.title).toBe('Okapi plan');
+    expect(hits(e, 'okapicode')).toEqual([held.id]);
+  });
+});
+
 describe('injection flag over paths (R5)', () => {
   it('a source path carrying an instruction is flagged, at index time and at write', async () => {
     const r: ElmoryRecord = {
@@ -732,5 +792,56 @@ describe('injection flag over paths (R5)', () => {
     const res = await e.remember({ title: 'Plain', text: 'Plain text.', quotes: [{ file: name, text: LINE_A }] });
     expect(res.notes.some((n) => n.startsWith('flagged:'))).toBe(true);
     expect(e.cache.getRecord(res.id)?.flagged).toBe(true);
+  });
+});
+
+describe('two worktrees over one cache (R6, R7)', () => {
+  /** Worktree A opened over a fresh cache, and the path where a second worktree can be added. */
+  async function twoWorktrees(): Promise<{ a: Elmory; wt: string; wt2: string; cacheDir: string }> {
+    const wt = await repo();
+    const cacheDir = tmp();
+    return { a: await open(wt, cacheDir), wt, wt2: path.join(tmp(), 'wt2'), cacheDir };
+  }
+
+  it('the same id edited differently in two worktrees is judged per worktree (R7)', async () => {
+    const { a, wt, wt2, cacheDir } = await twoWorktrees();
+    const res = await a.remember(fact('Shared fact'));
+    a.publish([res.id]);
+    await git(wt, 'add', '-A');
+    await git(wt, 'commit', '-q', '--no-verify', '-m', 'publish');
+    await git(wt, 'worktree', 'add', '-q', '-b', 'other', wt2);
+    const b = await open(wt2, cacheDir);
+
+    // A edits its copy in place; its full sync makes the shared row A's edited bytes.
+    fs.appendFileSync(path.join(a.layout.facts, `${res.id}.md`), 'x');
+    await a.sync({ full: true });
+    expect(a.cache.getRecord(res.id)?.candidate).toBe('edited');
+    expect(await stateOf(a, res.id)).toBe('candidate');
+    // B's view (no sync of its own) and A's peer deriver for B judge B's committed bytes.
+    expect(b.view().find((r) => r.id === res.id)?.candidate).toBeNull();
+    const peers = await a.peerDerivers();
+    expect(peers.map((p) => p.worktree)).toEqual([fs.realpathSync(wt2)]);
+    expect((await (peers[0] as { deriver: Deriver }).deriver.state(res.id)).state).toBe('active');
+
+    // The other way round: B's full sync makes the row B's clean copy; A still sees its edit.
+    await b.sync({ full: true });
+    expect(b.cache.getRecord(res.id)?.candidate).toBeNull();
+    expect(a.view().find((r) => r.id === res.id)?.candidate).toBe('edited');
+    expect(await stateOf(b, res.id)).toBe('active');
+  });
+
+  it('an unchanged, settled file is served from its row without reading it; a moved stamp is read (R7)', async () => {
+    const { e } = await setup();
+    const res = await e.remember(fact('Settled fact'));
+    settle(e, true);
+    await e.sync();
+    let reads = 0;
+    const readRecord = e.store.readRecord.bind(e.store);
+    e.store.readRecord = (id: string) => (reads++, readRecord(id));
+    expect(e.view().map((r) => r.id)).toEqual([res.id]);
+    expect(reads).toBe(0);
+    fs.appendFileSync(path.join(e.layout.pending, `${res.id}.md`), 'x');
+    expect(e.view().find((r) => r.id === res.id)?.candidate).toBe('edited');
+    expect(reads).toBe(1);
   });
 });
