@@ -5,7 +5,10 @@ export interface RenameResult {
   newPath?: string;
 }
 
-/** `signer` is the key fingerprint, set only when git reports a good signature (`%G?` is `G`). */
+/**
+ * The most recent commit that added or modified a path. `signer` is that commit's key
+ * fingerprint, set only when git reports a good signature (`%G?` is `G`).
+ */
 export interface AddedBy {
   commit: string;
   signer: string | null;
@@ -75,7 +78,10 @@ export class Git {
 
   /**
    * Where `relPath` (as of `fromCommit`) is at HEAD. Any failure, including a commit that is not
-   * reachable here (squash-merged branch, shallow clone), is `unknown`, never `deleted`.
+   * reachable here (squash-merged branch, shallow clone), is `unknown`, never `deleted`. A commit
+   * that exists but is not an ancestor of HEAD (another branch) is `unknown` too: a path it
+   * added was never deleted here. Git's rename limit (`diff.renameLimit`) is left alone, so past
+   * it an edited-and-moved file reports `deleted` rather than `renamed`.
    */
   async renameLookup(fromCommit: string, relPath: string): Promise<RenameResult> {
     if (!SHA.test(fromCommit)) return { status: 'unknown' };
@@ -91,7 +97,10 @@ export class Git {
         if (kind === 'R' && from === relPath && to !== undefined) return { status: 'renamed', newPath: to };
         i += 3;
       } else {
-        if (kind === 'D' && parts[i + 1] === relPath) return { status: 'deleted' };
+        if (kind === 'D' && parts[i + 1] === relPath) {
+          const ancestor = await this.run(['merge-base', '--is-ancestor', fromCommit, 'HEAD']);
+          return { status: ancestor.code === 0 ? 'deleted' : 'unknown' };
+        }
         i += 2;
       }
     }
@@ -99,9 +108,9 @@ export class Git {
   }
 
   /**
-   * For each file added under `relDir` in HEAD's history: the adding commit and its signer.
-   * One `git log` call. When a path was added more than once, the first entry in log order (the
-   * most recent add) wins.
+   * For each file added or modified under `relDir` in HEAD's history: the most recent such
+   * commit and its signer. One `git log` call; the first entry in log order wins, so a later
+   * unsigned edit replaces an earlier signed add.
    *
    * The format prints only git-computed fields, never author-controlled text, so nothing a
    * committer writes can contain the separators. Paths are C-quoted by git when they hold
@@ -117,7 +126,7 @@ export class Git {
       // %G? verifies the signature itself. --show-signature (or log.showSignature) would print
       // the verification text to stdout between records, where it would parse as file paths.
       '--no-show-signature',
-      '--diff-filter=A',
+      '--diff-filter=AM',
       '--name-only',
       '--format=%x1e%H%x1f%G?%x1f%GF%x1f%GK',
       '--',

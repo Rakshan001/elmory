@@ -57,6 +57,22 @@ function hasSshKeygen(): boolean {
   }
 }
 
+/**
+ * Configure SSH commit signing in `wt` and return an Exec that points git at an allowed-signers
+ * file. The library reads the user's config; only tests pass the allowed-signers file.
+ */
+async function sshSigning(wt: string): Promise<Exec> {
+  const keys = tmp();
+  const key = path.join(keys, 'k');
+  execFileSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-C', 'tester', '-f', key]);
+  const [keyType, keyBody] = fs.readFileSync(`${key}.pub`, 'utf8').trim().split(' ');
+  const allowed = path.join(keys, 'allowed');
+  fs.writeFileSync(allowed, `tester@example.com namespaces="git" ${keyType} ${keyBody}\n`);
+  await git(wt, 'config', 'gpg.format', 'ssh');
+  await git(wt, 'config', 'user.signingkey', `${key}.pub`);
+  return (file, args, opts) => defaultExec(file, ['-c', `gpg.ssh.allowedSignersFile=${allowed}`, ...args], opts);
+}
+
 describe('Git', () => {
   it('head is null before the first commit and a sha after it', async () => {
     const wt = await repo();
@@ -123,6 +139,20 @@ describe('Git', () => {
     expect(await g.renameLookup('0'.repeat(40), 'a.ts')).toEqual({ status: 'unknown' });
   });
 
+  it('a commit from another branch is unknown, not deleted', async () => {
+    const wt = await repo();
+    write(wt, 'a.ts', 'a\n');
+    await commitAll(wt, 'base');
+    const main = (await git(wt, 'branch', '--show-current')).trim();
+    await git(wt, 'checkout', '-q', '-b', 'feat');
+    write(wt, 'new.ts', 'export const onlyOnFeat = 1;\n');
+    const x = await commitAll(wt, 'feat adds new.ts');
+    await git(wt, 'checkout', '-q', main);
+    const g = new Git(defaultExec, wt);
+    expect(await g.renameLookup(x, 'new.ts')).toEqual({ status: 'unknown' });
+    expect(await g.renameLookup(x, 'a.ts')).toEqual({ status: 'same' });
+  });
+
   it('renameLookup treats a non-sha commit as unknown and never passes it as an option', async () => {
     const wt = await repo();
     write(wt, 'a.ts', 'a\n');
@@ -140,20 +170,22 @@ describe('Git', () => {
     expect(calls).toEqual([]);
   });
 
-  it('addedBy returns the adding commit and null signer for unsigned commits', async () => {
+  it('addedBy reports the most recent commit that added or modified each path', async () => {
     const wt = await repo();
     write(wt, '.elmory/facts/f_a.md', 'a\n');
-    const first = await commitAll(wt, 'add a');
+    await commitAll(wt, 'add a');
     write(wt, '.elmory/facts/f_b.md', 'b\n');
     write(wt, 'outside.md', 'not under the dir\n');
     const second = await commitAll(wt, 'add b');
     write(wt, '.elmory/facts/f_a.md', 'a changed\n');
-    await commitAll(wt, 'modify a');
+    const third = await commitAll(wt, 'modify a');
+    write(wt, 'outside.md', 'a later commit outside the dir changes nothing\n');
+    await commitAll(wt, 'outside');
     const g = new Git(defaultExec, wt);
     const added = await g.addedBy('.elmory/');
     expect(added).toEqual(
       new Map([
-        ['.elmory/facts/f_a.md', { commit: first, signer: null }],
+        ['.elmory/facts/f_a.md', { commit: third, signer: null }],
         ['.elmory/facts/f_b.md', { commit: second, signer: null }],
       ]),
     );
@@ -166,6 +198,8 @@ describe('Git', () => {
   });
 
   it('forged author is not a signer', async () => {
+    // Unsigned variant. The signed-commit-with-forged-author check is in 'signed commit reports
+    // a signer' (needs ssh-keygen).
     const wt = await repo();
     write(wt, '.elmory/facts/f_m.md', 'm\n');
     const sha = await commitAll(wt, 'forged', '--author=Mallory <m@x>');
@@ -205,14 +239,7 @@ describe('Git', () => {
 
   it.skipIf(!hasSshKeygen())('signed commit reports a signer', async () => {
     const wt = await repo();
-    const keys = tmp();
-    const key = path.join(keys, 'k');
-    execFileSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-C', 'tester', '-f', key]);
-    const [keyType, keyBody] = fs.readFileSync(`${key}.pub`, 'utf8').trim().split(' ');
-    const allowed = path.join(keys, 'allowed');
-    fs.writeFileSync(allowed, `tester@example.com namespaces="git" ${keyType} ${keyBody}\n`);
-    await git(wt, 'config', 'gpg.format', 'ssh');
-    await git(wt, 'config', 'user.signingkey', `${key}.pub`);
+    const withSigners = await sshSigning(wt);
     // Even when the user's config asks log to print signatures, the parse must stay clean.
     await git(wt, 'config', 'log.showSignature', 'true');
 
@@ -223,9 +250,6 @@ describe('Git', () => {
     write(wt, '.elmory/facts/f_t.md', 't\n');
     const signedForged = await commitAll(wt, 'signed, forged author', '-S', '--author=Mallory <m@x>');
 
-    // The library reads the user's config; only the test points git at the allowed-signers file.
-    const withSigners: Exec = (file, args, opts) =>
-      defaultExec(file, ['-c', `gpg.ssh.allowedSignersFile=${allowed}`, ...args], opts);
     const added = await new Git(withSigners, wt).addedBy('.elmory/');
 
     expect([...added.keys()].sort()).toEqual(['.elmory/facts/f_s.md', '.elmory/facts/f_t.md', '.elmory/facts/f_u.md']);
@@ -244,5 +268,19 @@ describe('Git', () => {
     // Without the allowed-signers file the signature is not good, so there is no signer.
     const unverified = await new Git(defaultExec, wt).addedBy('.elmory/');
     expect(unverified.get('.elmory/facts/f_s.md')?.signer).toBeNull();
+  });
+
+  it.skipIf(!hasSshKeygen())('an unsigned edit after a signed add drops the signer', async () => {
+    const wt = await repo();
+    const withSigners = await sshSigning(wt);
+    write(wt, '.elmory/tombstones/f_x', 'supersedes: []\n');
+    const signed = await commitAll(wt, 'signed tombstone', '-S');
+    const g = new Git(withSigners, wt);
+    expect((await g.addedBy('.elmory/')).get('.elmory/tombstones/f_x')?.signer).toMatch(/^SHA256:/);
+
+    write(wt, '.elmory/tombstones/f_x', 'supersedes: [f_victim]\n');
+    const forged = await commitAll(wt, 'unsigned edit', '--author=Mallory <m@x>');
+    expect((await g.addedBy('.elmory/')).get('.elmory/tombstones/f_x')).toEqual({ commit: forged, signer: null });
+    expect(forged).not.toBe(signed);
   });
 });
