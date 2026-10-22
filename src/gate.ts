@@ -3,7 +3,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import type { Context } from './api.js';
+import type { Context } from './context.js';
 import type { Cache, RecordRow } from './cache.js';
 import { Deriver, type State } from './derive.js';
 import type { AddedBy } from './git.js';
@@ -349,8 +349,9 @@ async function write(ctx: Context, type: RecordType, input: RememberInput): Prom
   // fetched again and the write retried once. A second change in that window proceeds with the
   // newer fetch: a record it misses counts as unsigned, so it can only fail to block a write.
   let id = '';
+  let addedBy: Map<string, AddedBy>;
   for (let attempt = 0; ; attempt++) {
-    const addedBy = await fetchAddedBy(ctx);
+    addedBy = await fetchAddedBy(ctx);
     const before = committedSignature(ctx.store, ctx.store.readTombstones());
     try {
       id = ctx.cache.withWriteLock(() => {
@@ -412,8 +413,9 @@ async function write(ctx: Context, type: RecordType, input: RememberInput): Prom
     }
   }
 
-  // 12 reply
-  const d = await ctx.deriver();
+  // 12 reply, with the addedBy the CAS used (one `git log` per write); fresh evidence probes
+  ctx.evidence.resetMemo();
+  const d = buildDeriver(ctx, addedBy);
   const state = (await d.state(id)).state;
   const mine = ctx.cache.getRecord(id);
   const myPaths = new Set(mine?.paths ?? []);

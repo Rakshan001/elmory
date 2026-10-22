@@ -404,3 +404,33 @@ describe('without git', () => {
     expect(e.layout.pending.startsWith(path.join(root, '.elmory'))).toBe(true);
   });
 });
+
+describe('Elmory wiring', () => {
+  it('read flows are methods; addedBy is one git log per write and is reused until sync', async () => {
+    const wt = await repo();
+    let logs = 0;
+    const exec: typeof defaultExec = (file, args, opts) => {
+      if (args.includes('log')) logs++;
+      return defaultExec(file, args, opts);
+    };
+    const e = await Elmory.open({ worktree: wt, cacheDir: tmp(), now: () => NOW, observer: 'agent:test', exec });
+    opened.push(e);
+
+    const a = await e.remember(fact('Token check'));
+    expect(logs).toBe(1);
+    await e.deriver();
+    await e.deriver();
+    expect(logs).toBe(2); // the write dropped the memo; one fetch serves both calls
+    await e.sync();
+    await e.deriver();
+    expect(logs).toBe(3);
+
+    const r = await e.recall({ query: 'checkToken' });
+    expect(r.abstain === false && r.served.map((s) => s.id)).toEqual([a.id]);
+    const ab = await e.about('src/auth.ts');
+    expect(ab.abstain === false && ab.served.map((s) => s.id)).toEqual([a.id]);
+    expect((await e.history(a.id)).map((h) => h.id)).toEqual([a.id]);
+    expect((await e.verify()).states.active).toBe(1);
+    expect(await e.gc({ dryRun: true })).toEqual({ archived: [], committed: [], dryRun: true });
+  });
+});
