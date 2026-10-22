@@ -303,6 +303,7 @@ const VERBS: Record<string, Verb> = {
         `cascaded: ${r.cascaded.length === 0 ? 'none' : r.cascaded.join(', ')}`,
       ];
       if (r.unknown.length > 0) out.push(`unknown (no such record here; nothing written): ${r.unknown.join(', ')}`);
+      out.push(...r.notes.map((n) => `note: ${n}`));
       out.push(`compaction: ${r.compaction}`);
       if (r.unreachable.length > 0) out.push('not reachable from here:', ...r.unreachable.map((u) => `  ${u}`));
       // Every id asked for was unknown: nothing happened, which a script must be able to see.

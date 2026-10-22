@@ -449,6 +449,80 @@ describe('forget', () => {
     }
   });
 
+  it('archived local records are reached by id, by --query and by --all (C1)', async () => {
+    const { wt, cacheDir, e } = await setup();
+    const roots = [cacheDir, path.join(wt, '.elmory'), path.join(e.layout.commonDir as string, 'elmory')];
+    const archivedLocal = (id: string): string => path.join(e.layout.archive, 'local', `${id}.md`);
+    const privateNote = async (title: string, marker: string): Promise<string> => {
+      const id = (await e.note({ title, text: `Private: ${marker}.`, local: true })).id;
+      expect(e.store.archive(id)).toEqual(['local']); // as gc would
+      expect(exists(archivedLocal(id))).toBe(true);
+      return id;
+    };
+
+    const byId = await privateNote('Private by id', 'zqxprivone');
+    const r = await e.forget({ ids: [byId] });
+    expect(r).toMatchObject({ deleted: [byId], unknown: [], compaction: 'done' });
+    expect(exists(archivedLocal(byId))).toBe(false);
+    expect(exists(path.join(e.layout.localTombstones, byId))).toBe(true);
+    expect(occurrences(roots, 'zqxprivone')).toBe(0);
+
+    const byQuery = await privateNote('Private by query', 'zqxprivtwo');
+    expect((await previewForget(e, { query: 'zqxprivtwo' })).seeds.map((s) => s.id)).toEqual([byQuery]);
+    expect((await e.forget({ query: 'zqxprivtwo', confirm: true })).deleted).toEqual([byQuery]);
+    expect(exists(archivedLocal(byQuery))).toBe(false);
+    expect(occurrences(roots, 'zqxprivtwo')).toBe(0);
+
+    const byAll = await privateNote('Private by all', 'zqxprivthree');
+    expect((await e.forget({ all: true, confirm: true })).deleted).toContain(byAll);
+    expect(exists(archivedLocal(byAll))).toBe(false);
+    expect(occurrences(roots, 'zqxprivthree')).toBe(0);
+  });
+
+  it('a record published in another worktree is forgotten from this one: common-dir tombstone, row gone, a note (I1)', async () => {
+    const { wt, cacheDir, e: a } = await setup();
+    const wtB = path.join(path.dirname(wt), 'b');
+    await git(wt, 'worktree', 'add', '-q', '-b', 'side', wtB);
+    const b = await open(wtB, cacheDir);
+    const id = (await b.note({ title: 'Leaked in B', text: 'the zqxleak token story' })).id;
+    b.publish([id]);
+    const served = await b.recall({ query: 'zqxleak' });
+    expect(served.abstain === false && served.served.map((s) => s.state)).toEqual(['active']);
+
+    expect((await previewForget(a, { ids: [id] })).seeds.map((s) => s.id)).toEqual([id]);
+    const r = await a.forget({ ids: [id] });
+    expect(r).toMatchObject({ deleted: [id], unknown: [], compaction: 'done' });
+    expect(r.notes).toHaveLength(1);
+    expect(r.notes[0]).toContain(id);
+    expect(exists(path.join(a.layout.localTombstones, id))).toBe(true); // the common dir: every worktree reads it
+    expect(exists(path.join(a.layout.tombstones, id))).toBe(true); // committed with A's work, it travels
+    expect(a.cache.getRecord(id)).toBeNull();
+    expect(occurrences([cacheDir], 'zqxleak')).toBe(0);
+    expect(exists(path.join(b.layout.facts, `${id}.md`))).toBe(true); // not A's to unlink
+
+    // B's next sync stops serving it, and its file's text never re-enters the cache.
+    const after = await b.recall({ query: 'zqxleak' });
+    expect(after.abstain).toBe(true);
+    expect((await (await b.deriver()).state(id)).state).toBe('forgotten');
+    expect(occurrences([cacheDir], 'zqxleak')).toBe(0);
+  });
+
+  it('an id only in HEAD (file deleted from the working tree) is known to forget (I1)', async () => {
+    const { wt, e } = await setup();
+    const id = (await e.note({ title: 'Committed then removed', text: 'In HEAD only.' })).id;
+    e.publish([id]);
+    await git(wt, 'add', '-A');
+    await git(wt, 'commit', '-q', '--no-verify', '-m', 'publish');
+    fs.rmSync(path.join(e.layout.facts, `${id}.md`));
+    await e.sync();
+    e.cache.deleteRecord(id); // as if never indexed here
+    const r = await e.forget({ ids: [id] });
+    expect(r).toMatchObject({ deleted: [id], unknown: [] });
+    expect(r.notes).toHaveLength(1);
+    expect(exists(path.join(e.layout.localTombstones, id))).toBe(true);
+    expect(exists(path.join(e.layout.tombstones, id))).toBe(true);
+  });
+
   it('the unreachable list is the seven spec strings', async () => {
     const { e } = await setup();
     const r = await e.forget({ ids: [] });

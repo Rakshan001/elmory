@@ -248,8 +248,8 @@ const TOOLS: Tool[] = [
     name: 'elmory_forget',
     description:
       'Delete records by id, with every record that cites them, from files and the search index. Only on a human\'s say-so. ' +
-      'Returns { deleted, cascaded, unknown, compaction: "done" | "pending", unreachable }: unknown lists ids that never existed here ' +
-      '(nothing written for them); unreachable lists the copies forget cannot touch ' +
+      'Returns { deleted, cascaded, unknown, compaction: "done" | "pending", unreachable, notes }: unknown lists ids that never existed here ' +
+      '(nothing written for them); notes name deleted ids whose file is in another worktree; unreachable lists the copies forget cannot touch ' +
       '(other branches until the tombstone is committed, git history, agent transcripts, backups…).',
     inputSchema: { type: 'object', properties: { ids: { ...IDS, minItems: 1 } }, required: ['ids'] },
     run: (m, a) => m.forget({ ids: strs(a, 'ids') }),
