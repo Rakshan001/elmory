@@ -7,7 +7,8 @@ export interface RenameResult {
 
 /**
  * The most recent commit that changed a path (other than deleting it). `signer` is that
- * commit's key fingerprint, set only when git reports a good signature (`%G?` is `G`).
+ * commit's key fingerprint, set only when git reports a good signature (`%G?` is `G`) and no
+ * later commit in HEAD's history touched the path again (see `Git.addedBy`).
  */
 export interface AddedBy {
   commit: string;
@@ -20,12 +21,26 @@ const US = '\x1f';
 const SHA = /^[0-9a-f]{4,64}$/i;
 /** A full object name as `%H` prints it (SHA-1 or SHA-256). */
 const FULL_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
-/** One `--raw` change line for one parent (`separate`); captures the post-image blob. */
-const RAW_CHANGE = /^:[0-7]{6} [0-7]{6} (?:[0-9a-f]{40}|[0-9a-f]{64}) ([0-9a-f]{40}|[0-9a-f]{64}) [ACMTUXB][0-9]*$/;
+/** One `--raw` change line for one parent (`separate`); captures the post-image blob and the status. */
+const RAW_CHANGE = /^:[0-7]{6} [0-7]{6} (?:[0-9a-f]{40}|[0-9a-f]{64}) ([0-9a-f]{40}|[0-9a-f]{64}) ([ACDMTUXB])[0-9]*$/;
 
 /** Pathspec that matches `p` byte for byte: no globs, no magic. */
 function literal(p: string): string {
   return `:(literal)${p}`;
+}
+
+/** Whether `ancestor` is reachable from any commit in `from` through `parentsOf`. */
+function descendsFrom(parentsOf: Map<string, string[]>, from: string[], ancestor: string): boolean {
+  const seen = new Set<string>();
+  const stack = [...from];
+  while (stack.length > 0) {
+    const c = stack.pop() as string;
+    if (c === ancestor) return true;
+    if (seen.has(c)) continue;
+    seen.add(c);
+    for (const p of parentsOf.get(c) ?? []) stack.push(p);
+  }
+  return false;
 }
 
 function splitZ(out: string): string[] {
@@ -111,8 +126,8 @@ export class Git {
 
   /**
    * For each file under `relDir` at HEAD: the most recent commit whose change left the file with
-   * exactly HEAD's bytes (added, modified, type-changed; deletes are ignored), and that commit's
-   * signer. A file not at HEAD, or one whose HEAD bytes no commit in the log produced, is absent.
+   * exactly HEAD's bytes (added, modified, type-changed), and that commit's signer. A file not at
+   * HEAD, or one whose HEAD bytes no commit in the log produced, is absent.
    *
    * Attribution is by content, not by order. Each change record carries its post-image blob, and
    * a record counts only when that blob is the one HEAD has for the path. So when a merge keeps
@@ -125,13 +140,28 @@ export class Git {
    * clean merge just carries over from one side is not a touch, so it keeps the branch commit
    * that made the change, and its signer.
    *
+   * Replay: the signer is kept only while the signed write is still the last word on the path in
+   * HEAD's history. If any commit descending from it in that history touched the path again
+   * (changed it, or deleted it), HEAD can hold those bytes only because some later merge or
+   * commit brought them back, and nobody signed that: `signer` is null. This covers a merge that
+   * resolves to stale signed bytes, `merge -s ours` over a deletion, and a reverted forget
+   * re-added on an old branch. A concurrent change on a branch that does not descend from the
+   * signed commit (the merge chose the signed side) does not drop it.
+   *
+   * The log walks the full history (`--full-history`: no side of a merge is pruned, so a deletion
+   * on the side a merge discarded is still seen) with parents rewritten to the nearest listed
+   * commits (`--parents`), which keeps ancestry among the listed commits exact. Deletes are read
+   * as touches but never credited.
+   *
    * Two git calls: one `ls-tree` for HEAD's blobs, then one `log`. Output is NUL-separated, so
    * paths are taken verbatim and are only ever read from the slot after a change line; nothing a
    * committer writes can be read as a header. The header prints only git-computed fields. As
    * defence in depth, a header that is not exactly five fields with full shas gets
-   * `signer: null` (and an empty `commit` when its sha is not valid) and is treated as a
-   * single-parent commit; a change line that does not parse is skipped; and any token out of
-   * place stops the parse, leaving the remaining paths unattributed.
+   * `signer: null` (and an empty `commit` when its sha is not valid), is treated as a
+   * single-parent commit, and leaves the ancestry incomplete, so every signer that needs the
+   * replay check is dropped; a change line that does not parse counts as a touch that did not
+   * produce HEAD's bytes; and any token out of place stops the parse, leaving the remaining paths
+   * unattributed.
    */
   async addedBy(relDir: string): Promise<Map<string, AddedBy>> {
     const result = new Map<string, AddedBy>();
@@ -146,10 +176,12 @@ export class Git {
       '--no-show-signature',
       // Children before parents, whatever the commit dates say.
       '--topo-order',
-      // Every non-delete change, each path on its own (no rename pairing), and one record per
-      // parent for a merge, so a merge's own edits can be told apart from carried-over changes.
+      // Every side of every merge, and %P as the nearest listed ancestors (see above).
+      '--full-history',
+      '--parents',
+      // Every change, each path on its own (no rename pairing), and one record per parent for a
+      // merge, so a merge's own edits can be told apart from carried-over changes.
       '--no-renames',
-      '--diff-filter=d',
       '--diff-merges=separate',
       // One `:<mode> <mode> <old blob> <new blob> <status>` line per path, full object names.
       '--raw',
@@ -164,7 +196,14 @@ export class Git {
     let commit = '';
     let signer: string | null = null;
     let parentCount = 1;
-    // Per (merge, path): how many of the merge's per-parent diffs left the path at HEAD's blob.
+    let ancestryComplete = true;
+    // Listed commit → its listed parents (rewritten by --parents).
+    const parentsOf = new Map<string, string[]>();
+    // Per path still unattributed: the commits that touched it so far without producing HEAD's
+    // bytes. Topological order lists them before (as descendants of, or concurrently with) the
+    // commit that is credited later.
+    const newer = new Map<string, string[]>();
+    // Per (merge, path): how many of the merge's per-parent diffs list the path.
     const mergeSeen = new Map<string, number>();
     const tokens = splitZ(res.stdout);
     for (let i = 0; i < tokens.length; i++) {
@@ -178,13 +217,15 @@ export class Git {
         commit = FULL_SHA.test(hash) ? hash : '';
         signer = wellFormed && good === 'G' ? fingerprint || keyId || null : null;
         parentCount = wellFormed ? parents.length : 1;
+        if (wellFormed) parentsOf.set(hash, parents);
+        else ancestryComplete = false;
         continue;
       }
       if (!token.startsWith(':')) break;
       const file = tokens[++i];
       if (file === undefined) break;
-      const blob = RAW_CHANGE.exec(token)?.[1];
-      if (blob === undefined || result.has(file) || headBlobs.get(file) !== blob) continue;
+      const headBlob = headBlobs.get(file);
+      if (headBlob === undefined || result.has(file)) continue;
       if (parentCount > 1) {
         // Merge records for one commit are consecutive and come before its parents, so
         // recording the touch when the last parent's diff lists the path keeps log order.
@@ -193,7 +234,20 @@ export class Git {
         mergeSeen.set(key, seen);
         if (seen < parentCount) continue;
       }
-      result.set(file, { commit, signer });
+      const change = RAW_CHANGE.exec(token);
+      if (change !== null && change[2] !== 'D' && change[1] === headBlob) {
+        result.set(file, { commit, signer });
+      } else {
+        const list = newer.get(file) ?? [];
+        list.push(commit);
+        newer.set(file, list);
+      }
+    }
+
+    for (const [file, entry] of result) {
+      const touches = newer.get(file);
+      if (entry.signer === null || touches === undefined) continue;
+      if (!ancestryComplete || descendsFrom(parentsOf, touches, entry.commit)) entry.signer = null;
     }
     return result;
   }
