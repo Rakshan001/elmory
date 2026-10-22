@@ -246,15 +246,31 @@ describe('Store records', () => {
 
   it('archive and restore move records between areas', () => {
     const store = plainStore();
-    const id = store.writeRecord('local', note(1));
-    store.archive(id);
+    const id = store.writeRecord('pending', note(1));
+    expect(store.archive(id)).toEqual(['pending']);
     expect(store.readRecord(id)).toBeNull();
     expect(fs.existsSync(path.join(store.layout.archive, `${id}.md`))).toBe(true);
-    store.restore(id);
+    expect(store.restore(id)).toEqual(['pending']);
     expect(store.readRecord(id)?.area).toBe('pending');
     expect(fs.readdirSync(store.layout.archive)).toEqual([]);
     expect(() => store.restore(id)).toThrow();
     expect(() => store.archive('f_' + 'q'.repeat(26))).toThrow();
+  });
+
+  it('an archived local record is restored into local, never pending', () => {
+    const store = plainStore();
+    const id = store.writeRecord('local', note(1));
+    expect(store.archive(id)).toEqual(['local']);
+    expect(store.readRecord(id)).toBeNull();
+    expect(fs.existsSync(path.join(store.layout.archive, 'local', `${id}.md`))).toBe(true);
+    expect(fs.existsSync(path.join(store.layout.archive, `${id}.md`))).toBe(false);
+    expect(store.restore(id)).toEqual(['local']);
+    expect(store.readRecord(id)?.area).toBe('local');
+    expect(fs.existsSync(path.join(store.layout.pending, `${id}.md`))).toBe(false);
+    expect(store.publish([id])).toEqual([]);
+    expect(store.archive(id)).toEqual(['local']);
+    expect(store.unlink(id)).toEqual(['archive']);
+    expect(() => store.restore(id)).toThrow(RecordError);
   });
 
   it('unlink removes a record from every area', () => {
@@ -355,6 +371,21 @@ describe('Store trust and tombstones', () => {
       `written ${a}\napproved ${b}\nrejected ${a}\nsigner ssh-ed25519 AAAAC3Nza key@host\n`,
     );
     expect(() => store.appendTrust(`written ${a}\napproved ${b}`)).toThrow();
+  });
+
+  it('trust ledger: the latest line for an id wins (approve after reject re-trusts)', async () => {
+    const { wt, common } = await gitWorktree();
+    const store = new Store(resolveLayout(wt, common));
+    const a = 'f_' + 'a'.repeat(26);
+    store.appendTrust(`approved ${a}`);
+    store.appendTrust(`rejected ${a}`);
+    expect(store.readTrust().rejected).toEqual(new Set([a]));
+    store.appendTrust(`approved ${a}`);
+    const t = store.readTrust();
+    expect(t.rejected).toEqual(new Set());
+    expect(t.approved).toEqual(new Set([a]));
+    store.appendTrust(`rejected ${a}`);
+    expect(store.readTrust().rejected).toEqual(new Set([a]));
   });
 
   it('tombstones round-trip in both dirs', async () => {
