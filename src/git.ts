@@ -8,7 +8,6 @@ export interface RenameResult {
 /** `signer` is the key fingerprint, set only when git reports a good signature (`%G?` is `G`). */
 export interface AddedBy {
   commit: string;
-  authorEmail: string;
   signer: string | null;
 }
 
@@ -16,6 +15,8 @@ const RS = '\x1e';
 const US = '\x1f';
 /** A full or abbreviated object name. Anything else (refs, options) is refused before git sees it. */
 const SHA = /^[0-9a-f]{4,64}$/i;
+/** A full object name as `%H` prints it (SHA-1 or SHA-256). */
+const FULL_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 /** Pathspec that matches `p` byte for byte: no globs, no magic. */
 function literal(p: string): string {
@@ -98,9 +99,14 @@ export class Git {
   }
 
   /**
-   * For each file added under `relDir` in HEAD's history: the adding commit, its author email,
-   * and its signer. One `git log` call. When a path was added more than once, the first entry in
-   * log order (the most recent add) wins.
+   * For each file added under `relDir` in HEAD's history: the adding commit and its signer.
+   * One `git log` call. When a path was added more than once, the first entry in log order (the
+   * most recent add) wins.
+   *
+   * The format prints only git-computed fields, never author-controlled text, so nothing a
+   * committer writes can contain the separators. Paths are C-quoted by git when they hold
+   * control characters. As defence in depth, a header that is not exactly four fields with a
+   * full sha first gets `signer: null` (and an empty `commit` when the sha is not valid).
    */
   async addedBy(relDir: string): Promise<Map<string, AddedBy>> {
     const result = new Map<string, AddedBy>();
@@ -113,7 +119,7 @@ export class Git {
       '--no-show-signature',
       '--diff-filter=A',
       '--name-only',
-      '--format=%x1e%H%x1f%G?%x1f%GF%x1f%GK%x1f%ae',
+      '--format=%x1e%H%x1f%G?%x1f%GF%x1f%GK',
       '--',
       literal(relDir),
     ]);
@@ -124,11 +130,14 @@ export class Git {
     }
     for (const record of res.stdout.split(RS).slice(1)) {
       const lines = record.split('\n');
-      const [commit = '', good = '', fingerprint = '', keyId = '', authorEmail = ''] = (lines[0] ?? '').split(US);
-      const signer = good === 'G' ? fingerprint || keyId || null : null;
+      const fields = (lines[0] ?? '').split(US);
+      const [hash = '', good = '', fingerprint = '', keyId = ''] = fields;
+      const wellFormed = fields.length === 4 && FULL_SHA.test(hash);
+      const commit = FULL_SHA.test(hash) ? hash : '';
+      const signer = wellFormed && good === 'G' ? fingerprint || keyId || null : null;
       for (const file of lines.slice(1)) {
         if (file === '' || result.has(file)) continue;
-        result.set(file, { commit, authorEmail, signer });
+        result.set(file, { commit, signer });
       }
     }
     return result;

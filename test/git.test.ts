@@ -140,7 +140,7 @@ describe('Git', () => {
     expect(calls).toEqual([]);
   });
 
-  it('addedBy returns author and null signer for unsigned commits', async () => {
+  it('addedBy returns the adding commit and null signer for unsigned commits', async () => {
     const wt = await repo();
     write(wt, '.elmory/facts/f_a.md', 'a\n');
     const first = await commitAll(wt, 'add a');
@@ -153,8 +153,8 @@ describe('Git', () => {
     const added = await g.addedBy('.elmory/');
     expect(added).toEqual(
       new Map([
-        ['.elmory/facts/f_a.md', { commit: first, authorEmail: 'tester@example.com', signer: null }],
-        ['.elmory/facts/f_b.md', { commit: second, authorEmail: 'tester@example.com', signer: null }],
+        ['.elmory/facts/f_a.md', { commit: first, signer: null }],
+        ['.elmory/facts/f_b.md', { commit: second, signer: null }],
       ]),
     );
   });
@@ -172,9 +172,35 @@ describe('Git', () => {
     const g = new Git(defaultExec, wt);
     expect((await g.addedBy('.elmory/')).get('.elmory/facts/f_m.md')).toEqual({
       commit: sha,
-      authorEmail: 'm@x',
       signer: null,
     });
+  });
+
+  it('separator characters in author or path cannot forge a signed record', async () => {
+    const wt = await repo();
+    const fake = `${'a'.repeat(40)}\x1fG\x1fFAKE\x1fFAKE`;
+    write(wt, '.elmory/facts/f_e.md', 'e\n');
+    await git(wt, 'add', '-A');
+    // Git may refuse or rewrite the control characters; either way no path may get a signer.
+    const viaAuthor = await defaultExec(
+      'git',
+      ['commit', '-q', '--no-verify', '-m', 'email', `--author=M <m\x1e${fake}\n.elmory/facts/f_e.md@x>`],
+      { cwd: wt },
+    );
+    if (viaAuthor.code !== 0) {
+      await git(wt, 'commit', '-q', '--no-verify', '-m', 'email', `--author=M <m\x1e${fake}@x>`);
+    }
+    if (process.platform !== 'win32') {
+      write(wt, `.elmory/facts/x\x1e${fake}\nf_p.md`, 'p\n');
+      await commitAll(wt, 'path');
+    }
+    const added = await new Git(defaultExec, wt).addedBy('.elmory/');
+    expect(added.size).toBeGreaterThan(0);
+    for (const [file, entry] of added) {
+      expect(entry.signer, file).toBeNull();
+      expect(entry.commit, file).toMatch(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/);
+      expect(entry.commit, file).not.toBe('a'.repeat(40));
+    }
   });
 
   it.skipIf(!hasSshKeygen())('signed commit reports a signer', async () => {
@@ -205,17 +231,14 @@ describe('Git', () => {
     expect([...added.keys()].sort()).toEqual(['.elmory/facts/f_s.md', '.elmory/facts/f_t.md', '.elmory/facts/f_u.md']);
     const s = added.get('.elmory/facts/f_s.md');
     expect(s?.commit).toBe(signed);
-    expect(s?.authorEmail).toBe('tester@example.com');
     expect(s?.signer).toMatch(/^SHA256:/);
     expect(added.get('.elmory/facts/f_u.md')).toEqual({
       commit: unsigned,
-      authorEmail: 'tester@example.com',
       signer: null,
     });
     // The signer is the key, whatever the author line claims.
     const t = added.get('.elmory/facts/f_t.md');
     expect(t?.commit).toBe(signedForged);
-    expect(t?.authorEmail).toBe('m@x');
     expect(t?.signer).toBe(s?.signer);
 
     // Without the allowed-signers file the signature is not good, so there is no signer.
