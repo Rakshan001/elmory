@@ -3,6 +3,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
+import { Elmory } from '../src/api.js';
+import { type ElmoryRecord, FORMAT_VERSION, recordId } from '../src/record.js';
 import { FILE, LINE, cleanupDirs, repo } from './helpers/children.js';
 
 const CLI = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'dist', 'cli.js');
@@ -32,10 +34,25 @@ function cli(cwd: string, cacheHome: string, ...args: string[]): Promise<Run> {
   });
 }
 
-async function setup(): Promise<{ run: (...args: string[]) => Promise<Run> }> {
+async function setup(): Promise<{ wt: string; cacheDir: string; run: (...args: string[]) => Promise<Run>; runIn: (cwd: string, ...args: string[]) => Promise<Run> }> {
   const { wt, cacheDir } = await repo();
-  return { run: (...args) => cli(wt, cacheDir, ...args) };
+  return { wt, cacheDir, run: (...args) => cli(wt, cacheDir, ...args), runIn: (cwd, ...args) => cli(cwd, cacheDir, ...args) };
 }
+
+/** A record as a hostile commit could carry it: written to pending as this clone's own. */
+async function plant(wt: string, cacheDir: string, r: Omit<ElmoryRecord, 'version' | 'recorded' | 'supersedes' | 'cites' | 'sources'>): Promise<string> {
+  const e = await Elmory.open({ worktree: wt, cacheDir: path.join(cacheDir, 'planter') });
+  try {
+    const rec: ElmoryRecord = { version: FORMAT_VERSION, recorded: '2026-10-22T10:00:00.000Z', supersedes: [], cites: [], sources: [], ...r };
+    e.store.appendTrust(`written ${recordId(rec)}`);
+    return e.store.writeRecord('pending', rec);
+  } finally {
+    e.close();
+  }
+}
+
+/** Raw C0/C1 control bytes other than newline. */
+const RAW_CONTROL = /[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/;
 
 const quoteArg = `${FILE}:${LINE}`;
 
@@ -135,9 +152,110 @@ describe('elmory cli', () => {
     expect(badFlag.code).toBe(1);
     expect(badFlag.err.split('\n')).toHaveLength(1);
 
+    expect((await run('note', 'something to delete', '--title', 'victim')).code).toBe(0);
     const noConfirm = await run('forget', '--all');
-    expect(noConfirm.code).toBe(1);
-    expect(noConfirm.err).toContain('--confirm');
+    expect(noConfirm.code).toBe(2);
+    expect(noConfirm.err.split('\n')).toHaveLength(1);
+    expect(noConfirm.err).toContain('refused (confirm)');
+    expect(noConfirm.out).toContain('re-run with --confirm to delete this 1 record');
+
+    const noScope = await run('forget');
+    expect(noScope.code).toBe(1);
+  }, 30000);
+
+  it('control characters in record text are escaped in human output; --json keeps them', async () => {
+    const { wt, cacheDir, run } = await setup();
+    const id = await plant(wt, cacheDir, {
+      type: 'memory/note',
+      title: 'evil \u001b[2Jclear title',
+      observer: 'x\ninjected: y',
+      body: 'line one \u001b]0;pwned\u0007 tail\r\nline two \u009b31m',
+    });
+
+    const r = await run('recall', 'evil');
+    expect(r, r.err).toMatchObject({ code: 0 });
+    expect(r.out).not.toMatch(RAW_CONTROL);
+    expect(r.out).toContain('## evil \\x1b[2Jclear title');
+    expect(r.out).toContain('line one \\x1b]0;pwned\\x07 tail');
+    expect(r.out).toContain('\\x9b31m');
+
+    const h = await run('history', id);
+    expect(h, h.err).toMatchObject({ code: 0 });
+    expect(h.out).not.toMatch(RAW_CONTROL);
+    expect(h.out.split('\n')).toHaveLength(1); // the observer's newline cannot forge a second line
+    expect(h.out).toContain('x\\x0ainjected: y');
+
+    const json = await run('recall', 'evil', '--json');
+    const got = JSON.parse(json.out) as { served: { title: string }[] };
+    expect(got.served[0]?.title).toBe('evil \u001b[2Jclear title');
+  }, 30000);
+
+  it('--title and --observer with control characters are refused', async () => {
+    const { run } = await setup();
+    const title = await run('note', 'body text', '--title', 't \u001b[2Jclear');
+    expect(title.code).toBe(2);
+    expect(title.err).toMatch(/refused \(title\)/);
+    expect(title.err).not.toMatch(RAW_CONTROL);
+
+    const observer = await run('note', 'body text', '--title', 'fine', '--observer', 'x\ninjected: y', '--json');
+    expect(observer.code).toBe(2);
+    expect(JSON.parse(observer.out)).toMatchObject({ error: 'refused', reason: 'observer' });
+  }, 30000);
+
+  it('forget --query without --confirm previews the seeds and the cascade and deletes nothing', async () => {
+    const { run } = await setup();
+    const a = JSON.parse((await run('note', 'No deploys on Fridays', '--title', 'deploy freeze', '--json')).out) as { id: string };
+    const b = JSON.parse((await run('note', 'Because of the freeze', '--title', 'why fridays', '--cites', a.id, '--json')).out) as { id: string };
+
+    const p = await run('forget', '--query', 'deploys');
+    expect(p.code).toBe(2);
+    expect(p.out).toContain(`${a.id} deploy freeze`);
+    expect(p.out).toContain(`${b.id} why fridays`);
+    expect(p.out).toContain('re-run with --confirm to delete these 2 records');
+    expect(p.err).toContain('refused (confirm)');
+
+    const pj = await run('forget', '--query', 'deploys', '--json');
+    expect(pj.code).toBe(2);
+    expect(JSON.parse(pj.out)).toEqual({
+      preview: true,
+      seeds: [{ id: a.id, title: 'deploy freeze' }],
+      cascaded: [{ id: b.id, title: 'why fridays' }],
+    });
+    expect((await run('recall', 'freeze')).code).toBe(0); // still there
+
+    const done = await run('forget', '--query', 'deploys', '--confirm', '--json');
+    expect(done, done.err).toMatchObject({ code: 0 });
+    expect(JSON.parse(done.out)).toMatchObject({ deleted: [a.id], cascaded: [b.id], unknown: [] });
+    expect((await run('recall', 'freeze')).code).toBe(4);
+  }, 30000);
+
+  it('forget of an id that never existed reports it as unknown', async () => {
+    const { run } = await setup();
+    const typo = `f_${'a'.repeat(26)}`;
+    const r = await run('forget', typo, '--json');
+    expect(r, r.err).toMatchObject({ code: 0 });
+    expect(JSON.parse(r.out)).toMatchObject({ deleted: [], unknown: [typo] });
+    const human = await run('forget', typo);
+    expect(human.out).toContain(`unknown (no such record here; nothing written): ${typo}`);
+  }, 30000);
+
+  it('global flags work before the verb; help --json lists the verbs', async () => {
+    const { wt, runIn } = await setup();
+    const elsewhere = path.dirname(wt);
+    const w = await runIn(elsewhere, '--json', '--worktree', path.join(wt, 'src'), 'note', 'Tabs not spaces', '--title', 'indent');
+    expect(w, w.err).toMatchObject({ code: 0 });
+    const id = (JSON.parse(w.out) as { id: string }).id;
+    const r = await runIn(elsewhere, '--worktree', wt, '--json', 'recall', 'Tabs');
+    expect(r, r.err).toMatchObject({ code: 0 });
+    expect((JSON.parse(r.out) as { served: { id: string }[] }).served.map((s) => s.id)).toEqual([id]);
+
+    for (const args of [['help', '--json'], ['--json', 'help']]) {
+      const h = await runIn(elsewhere, ...args);
+      expect(h.code).toBe(0);
+      const verbs = (JSON.parse(h.out) as { verbs: { name: string; usage: string; summary: string }[] }).verbs;
+      expect(verbs.map((v) => v.name)).toContain('forget');
+      expect(verbs.map((v) => v.name)).toContain('help');
+    }
   }, 30000);
 
   it('publish, about, history and forget work end to end', async () => {

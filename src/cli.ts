@@ -4,15 +4,14 @@
 // as one line; `--json` prints the result (or the error) as JSON on stdout.
 
 import os from 'node:os';
-import path from 'node:path';
 import { type ParseArgsConfig, parseArgs } from 'node:util';
 import { ConflictError, Elmory, RefusedError } from './api.js';
 import type { Abstain, RecallResult, Served } from './api.js';
 import type { State } from './derive.js';
-import { defaultExec } from './exec.js';
-import { type ForgetScope, forget } from './forget.js';
+import { type ForgetPreviewScope, type ForgetScope, previewForget } from './forget.js';
 import type { RememberInput } from './gate.js';
 import type { Tag } from './record.js';
+import { resolveWorktree } from './worktree.js';
 
 const EXIT_OK = 0;
 const EXIT_ERROR = 1;
@@ -67,6 +66,8 @@ interface Outcome {
   /** what a person reads */
   text: string;
   code?: number;
+  /** one line for stderr, in both modes (like an error) */
+  stderr?: string;
 }
 
 class UsageError extends Error {}
@@ -116,6 +117,7 @@ function quote(spec: string): { file: string; text: string } {
 function writeInput(a: Args, quotes: { file: string; text: string }[] | undefined): RememberInput {
   const title = str(a, 'title');
   if (title === undefined) throw new UsageError('--title is required');
+  if (CONTROL.test(title)) throw new RefusedError('--title must be one line of printable characters', 'title');
   const input: RememberInput = { text: text(a, 'the text to remember'), title };
   if (quotes !== undefined) input.quotes = quotes;
   const tag = str(a, 'tag');
@@ -132,22 +134,46 @@ function writeInput(a: Args, quotes: { file: string; text: string }[] | undefine
 
 // ---------------------------------------------------------------------------
 // human output
+//
+// Record text comes from other people's commits. Before it reaches a terminal every C0/C1
+// control character (ESC, CSI, OSC, CR, BEL…) is shown as a visible `\x..` escape, so a record
+// cannot move the cursor, rewrite lines, set the title or reach the clipboard. One-line fields
+// (title, observer, key, reason…) escape newlines and tabs too, so they cannot forge a line.
+// `--json` output is left exactly as the api returned it.
+
+/** Any C0 or C1 control character, DEL included. */
+const CONTROL = /[\u0000-\u001f\u007f-\u009f]/;
+const CONTROLS = new RegExp(CONTROL.source, 'g');
+
+function escapeControls(s: string, keep: string): string {
+  return s.replace(CONTROLS, (c) => (keep.includes(c) ? c : `\\x${c.charCodeAt(0).toString(16).padStart(2, '0')}`));
+}
+
+/** A one-line field: every control character escaped, newlines and tabs included. */
+function inline(s: string): string {
+  return escapeControls(s, '');
+}
+
+/** A body: newlines and tabs kept, every other control character escaped. */
+function multiline(s: string): string {
+  return escapeControls(s, '\n\t');
+}
 
 function block(s: Served): string {
   const meta = [`id: ${s.id}`, `state: ${s.state}`, s.type === 'memory/fact' ? 'fact' : 'note'];
-  if (s.tag !== null) meta.push(`tag: ${s.tag}`);
-  if (s.key !== null) meta.push(`key: ${s.key}`);
-  const lines = [`## ${s.title}`, meta.join(' · ')];
-  const labels = [...s.warnings, ...s.labels];
+  if (s.tag !== null) meta.push(`tag: ${inline(s.tag)}`);
+  if (s.key !== null) meta.push(`key: ${inline(s.key)}`);
+  const lines = [`## ${inline(s.title)}`, meta.join(' · ')];
+  const labels = [...s.warnings, ...s.labels].map(inline);
   if (labels.length > 0) lines.push(`labels: ${labels.join(', ')}`);
-  if (s.paths.length > 0) lines.push(`quotes: ${s.paths.join(', ')}`);
-  lines.push('', s.body);
+  if (s.paths.length > 0) lines.push(`quotes: ${s.paths.map(inline).join(', ')}`);
+  lines.push('', multiline(s.body));
   return lines.join('\n');
 }
 
 function served(r: RecallResult | Abstain): Outcome {
   if (r.abstain) {
-    return { data: r, text: [`I don't know: ${r.reason}`, ...r.hints.map((h) => `  ${h}`)].join('\n'), code: EXIT_ABSTAIN };
+    return { data: r, text: [`I don't know: ${inline(r.reason)}`, ...r.hints.map((h) => `  ${inline(h)}`)].join('\n'), code: EXIT_ABSTAIN };
   }
   return { data: r, text: r.served.map(block).join('\n\n') };
 }
@@ -168,7 +194,7 @@ const VERBS: Record<string, Verb> = {
       const raw = a.values.quote;
       const quotes = (Array.isArray(raw) ? raw : []).map((q) => quote(String(q)));
       const r = await e.remember(writeInput(a, quotes));
-      return { data: r, text: [`${r.id} ${r.state}`, ...r.notes].join('\n') };
+      return { data: r, text: [`${r.id} ${r.state}`, ...r.notes.map(inline)].join('\n') };
     },
   },
   note: {
@@ -177,7 +203,7 @@ const VERBS: Record<string, Verb> = {
     options: WRITE,
     async run(e, a) {
       const r = await e.note(writeInput(a, undefined));
-      return { data: r, text: [`${r.id} ${r.state}`, ...r.notes].join('\n') };
+      return { data: r, text: [`${r.id} ${r.state}`, ...r.notes.map(inline)].join('\n') };
     },
   },
   recall: {
@@ -218,10 +244,10 @@ const VERBS: Record<string, Verb> = {
       const h = await e.history(target);
       const rows = h.map(
         (x) =>
-          `${x.id} ${x.state}${x.forgotten ? ' (forgotten)' : ''} ${x.recorded} ${x.observer} ${x.title}` +
+          `${x.id} ${x.state}${x.forgotten ? ' (forgotten)' : ''} ${inline(x.recorded)} ${inline(x.observer)} ${inline(x.title)}` +
           (x.supersedes.length > 0 ? ` ← supersedes ${x.supersedes.join(', ')}` : ''),
       );
-      return { data: h, text: lines(rows, `no history for ${target}`) };
+      return { data: h, text: lines(rows, `no history for ${inline(target)}`) };
     },
   },
   verify: {
@@ -241,26 +267,27 @@ const VERBS: Record<string, Verb> = {
     },
   },
   forget: {
-    usage: 'forget <id…> | --query <q> --confirm | --all --confirm',
-    summary: 'delete records (and those citing them) and say what could not be reached',
+    usage: 'forget <id…> | --query <q> [--confirm] | --all [--confirm]',
+    summary: 'delete records and those citing them; --query/--all without --confirm only list them',
     options: { query: { type: 'string' }, all: { type: 'boolean' }, confirm: { type: 'boolean' } },
     async run(e, a) {
       const query = str(a, 'query');
       const all = flag(a, 'all');
       const modes = [a.positionals.length > 0, query !== undefined, all].filter(Boolean).length;
-      if (modes !== 1) throw new UsageError('forget takes ids, or --query <q> --confirm, or --all --confirm');
+      if (modes !== 1) throw new UsageError('forget takes ids, or --query <q>, or --all');
       let scope: ForgetScope;
       if (a.positionals.length > 0) scope = { ids: a.positionals };
-      else {
-        if (!flag(a, 'confirm')) throw new UsageError(`forget ${all ? '--all' : '--query'} needs --confirm`);
-        scope = query !== undefined ? { query, confirm: true } : { all: true, confirm: true };
-      }
-      const r = await forget(e, scope);
+      else if (!flag(a, 'confirm')) {
+        const what: ForgetPreviewScope = query !== undefined ? { query } : { all: true };
+        return forgetPreview(await previewForget(e, what));
+      } else scope = query !== undefined ? { query, confirm: true } : { all: true, confirm: true };
+      const r = await e.forget(scope);
       const out = [
         `deleted: ${r.deleted.length === 0 ? 'none' : r.deleted.join(', ')}`,
         `cascaded: ${r.cascaded.length === 0 ? 'none' : r.cascaded.join(', ')}`,
-        `compaction: ${r.compaction}`,
       ];
+      if (r.unknown.length > 0) out.push(`unknown (no such record here; nothing written): ${r.unknown.join(', ')}`);
+      out.push(`compaction: ${r.compaction}`);
       if (r.unreachable.length > 0) out.push('not reachable from here:', ...r.unreachable.map((u) => `  ${u}`));
       return { data: r, text: out.join('\n') };
     },
@@ -281,7 +308,7 @@ const VERBS: Record<string, Verb> = {
     async run(e, a) {
       none(a);
       const r = await e.review();
-      return { data: r, text: lines(r.map((c) => `${c.id} ${c.reason} ${c.title}`), 'nothing to review') };
+      return { data: r, text: lines(r.map((c) => `${c.id} ${inline(c.reason)} ${inline(c.title)}`), 'nothing to review') };
     },
   },
   approve: {
@@ -334,25 +361,55 @@ const VERBS: Record<string, Verb> = {
   },
 };
 
+/** `forget --query/--all` without `--confirm`: what would go, and exit 2 (§8 "confirmed first"). */
+function forgetPreview(p: { seeds: { id: string; title: string }[]; cascaded: { id: string; title: string }[] }): Outcome {
+  const n = p.seeds.length + p.cascaded.length;
+  const row = (r: { id: string; title: string }): string => `  ${r.id} ${inline(r.title)}`;
+  const out = [p.seeds.length === 0 ? 'matches: none' : 'matches:', ...p.seeds.map(row)];
+  out.push(p.cascaded.length === 0 ? 'cascaded (they cite a match): none' : 'cascaded (they cite a match):', ...p.cascaded.map(row));
+  const next = n === 0 ? 'nothing matches, nothing to delete' : `re-run with --confirm to delete ${n === 1 ? 'this 1 record' : `these ${n} records`}`;
+  out.push(next);
+  return {
+    data: { preview: true, seeds: p.seeds, cascaded: p.cascaded },
+    text: out.join('\n'),
+    code: EXIT_REFUSED,
+    stderr: `refused (confirm): nothing deleted; ${next}`,
+  };
+}
+
+const HELP_SUMMARY = 'this list';
+
 function helpText(): string {
   const width = Math.max(...Object.keys(VERBS).map((v) => v.length));
   return [
     'elmory: evidence-checked memory for coding agents',
     '',
-    'usage: elmory <verb> [args] [--json] [--worktree <path>] [--observer <s>]',
+    'usage: elmory [--json] [--worktree <path>] [--observer <s>] <verb> [args]',
+    '       (--worktree: the git toplevel of that path, default the current directory)',
     '',
     ...Object.entries(VERBS).map(([name, v]) => `  ${name.padEnd(width)}  ${v.summary}\n  ${' '.repeat(width)}  elmory ${v.usage}`),
-    `  ${'help'.padEnd(width)}  this list`,
+    `  ${'help'.padEnd(width)}  ${HELP_SUMMARY}`,
     '',
+    'forget --query matches records containing ANY of its words (OR); run it without --confirm first to see them.',
     'exit codes: 0 ok, 1 error, 2 refused, 3 conflict, 4 abstain (I don\'t know)',
   ].join('\n');
+}
+
+function helpJson(): unknown {
+  return {
+    verbs: [
+      ...Object.entries(VERBS).map(([name, v]) => ({ name, usage: `elmory ${v.usage}`, summary: v.summary })),
+      { name: 'help', usage: 'elmory help', summary: HELP_SUMMARY },
+    ],
+    exitCodes: { ok: EXIT_OK, error: EXIT_ERROR, refused: EXIT_REFUSED, conflict: EXIT_CONFLICT, abstain: EXIT_ABSTAIN },
+  };
 }
 
 // ---------------------------------------------------------------------------
 // main
 
 function oneLine(s: string): string {
-  return s.replace(/\s*\n\s*/g, ' ').trim();
+  return s.replace(/\s*[\r\n]\s*/g, ' ').trim();
 }
 
 function defaultObserver(): string {
@@ -367,28 +424,44 @@ function defaultObserver(): string {
   return `cli:${user}`;
 }
 
-/** The top of the git worktree holding `dir` (quotes and `about` paths are relative to it), else `dir`. */
-async function worktreeRoot(dir: string): Promise<string> {
-  try {
-    const r = await defaultExec('git', ['rev-parse', '--show-toplevel'], { cwd: dir });
-    const top = r.stdout.trim();
-    if (r.code === 0 && top !== '') return top;
-  } catch {
-    // no git: the directory itself
+/** The global flags; they may come before the verb as well as after it. */
+const GLOBAL_VALUE = new Set(['--worktree', '--observer']);
+
+/** Split argv into the verb and its arguments; global flags placed before the verb join the arguments. */
+function splitVerb(argv: string[]): { name: string | undefined; rest: string[] } {
+  const lead: string[] = [];
+  let i = 0;
+  while (i < argv.length) {
+    const a = argv[i] as string;
+    if (a === '--json' || /^--(worktree|observer)=/.test(a)) {
+      lead.push(a);
+      i += 1;
+    } else if (GLOBAL_VALUE.has(a)) {
+      lead.push(...argv.slice(i, i + 2));
+      i += 2;
+    } else break;
   }
-  return dir;
+  return { name: argv[i], rest: [...lead, ...argv.slice(i + 1)] };
+}
+
+/** One printable line, or refused: the observer is stamped into records and printed by history. */
+function checkObserver(observer: string): string {
+  if (CONTROL.test(observer) || observer.trim() === '') {
+    throw new RefusedError('the observer must be one line of printable characters', 'observer');
+  }
+  return observer;
 }
 
 async function main(argv: string[]): Promise<number> {
-  const [name, ...rest] = argv;
+  const { name, rest } = splitVerb(argv);
+  let json = rest.includes('--json');
   if (name === undefined || name === 'help' || name === '--help' || name === '-h') {
-    process.stdout.write(`${helpText()}\n`);
+    process.stdout.write(`${json ? JSON.stringify(helpJson()) : helpText()}\n`);
     return EXIT_OK;
   }
   const verb = Object.hasOwn(VERBS, name) ? VERBS[name] : undefined;
-  let json = rest.includes('--json');
   const fail = (code: number, kind: string, message: string, extra: Record<string, unknown> = {}): number => {
-    process.stderr.write(`elmory ${name}: ${oneLine(message)}\n`);
+    process.stderr.write(`elmory ${inline(name)}: ${inline(oneLine(message))}\n`);
     if (json) process.stdout.write(`${JSON.stringify({ error: kind, message: oneLine(message), ...extra })}\n`);
     return code;
   };
@@ -405,10 +478,12 @@ async function main(argv: string[]): Promise<number> {
 
   let e: Elmory | null = null;
   try {
-    const dir = path.resolve(str(args, 'worktree') ?? process.cwd());
-    e = await Elmory.open({ worktree: await worktreeRoot(dir), observer: str(args, 'observer') ?? defaultObserver() });
+    const observer = checkObserver(str(args, 'observer') ?? defaultObserver());
+    const worktree = await resolveWorktree(str(args, 'worktree') ?? process.cwd());
+    e = await Elmory.open({ worktree, observer });
     const out = await verb.run(e, args);
-    process.stdout.write(`${json ? JSON.stringify(out.data) : out.text}\n`);
+    process.stdout.write(`${json ? JSON.stringify(out.data) : multiline(out.text)}\n`);
+    if (out.stderr !== undefined) process.stderr.write(`elmory ${name}: ${out.stderr}\n`);
     return out.code ?? EXIT_OK;
   } catch (err) {
     if (err instanceof RefusedError) return fail(EXIT_REFUSED, 'refused', `refused (${err.reason}): ${err.message}`, { reason: err.reason });
