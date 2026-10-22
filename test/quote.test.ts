@@ -265,7 +265,9 @@ describe('locate', () => {
     expect(locateAfter(before, QUOTE, '')).toBe('not-found');
   });
 
-  it('timing: 5000 quotes over 200 files locate in under 2 s', () => {
+  // A regression guard, not a benchmark: the budget leaves room for a loaded machine. The
+  // measured time is logged; about 270 ms on an idle dev machine.
+  it('timing: 5000 quotes over 200 files locate in under 5 s', () => {
     const files: string[] = [];
     const quotes: { file: number; quote: string; anchor: string; tokens: number }[] = [];
     for (let f = 0; f < 200; f++) {
@@ -291,6 +293,6 @@ describe('locate', () => {
     expect(results).toHaveLength(5000);
     expect(results.every((r) => r === 'found')).toBe(true);
     console.log(`timing: 5000 quotes over 200 files located in ${elapsed.toFixed(0)} ms`);
-    expect(elapsed).toBeLessThan(2000);
+    expect(elapsed).toBeLessThan(5000);
   });
 });
