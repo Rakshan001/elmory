@@ -60,11 +60,13 @@ export class Deriver {
   private readonly input: DeriveInput;
   /** ids named by a trusted tombstone */
   private readonly forgotten = new Set<string>();
-  /** ids named only by untrusted tombstones */
+  /** ids named only by an untrusted tombstone */
   private readonly forgetUntrusted = new Set<string>();
+  /** One tombstone per id: the local copy when there is one, else the committed copy. */
+  private readonly tombs: Tombstone[];
   /** Chain nodes: every record and every trusted tombstone id. */
   private readonly nodes = new Set<string>();
-  /** Undirected supersedes edges between nodes. */
+  /** Undirected supersedes edges between nodes, from effective superseders and trusted tombstones only. */
   private readonly adj = new Map<string, Set<string>>();
   /** target → records (any trust) whose `supersedes` names it */
   private readonly recordSupersededBy = new Map<string, string[]>();
@@ -74,35 +76,42 @@ export class Deriver {
   private readonly scc = new Map<string, number>();
   /** records on a dependency cycle (through `cites` and/or effective `supersedes`) */
   private readonly cyclic = new Set<string>();
-  private readonly staticMemo = new Map<string, string | null>();
+  private readonly slotMemo = new Map<string, string | null>();
   private readonly baseMemo = new Map<string, Promise<Base>>();
   private readonly stateMemo = new Map<string, Promise<Derived>>();
 
   constructor(input: DeriveInput) {
     this.input = input;
-    const committedOnly: Tombstone[] = [];
+    // A tombstone's text is not bound to its name, so a committed copy is only ever judged on
+    // its own: when a local twin exists, the local text is the one that counts (an unsigned edit
+    // of the committed file must not add edges).
+    const byId = new Map<string, Tombstone>();
     for (const t of input.tombstones) {
-      if (this.tombstoneTrusted(t)) this.forgotten.add(t.id);
-      else committedOnly.push(t);
+      const prev = byId.get(t.id);
+      if (prev === undefined || (prev.committed && !t.committed)) byId.set(t.id, t);
     }
-    for (const t of committedOnly) if (!this.forgotten.has(t.id)) this.forgetUntrusted.add(t.id);
+    this.tombs = [...byId.values()];
+    for (const t of this.tombs) (this.tombstoneTrusted(t) ? this.forgotten : this.forgetUntrusted).add(t.id);
 
     for (const id of input.records.keys()) this.nodes.add(id);
     for (const id of this.forgotten) this.nodes.add(id);
 
     for (const row of input.records.values()) {
+      // Only an effective superseder (trusted, non-candidate) joins chains: an untrusted record
+      // naming two unrelated heads must not merge them into one chain and make both conflict.
+      // A record withheld only by an untrusted forget keeps its slot (see slotCandidate).
+      const effective = this.slotCandidate(row.id) === null;
       for (const target of new Set(row.supersedes)) {
         if (!this.nodes.has(target)) continue; // unknown id: the edge is absent
-        push(this.recordSupersededBy, target, row.id);
-        this.link(row.id, target);
+        push(this.recordSupersededBy, target, row.id); // every record: the unreviewed label needs it
+        if (effective) this.link(row.id, target);
       }
     }
-    for (const t of input.tombstones) {
-      if (!this.forgotten.has(t.id) || !this.tombstoneTrusted(t)) continue;
+    for (const t of this.tombs) {
+      if (!this.forgotten.has(t.id)) continue;
       for (const target of new Set(t.supersedes)) {
         if (!this.nodes.has(target)) continue;
-        const list = this.tombSupersededBy.get(target);
-        if (!list?.includes(t.id)) push(this.tombSupersededBy, target, t.id);
+        push(this.tombSupersededBy, target, t.id);
         this.link(t.id, target);
       }
     }
@@ -121,15 +130,20 @@ export class Deriver {
     return { trusted: false, source: null, reason: 'untrusted' };
   }
 
-  /** Local → true; committed → true when a local twin exists or its adding commit is signed by a trusted key. */
+  /**
+   * This copy, judged on its own: local → true; committed → true when `addedBy` reports a trusted
+   * signer for its path. A local twin does not make the committed copy's text trusted.
+   */
   tombstoneTrusted(t: Tombstone): boolean {
     if (!t.committed) return true;
-    if (this.input.tombstones.some((o) => o.id === t.id && !o.committed)) return true;
     const signer = this.input.addedBy.get(`.elmory/tombstones/${t.id}`)?.signer;
     return !!signer && this.input.trust.signers.has(signer);
   }
 
-  /** Ids of the connected component over supersedes edges (records and tombstone nodes), sorted. */
+  /**
+   * Ids of the connected component over the supersedes edges of trusted, non-candidate records
+   * and trusted tombstones (tombstone nodes included), sorted.
+   */
   chainOf(idOrKey: string): string[] {
     const starts = this.nodes.has(idOrKey)
       ? [idOrKey]
@@ -150,6 +164,17 @@ export class Deriver {
   /** Members not superseded by a trusted, non-candidate record or a trusted tombstone. */
   heads(chain: string[]): string[] {
     return chain.filter((id) => this.isHead(id));
+  }
+
+  /**
+   * `heads()` minus everything a new write can neither be served beside nor supersede:
+   * candidates (rejected, untrusted, edited, forget requested by an untrusted commit), forgotten
+   * records and tombstone-only nodes. The write-time conflict check runs on this.
+   */
+  liveHeads(chain: string[]): string[] {
+    return this.heads(chain).filter(
+      (id) => this.input.records.has(id) && !this.forgotten.has(id) && this.staticCandidate(id) === null,
+    );
   }
 
   /** Memoised; the §4.6 table, first match wins. */
@@ -183,30 +208,46 @@ export class Deriver {
   private isHead(id: string): boolean {
     if (!this.nodes.has(id)) return false;
     if (this.tombSupersededBy.has(id)) return false;
-    return !(this.recordSupersededBy.get(id) ?? []).some((s) => this.staticCandidate(s) === null);
+    return !(this.recordSupersededBy.get(id) ?? []).some((s) => this.slotCandidate(s) === null);
   }
 
-  /** Steps 1–2 without recursion: the candidate reason, or null when the record may be served. */
-  private staticCandidate(id: string): string | null {
-    if (this.staticMemo.has(id)) return this.staticMemo.get(id) ?? null;
+  /**
+   * Steps 1–2 for the record's place in its chain, without recursion: the candidate reason, or
+   * null when the record is an effective superseder. An untrusted forget is not a reason here: it
+   * withholds the record itself (staticCandidate) but the record keeps its slot, so the older
+   * value is not brought back (§6.3) by an unsigned commit (§8 V3).
+   */
+  private slotCandidate(id: string): string | null {
+    if (this.slotMemo.has(id)) return this.slotMemo.get(id) ?? null;
     const row = this.input.records.get(id);
     let reason: string | null;
     if (!row) reason = 'not-found';
     else if (row.candidate !== null) reason = row.candidate;
     else {
       const t = this.trustOf(id);
-      reason = !t.trusted ? (t.reason ?? 'untrusted') : this.forgetUntrusted.has(id) ? FORGET_UNTRUSTED : null;
+      reason = t.trusted ? null : (t.reason ?? 'untrusted');
     }
-    this.staticMemo.set(id, reason);
+    this.slotMemo.set(id, reason);
     return reason;
   }
 
-  /** Records whose state decides this record's base state: effective superseders and cited records. */
+  /** Steps 1–2: the candidate reason, or null when the record may be served. */
+  private staticCandidate(id: string): string | null {
+    return this.slotCandidate(id) ?? (this.forgetUntrusted.has(id) ? FORGET_UNTRUSTED : null);
+  }
+
+  /**
+   * The records `computeBase(id)` awaits, and nothing else: effective superseders and the cited
+   * records it recurses into. Mirrors computeBase's early returns so a cycle is only reported
+   * where evaluation would actually wait on itself.
+   */
   private deps(id: string): string[] {
     const row = this.input.records.get(id);
-    if (!row) return [];
-    const out = (this.recordSupersededBy.get(id) ?? []).filter((s) => this.staticCandidate(s) === null);
-    for (const c of row.cites) if (this.input.records.has(c)) out.push(c);
+    if (!row || this.slotCandidate(id) !== null || this.forgotten.has(id) || this.tombSupersededBy.has(id)) return [];
+    const out = (this.recordSupersededBy.get(id) ?? []).filter((s) => this.slotCandidate(s) === null);
+    for (const c of row.cites) {
+      if (this.input.records.has(c) && !this.forgotten.has(c) && this.isHead(c) && this.staticCandidate(c) === null) out.push(c);
+    }
     return out;
   }
 
@@ -279,8 +320,8 @@ export class Deriver {
   private async computeBase(id: string): Promise<Base> {
     const row = this.input.records.get(id);
     if (!row) throw new RangeError(`unknown record: ${id}`);
-    // 1–2: candidate
-    const cand = this.staticCandidate(id);
+    // 1–2: candidate (an untrusted forget is applied in derive(): the slot is judged here)
+    const cand = this.slotCandidate(id);
     if (cand !== null) return { state: 'candidate', reason: cand, evidence: [] };
     // 3: forgotten
     if (this.forgotten.has(id)) return { state: 'forgotten', reason: null, evidence: [] };
@@ -288,7 +329,7 @@ export class Deriver {
     // (it holds itself, or something newer above it does: §6.3 "newest member that holds").
     const tomb = this.tombSupersededBy.get(id)?.[0];
     if (tomb !== undefined) return { state: 'superseded', reason: `superseded by ${tomb}`, evidence: [] };
-    for (const s of (this.recordSupersededBy.get(id) ?? []).filter((x) => this.staticCandidate(x) === null).sort()) {
+    for (const s of (this.recordSupersededBy.get(id) ?? []).filter((x) => this.slotCandidate(x) === null).sort()) {
       if (this.sameCycle(id, s)) continue;
       const b = await this.baseOf(s);
       if (b.state === 'holds' || b.state === 'superseded') return { state: 'superseded', reason: `superseded by ${s}`, evidence: [] };
@@ -299,14 +340,15 @@ export class Deriver {
     for (const r of evidence) if (r.outcome !== 'holds') problems.push({ state: r.outcome, reason: r.detail });
     if (this.cyclic.has(id)) problems.push({ state: 'suspect', reason: 'cycle' });
     for (const c of row.cites) {
-      if (!this.input.records.has(c)) problems.push({ state: 'stale', reason: 'cited record gone' });
+      // Forgotten before head: §4.6 puts stale before suspect, and a forgotten record is gone.
+      if (!this.input.records.has(c) || this.forgotten.has(c)) problems.push({ state: 'stale', reason: 'cited record gone' });
       else if (!this.isHead(c)) problems.push({ state: 'suspect', reason: 'basis replaced' });
+      else if (this.staticCandidate(c) !== null) problems.push({ state: 'suspect', reason: 'cited record does not hold' });
       else if (this.sameCycle(id, c)) continue; // already suspect: cycle
       else {
         const b = await this.baseOf(c);
         if (b.state === 'holds') continue;
-        if (b.state === 'forgotten') problems.push({ state: 'stale', reason: 'cited record gone' });
-        else if (b.state === 'stale' || b.state === 'unknown') problems.push({ state: b.state, reason: 'cited record does not hold' });
+        if (b.state === 'stale' || b.state === 'unknown') problems.push({ state: b.state, reason: 'cited record does not hold' });
         else problems.push({ state: 'suspect', reason: 'cited record does not hold' });
       }
     }
@@ -325,11 +367,16 @@ export class Deriver {
       if (!this.forgotten.has(id)) throw new RangeError(`unknown record: ${id}`);
       return { id, state: 'forgotten', reason: null, trusted: t.trusted, trustSource: t.source, head, labels: [], evidence: [] };
     }
-    const base = await this.baseOf(id);
+    // An untrusted forget withholds the record itself; its slot is still judged by baseOf for others.
+    const base: Base =
+      this.slotCandidate(id) === null && this.forgetUntrusted.has(id)
+        ? { state: 'candidate', reason: FORGET_UNTRUSTED, evidence: [] }
+        : await this.baseOf(id);
     let state: State;
     if (base.state !== 'holds') state = base.state;
     else {
-      // 6: conflict when another global head of the same chain also holds here
+      // 6: conflict when another global head of the same chain also holds here (a head withheld
+      // by an untrusted forget still holds its slot, so it still makes this one conflict)
       state = 'active';
       if (head) {
         for (const other of this.heads(this.chainOf(id))) {
@@ -368,7 +415,7 @@ export class Deriver {
     // Active but not a global head: every trusted newer member fails here (otherwise step 4 hit).
     if (state === 'active' && !head) out.add(LABEL_NEWER_FAILS);
     const unreviewed = (this.recordSupersededBy.get(row.id) ?? []).some(
-      (s) => this.staticCandidate(s) !== null && this.trustOf(s).reason !== 'rejected',
+      (s) => this.slotCandidate(s) !== null && this.trustOf(s).reason !== 'rejected',
     );
     if (unreviewed) out.add(LABEL_UNREVIEWED);
     return [...out];

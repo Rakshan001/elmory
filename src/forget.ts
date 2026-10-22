@@ -3,9 +3,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Context } from './context.js';
-import type { State } from './derive.js';
 import { RefusedError, syncStore } from './gate.js';
-import { recall } from './recall.js';
 import { RecordError, isRecordId, parse } from './record.js';
 
 export type ForgetScope = { ids: string[] } | { query: string; confirm: true } | { all: true; confirm: true };
@@ -43,18 +41,6 @@ export const UNREACHABLE: readonly string[] = [
   'backups, Time Machine / APFS snapshots',
   'model provider prompt caches',
 ];
-
-/** Exhaustive over State (the compiler checks it), so a query seed sees records in every state. */
-const EVERY_STATE: Record<State, true> = {
-  candidate: true,
-  forgotten: true,
-  superseded: true,
-  conflict: true,
-  stale: true,
-  suspect: true,
-  unknown: true,
-  active: true,
-};
 
 const ARCHIVED_FILE = /^(f_[a-z2-7]{26})\.md$/;
 
@@ -102,10 +88,13 @@ function archivedNodes(ctx: Context): Map<string, Node> {
   return out;
 }
 
-/** Every record forget can see: indexed rows first, then archived files not also indexed. */
+/**
+ * Every record forget can see: this worktree's view of the shared rows first (another worktree's
+ * facts are not here to delete, §8 step 8), then archived files not also in the view.
+ */
 function graph(ctx: Context): Map<string, Node> {
   const nodes = new Map<string, Node>();
-  for (const r of ctx.cache.allRecords()) {
+  for (const r of ctx.view()) {
     nodes.set(r.id, { title: r.title, cites: r.cites, supersedes: r.supersedes, facts: r.area === 'facts' });
   }
   for (const [id, n] of archivedNodes(ctx)) if (!nodes.has(id)) nodes.set(id, n);
@@ -163,12 +152,12 @@ async function seedsOf(ctx: Context, scope: ForgetScope | ForgetPreviewScope, co
   }
   if ('query' in scope) {
     if (typeof scope.query !== 'string') throw new RefusedError('query must be a string', 'shape');
-    const r = await recall(ctx, {
-      query: scope.query,
-      include: Object.keys(EVERY_STATE) as State[],
-      budgetTokens: Number.MAX_SAFE_INTEGER,
-    });
-    return r.abstain ? [] : r.served.map((s) => s.id);
+    // Straight from the search, not through recall: recall serves only the states `include` may
+    // name (never candidate or forgotten) and stamps `recall:<id>`, so a preview would count as a
+    // use. Every record of this worktree's view that matches is a seed, whatever its state.
+    await ctx.sync();
+    const mine = new Set(ctx.view().map((r) => r.id));
+    return ctx.cache.search(scope.query, { limit: Number.MAX_SAFE_INTEGER, offset: 0 }).flatMap((h) => (mine.has(h.id) ? [h.id] : []));
   }
   if ((scope as { all?: unknown }).all === true) {
     await ctx.sync();

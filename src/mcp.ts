@@ -19,6 +19,8 @@ import { RecordError, TAGS, type Tag } from './record.js';
 import { resolveWorktree } from './worktree.js';
 
 const STATES: readonly State[] = ['candidate', 'forgotten', 'superseded', 'conflict', 'stale', 'suspect', 'unknown', 'active'];
+/** What `include` may name; candidate and forgotten are refused by recall (seen through review, or never). */
+const INCLUDABLE: readonly State[] = ['superseded', 'conflict', 'stale', 'suspect', 'unknown', 'active'];
 
 /** Verbatim in the recall tool's description (spec §7.2). */
 const RECALL_RULES =
@@ -160,8 +162,8 @@ const TOOLS: Tool[] = [
   {
     name: 'elmory_recall',
     description:
-      'Search memory for this worktree. Returns { abstain: false, served: [{ id, title, body, state, labels, paths, warnings, … }], tokensUsed } ' +
-      'with only the records that hold here, or { abstain: true, reason, hints }. ' +
+      'Search memory for this worktree. Returns { abstain: false, served: [{ id, title, body, state, labels, paths, warnings, … }], tokensUsed, warnings } ' +
+      'with only the records that hold here, or { abstain: true, reason, hints, warnings }. Top-level warnings (e.g. index busy) mean results may be behind. ' +
       RECALL_RULES,
     inputSchema: {
       type: 'object',
@@ -170,7 +172,7 @@ const TOOLS: Tool[] = [
         budgetTokens: { type: 'integer', minimum: 1, description: 'Token budget for the served records (default 1 500).' },
         include: {
           type: 'array',
-          items: { type: 'string', enum: [...STATES] },
+          items: { type: 'string', enum: [...INCLUDABLE] },
           description: 'States to serve besides active and conflict, e.g. ["stale"] to see facts whose code changed.',
         },
       },
@@ -202,14 +204,15 @@ const TOOLS: Tool[] = [
   },
   {
     name: 'elmory_history',
-    description: 'The supersedes chain of a record id or key, oldest first: [{ id, title, recorded, observer, state, supersedes, forgotten }].',
+    description:
+      'The supersedes chain of a record id or key, oldest first: { entries: [{ id, title, recorded, observer, state, supersedes, forgotten }], warnings }.',
     inputSchema: { type: 'object', properties: { idOrKey: S }, required: ['idOrKey'] },
     run: (m, a) => m.history(str(a, 'idOrKey')),
   },
   {
     name: 'elmory_verify',
     description:
-      'Re-check every record (or only those quoting the given files) against this worktree. Returns { changed: [{ id, from, to }], states } ' +
+      'Re-check every record (or only those quoting the given files) against this worktree. Returns { changed: [{ id, from, to }], states, warnings } ' +
       'with a count per state. Run it after editing code that facts quote.',
     inputSchema: { type: 'object', properties: { files: { ...IDS, description: 'Repo-relative paths; default every record.' } } },
     run: (m, a) => {

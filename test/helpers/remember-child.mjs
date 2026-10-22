@@ -23,7 +23,7 @@ try {
   await e.remember(JSON.parse(inputJson));
   console.log('OK');
 } catch (err) {
-  if (err instanceof ConflictError) console.log('CONFLICT');
+  if (err instanceof ConflictError) console.log(`CONFLICT ${err.heads.join(',')}`);
   else {
     console.error(err);
     process.exitCode = 1;

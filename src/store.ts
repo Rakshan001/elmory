@@ -359,6 +359,19 @@ export class Store {
     return null;
   }
 
+  /**
+   * Record ids named in one visible area, from the directory listing only (no file is read or
+   * checked to be regular). An area that fails the store's directory gate lists nothing.
+   */
+  ids(area: 'facts' | 'pending' | 'local'): string[] {
+    const out: string[] = [];
+    for (const name of this.names(this.layout[area])) {
+      const id = RECORD_FILE.exec(name)?.[1];
+      if (id !== undefined) out.push(id);
+    }
+    return out;
+  }
+
   /** Every regular record file in facts, pending and local; text exactly as on disk. */
   listRecords(): StoredRecord[] {
     const out: StoredRecord[] = [];
@@ -423,9 +436,12 @@ export class Store {
       if (line === '') return;
       if (TRUST_ID_LINE.test(line)) {
         const [verb, id] = line.split(' ') as [string, string];
+        // The latest line for an id wins: a `written` or `approved` after a `rejected` re-trusts
+        // it (trustOf checks `rejected` first, so it only has to be dropped here).
         if (verb === 'written') trust.written.add(id);
         else if (verb === 'approved') trust.approved.add(id);
         else trust.rejected.add(id);
+        if (verb !== 'rejected') trust.rejected.delete(id);
       } else if (TRUST_SIGNER_LINE.test(line)) {
         trust.signers.add(line.slice('signer '.length));
       } else {
@@ -500,25 +516,55 @@ export class Store {
     return moved;
   }
 
-  /** pending | local → archive. Throws when the id is in neither. */
-  archive(id: string): void {
-    assertId(id);
-    let found = false;
-    for (const area of ['pending', 'local'] as const) {
-      const from = this.regularRecord(area, id);
-      if (from === null) continue;
-      this.moveRecord(from, 'archive', id);
-      found = true;
-    }
-    if (!found) throw new RecordError(`no pending or local record ${id}`, 'not-found');
+  /** Where an archived local record lives, so a restore puts it back into local (V25). */
+  private get archivedLocal(): string {
+    return path.join(this.layout.archive, 'local');
   }
 
-  /** archive → pending. Throws when the id is not archived. */
-  restore(id: string): void {
+  /**
+   * pending → `archive/<id>.md`, local → `archive/local/<id>.md`: the origin area is kept so a
+   * restore never turns a private record into a publishable one. Returns the areas archived
+   * from; throws when the id is in neither.
+   */
+  archive(id: string): ('pending' | 'local')[] {
     assertId(id);
-    const from = this.regularRecord('archive', id);
-    if (from === null) throw new RecordError(`no archived record ${id}`, 'not-found');
-    this.moveRecord(from, 'pending', id);
+    const from: ('pending' | 'local')[] = [];
+    for (const area of ['pending', 'local'] as const) {
+      const file = this.regularRecord(area, id);
+      if (file === null) continue;
+      this.moveRecordTo(file, area === 'local' ? this.archivedLocal : this.layout.archive, id);
+      from.push(area);
+    }
+    if (from.length === 0) throw new RecordError(`no pending or local record ${id}`, 'not-found');
+    return from;
+  }
+
+  /**
+   * Every archived copy of `id` back into the area it was archived from (`archive/<id>.md` →
+   * pending, `archive/local/<id>.md` → local). Returns those areas; throws when none is archived.
+   */
+  restore(id: string): ('pending' | 'local')[] {
+    assertId(id);
+    const to: ('pending' | 'local')[] = [];
+    const pendingCopy = this.regularRecord('archive', id);
+    if (pendingCopy !== null) {
+      this.moveRecord(pendingCopy, 'pending', id);
+      to.push('pending');
+    }
+    const localCopy = this.archivedLocalFile(id);
+    if (localCopy !== null) {
+      this.moveRecord(localCopy, 'local', id);
+      to.push('local');
+    }
+    if (to.length === 0) throw new RecordError(`no archived record ${id}`, 'not-found');
+    return to;
+  }
+
+  /** `archive/local/<id>.md` when it is a regular file in a safe directory. */
+  private archivedLocalFile(id: string): string | null {
+    if (this.dirState(this.archivedLocal) !== 'ok') return null;
+    const file = path.join(this.archivedLocal, `${id}.md`);
+    return kindOf(file) === 'file' ? file : null;
   }
 
   /** Delete `id` from every area it is found in as a regular file; returns those areas. */
@@ -535,6 +581,15 @@ export class Store {
         if (!isMissing(e)) throw e;
       }
     }
+    const archivedLocal = this.archivedLocalFile(id);
+    if (archivedLocal !== null) {
+      try {
+        fs.unlinkSync(archivedLocal);
+        if (!removed.includes('archive')) removed.push('archive');
+      } catch (e) {
+        if (!isMissing(e)) throw e;
+      }
+    }
     return removed;
   }
 
@@ -544,13 +599,17 @@ export class Store {
    * An unsafe destination directory or a non-regular destination entry is refused.
    */
   private moveRecord(from: string, to: Area, id: string): void {
-    const dir = this.writable(this.layout[to]);
-    const dest = kindOf(this.fileOf(to, id));
+    this.moveRecordTo(from, this.layout[to], id);
+  }
+
+  private moveRecordTo(from: string, toDir: string, id: string): void {
+    const dir = this.writable(toDir);
+    const dest = kindOf(path.join(dir, `${id}.md`));
     if (dest === 'file') {
       fs.unlinkSync(from);
       return;
     }
-    if (dest !== 'missing') throw symlinkError(`non-regular entry for ${id} in ${to}`);
+    if (dest !== 'missing') throw symlinkError(`non-regular entry for ${id} in ${toDir}`);
     moveFile(from, dir, id, `${id}.md`);
   }
 }

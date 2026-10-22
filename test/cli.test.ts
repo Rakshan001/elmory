@@ -130,7 +130,7 @@ describe('elmory cli', () => {
 
     const json = await run('recall', 'nothing like this exists', '--json');
     expect(json.code).toBe(4);
-    expect(JSON.parse(json.out)).toEqual({ abstain: true, reason: 'no records match', hints: [] });
+    expect(JSON.parse(json.out)).toEqual({ abstain: true, reason: 'no records match', hints: [], warnings: [] });
   }, 30000);
 
   it('help lists every verb', async () => {
@@ -274,7 +274,7 @@ describe('elmory cli', () => {
 
     const hist = await run('history', 'auth.gate', '--json');
     expect(hist, hist.err).toMatchObject({ code: 0 });
-    expect((JSON.parse(hist.out) as { id: string }[]).map((h) => h.id)).toEqual([id]);
+    expect(JSON.parse(hist.out)).toEqual({ entries: [expect.objectContaining({ id })], warnings: [] });
 
     const f = await run('forget', id, '--json');
     expect(f, f.err).toMatchObject({ code: 0 });

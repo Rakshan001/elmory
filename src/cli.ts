@@ -68,6 +68,8 @@ interface Outcome {
   code?: number;
   /** one line for stderr, in both modes (like an error) */
   stderr?: string;
+  /** e.g. 'index busy; results may be behind': stderr in human mode (`--json` has them in data) */
+  warnings?: string[];
 }
 
 class UsageError extends Error {}
@@ -173,9 +175,14 @@ function block(s: Served): string {
 
 function served(r: RecallResult | Abstain): Outcome {
   if (r.abstain) {
-    return { data: r, text: [`I don't know: ${inline(r.reason)}`, ...r.hints.map((h) => `  ${inline(h)}`)].join('\n'), code: EXIT_ABSTAIN };
+    return {
+      data: r,
+      text: [`I don't know: ${inline(r.reason)}`, ...r.hints.map((h) => `  ${inline(h)}`)].join('\n'),
+      code: EXIT_ABSTAIN,
+      warnings: r.warnings,
+    };
   }
-  return { data: r, text: r.served.map(block).join('\n\n') };
+  return { data: r, text: r.served.map(block).join('\n\n'), warnings: r.warnings };
 }
 
 function lines(items: string[], empty: string): string {
@@ -242,12 +249,12 @@ const VERBS: Record<string, Verb> = {
     async run(e, a) {
       const target = one(a, 'id or key');
       const h = await e.history(target);
-      const rows = h.map(
+      const rows = h.entries.map(
         (x) =>
           `${x.id} ${x.state}${x.forgotten ? ' (forgotten)' : ''} ${inline(x.recorded)} ${inline(x.observer)} ${inline(x.title)}` +
           (x.supersedes.length > 0 ? ` ← supersedes ${x.supersedes.join(', ')}` : ''),
       );
-      return { data: h, text: lines(rows, `no history for ${inline(target)}`) };
+      return { data: h, text: lines(rows, `no history for ${inline(target)}`), warnings: h.warnings };
     },
   },
   verify: {
@@ -263,7 +270,7 @@ const VERBS: Record<string, Verb> = {
         .map(([s, n]) => `${n} ${s}`)
         .join(', ');
       const changed = r.changed.map((c) => `${c.id} ${c.from ?? 'new'} → ${c.to}`);
-      return { data: r, text: [...changed, counts === '' ? 'no records' : counts].join('\n') };
+      return { data: r, text: [...changed, counts === '' ? 'no records' : counts].join('\n'), warnings: r.warnings };
     },
   },
   forget: {
@@ -345,7 +352,12 @@ const VERBS: Record<string, Verb> = {
       }
       const r = await e.gc({ dryRun: flag(a, 'dry-run') });
       const verb = r.dryRun ? 'would archive' : 'archived';
-      const out = [...r.archived.map((id) => `${verb} ${id}`), ...r.committed.map((id) => `due (committed, delete in a commit) ${id}`)];
+      const out = [
+        ...r.archived.map((id) => `${verb} ${id}`),
+        ...r.committed.map((id) => `due (committed, delete in a commit) ${id}`),
+        ...r.staleHere.map((id) => `left (still holds in another worktree) ${id}`),
+        ...r.skipped.map((x) => `skipped (${inline(x.reason)}) ${x.id}`),
+      ];
       return { data: r, text: lines(out, 'nothing to collect') };
     },
   },
@@ -483,6 +495,7 @@ async function main(argv: string[]): Promise<number> {
     e = await Elmory.open({ worktree, observer });
     const out = await verb.run(e, args);
     process.stdout.write(`${json ? JSON.stringify(out.data) : multiline(out.text)}\n`);
+    if (!json) for (const w of out.warnings ?? []) process.stderr.write(`elmory ${name}: warning: ${inline(w)}\n`);
     if (out.stderr !== undefined) process.stderr.write(`elmory ${name}: ${out.stderr}\n`);
     return out.code ?? EXIT_OK;
   } catch (err) {

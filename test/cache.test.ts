@@ -81,22 +81,44 @@ function count(file: string, needle: string): number {
 
 interface ChildResult {
   code: number | null;
+  /** The final status line: OK or BUSY (READY is reported through `ready`). */
   out: string;
 }
 
-function runChild(dir: string, holdMs: number, name: string, env: Record<string, string> = {}): Promise<ChildResult> {
-  return new Promise((resolve, reject) => {
-    const p = spawn(process.execPath, ['--no-warnings', LOCK_CHILD, dir, String(holdMs), name], {
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, ...env },
-    });
-    let out = '';
-    let err = '';
-    p.stdout.on('data', (d: Buffer) => (out += d.toString()));
-    p.stderr.on('data', (d: Buffer) => (err += d.toString()));
-    p.on('error', reject);
-    p.on('exit', (code) => resolve({ code, out: (out + err).trim() }));
+interface Child {
+  /** Resolves once the child holds the write lock; rejects if it exits first. */
+  ready: Promise<void>;
+  done: Promise<ChildResult>;
+}
+
+function runChild(dir: string, holdMs: number, name: string, env: Record<string, string> = {}): Child {
+  const p = spawn(process.execPath, ['--no-warnings', LOCK_CHILD, dir, String(holdMs), name], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, ...env },
   });
+  let out = '';
+  let err = '';
+  let onReady: () => void = () => {};
+  let onNotReady: (e: Error) => void = () => {};
+  const ready = new Promise<void>((res, rej) => {
+    onReady = res;
+    onNotReady = rej;
+  });
+  ready.catch(() => {}); // callers that never await ready must not see an unhandled rejection
+  p.stdout.on('data', (d: Buffer) => {
+    out += d.toString();
+    if (out.split('\n').includes('READY')) onReady();
+  });
+  p.stderr.on('data', (d: Buffer) => (err += d.toString()));
+  const done = new Promise<ChildResult>((resolve, reject) => {
+    p.on('error', reject);
+    p.on('exit', (code) => {
+      onNotReady(new Error(`child ${name} exited before READY: ${out}${err}`));
+      const lines = out.split('\n').filter((l) => l && l !== 'READY');
+      resolve({ code, out: [...lines, err.trim()].filter(Boolean).join('\n') });
+    });
+  });
+  return { ready, done };
 }
 
 describe('defaultCacheDir', () => {
@@ -181,10 +203,13 @@ describe('Cache', () => {
     }).not.toThrow();
     expect(hits.map((h) => h.id)).toEqual(['f_tok']);
     expect(Number.isFinite(hits[0]?.score)).toBe(true);
-    for (const q of ['', '   ', '"', 'a"b OR NOT', 'col:x', '* ^ -', 'AND']) {
+    for (const q of ['', '   ', '"', 'a"b OR NOT', 'col:x', '* ^ -', 'AND', 'a\0b', 'hello\0', '\0', '"\0"']) {
       expect(() => c.search(q, { limit: 10, offset: 0 })).not.toThrow();
     }
     expect(c.search('   ', { limit: 10, offset: 0 })).toEqual([]);
+    expect(c.search('\0', { limit: 10, offset: 0 })).toEqual([]);
+    // a NUL separates terms like whitespace
+    expect(c.search('nothing\0checkToken', { limit: 10, offset: 0 }).map((h) => h.id).sort()).toEqual(['f_other', 'f_tok']);
   });
 
   it('search excludes ids in excludeIds and pages with offset', () => {
@@ -248,6 +273,15 @@ describe('Cache', () => {
     expect(c.getMeta('k')).toBe('v2');
   });
 
+  it('stat entries with inode numbers above 2^53 (NTFS, overlayfs xino)', () => {
+    const c = open(tmp());
+    const st = { mtimeMs: Date.now() - 60_000, ctimeMs: Date.now() - 60_000, size: 9, ino: 2 ** 60 };
+    c.statPut('/wt', 'big.ts', st, 'cid-big');
+    expect(c.statLookup('/wt', 'big.ts', st)).toBe('cid-big');
+    expect(c.statLookup('/wt', 'big.ts', { ...st, ino: 2 ** 60 + 2 ** 9 })).toBeNull();
+    expect(c.statLookup('/wt', 'big.ts', { ...st, ino: 7 })).toBeNull();
+  });
+
   it('racy stat', () => {
     const c = open(tmp());
     const fresh = { mtimeMs: Date.now() - 500, ctimeMs: Date.now() - 500, size: 1, ino: 1 };
@@ -262,20 +296,24 @@ describe('Cache', () => {
     const dir = tmp();
     open(dir); // create the cache before the race
     const holder = runChild(dir, 1500, 'holder');
-    await new Promise((r) => setTimeout(r, 200));
-    const others = Array.from({ length: 9 }, (_, i) => runChild(dir, 0, `w${i}`, { ELMORY_TEST_BUSY_MS: '500' }));
-    const results = await Promise.all([holder, ...others]);
+    await holder.ready; // the holder has the lock: everyone below starts while it is held
+    // five give up early (BUSY); four wait it out and must start after the holder ends
+    const names = Array.from({ length: 9 }, (_, i) => (i < 5 ? `quick${i}` : `patient${i}`));
+    const others = names.map((n) =>
+      runChild(dir, 0, n, { ELMORY_TEST_BUSY_MS: n.startsWith('quick') ? '300' : '5000' }),
+    );
+    const results = await Promise.all([holder.done, ...others.map((o) => o.done)]);
     for (const r of results) expect(r.code, r.out).toBe(0);
     expect(results[0]?.out).toBe('OK');
     for (const r of results.slice(1)) expect(['OK', 'BUSY']).toContain(r.out);
 
     // every child that held the lock recorded its interval; no two overlap
     const c = open(dir);
-    const names = ['holder', ...Array.from({ length: 9 }, (_, i) => `w${i}`)];
+    const all = ['holder', ...names];
     const intervals: [number, number][] = [];
     results.forEach((r, i) => {
-      const start = c.getMeta(`lock:${names[i]}:start`);
-      const end = c.getMeta(`lock:${names[i]}:end`);
+      const start = c.getMeta(`lock:${all[i]}:start`);
+      const end = c.getMeta(`lock:${all[i]}:end`);
       if (r.out === 'OK') {
         expect(start).not.toBeNull();
         expect(end).not.toBeNull();
@@ -284,18 +322,22 @@ describe('Cache', () => {
         expect(start).toBeNull();
       }
     });
-    expect(intervals.length).toBeGreaterThanOrEqual(1);
-    intervals.sort((a, b) => a[0] - b[0]);
-    for (let i = 1; i < intervals.length; i++) expect(intervals[i]![0]).toBeGreaterThanOrEqual(intervals[i - 1]![1]);
     const [hs, he] = [Number(c.getMeta('lock:holder:start')), Number(c.getMeta('lock:holder:end'))];
     expect(he - hs).toBeGreaterThanOrEqual(1400);
+    // non-vacuous: the patient children all held the lock, each after the holder released it
+    const patient = results.slice(6);
+    for (const r of patient) expect(r.out).toBe('OK');
+    for (const n of names.slice(5)) expect(Number(c.getMeta(`lock:${n}:start`))).toBeGreaterThanOrEqual(he);
+    expect(intervals.length).toBeGreaterThanOrEqual(5);
+    intervals.sort((x, y) => x[0] - y[0]);
+    for (let i = 1; i < intervals.length; i++) expect(intervals[i]![0]).toBeGreaterThanOrEqual(intervals[i - 1]![1]);
   });
 
   it('withWriteLock throws CacheBusyError when another holder outlasts the busy timeout', async () => {
     const dir = tmp();
     open(dir);
     const holder = runChild(dir, 1200, 'holder');
-    await new Promise((r) => setTimeout(r, 300));
+    await holder.ready;
     const saved = process.env.ELMORY_TEST_BUSY_MS;
     process.env.ELMORY_TEST_BUSY_MS = '100';
     try {
@@ -307,7 +349,7 @@ describe('Cache', () => {
       if (saved === undefined) delete process.env.ELMORY_TEST_BUSY_MS;
       else process.env.ELMORY_TEST_BUSY_MS = saved;
     }
-    expect((await holder).out).toBe('OK');
+    expect((await holder.done).out).toBe('OK');
   });
 
   it('withWriteLock rolls back the lock and rethrows on error, and nests', () => {
@@ -368,6 +410,31 @@ describe('Cache', () => {
     expect(c.generation).toBe(1);
     expect(c.getRecord('f_x')?.body).toBe('OLD');
     expect(fs.existsSync(path.join(dir, 'cache-2.db'))).toBe(false);
+    expect(fs.existsSync(path.join(dir, 'cache-2.db-wal'))).toBe(false);
+  });
+
+  it('rebuild refuses an async fill before switching generations', async () => {
+    const dir = tmp();
+    const c = open(dir);
+    c.upsertRecord(row('f_x', { body: 'OLD' }));
+    let late: unknown = null;
+    const fill = async (fresh: Cache): Promise<void> => {
+      await null;
+      try {
+        fresh.upsertRecord(row('f_x', { body: 'NEW' }));
+      } catch (e) {
+        late = e;
+      }
+    };
+    expect(() => c.rebuild(fill as unknown as (fresh: Cache) => void)).toThrow(TypeError);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(late).not.toBeNull(); // the late write hit a closed handle, never a published generation
+    expect(c.generation).toBe(1);
+    expect(c.getRecord('f_x')?.body).toBe('OLD');
+    expect(fs.existsSync(path.join(dir, 'cache-2.db'))).toBe(false);
+    expect(fs.existsSync(path.join(dir, 'cache-2.db-wal'))).toBe(false);
+    const other = open(dir);
+    expect(other.generation).toBe(1);
   });
 
   it('rebuild never reuses a db file left behind by a crashed rebuild', () => {

@@ -30,8 +30,6 @@ describe('CAS across processes', () => {
     const results = await Promise.all(children.map((c) => c.done));
 
     for (const r of results) expect(r, r.err).toMatchObject({ code: 0 });
-    const outs = results.map((r) => r.out).sort();
-    expect(outs).toEqual([...Array<string>(9).fill('CONFLICT'), 'OK']);
 
     // One successor on disk and in the ledger; the losers wrote nothing.
     await e.sync();
@@ -40,6 +38,9 @@ describe('CAS across processes', () => {
     const written = fs.readFileSync(e.layout.trust, 'utf8').split('\n').filter((l) => l.startsWith('written '));
     expect(written).toHaveLength(2);
     const winner = ids.find((id) => id !== head) as string;
+    // Every loser was told the head it lost to: the winner.
+    const outs = results.map((r) => r.out).sort();
+    expect(outs).toEqual([...Array<string>(9).fill(`CONFLICT ${winner}`), 'OK']);
     const d = await e.deriver();
     expect((await d.state(head)).state).toBe('superseded');
     expect((await d.state(winner)).state).toBe('active');

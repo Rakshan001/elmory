@@ -144,7 +144,8 @@ describe('forget', () => {
     expect(r.cascaded).toEqual([]);
     expect(fs.readFileSync(path.join(e.layout.localTombstones, b), 'utf8')).toBe(`supersedes: [${a}]\n`);
 
-    const h = await e.history('auth.algo');
+    const { entries: h, warnings } = await e.history('auth.algo');
+    expect(warnings).toEqual([]);
     expect(h.map((x) => x.id)).toEqual([a, b, c]);
     const byId = new Map(h.map((x) => [x.id, x]));
     expect(byId.get(a)?.state).toBe('superseded');
@@ -253,9 +254,21 @@ describe('forget', () => {
     const { e } = await setup();
     const a = (await e.remember(fact('Retry budget one', { key: 'retry' }))).id;
     const b = (await e.remember(fact('Retry budget two', { key: 'retry', supersedes: [a] }))).id;
+    // a candidate (hand-edited after publishing): recall may not include it, a query forget must
+    const edited = (await e.remember(fact('Retry budget edited'))).id;
+    expect(e.publish([edited])).toEqual([edited]);
+    fs.appendFileSync(path.join(e.layout.facts, `${edited}.md`), 'x');
+    await e.sync();
+    expect((await e.review()).map((c) => c.id)).toEqual([edited]);
     const other = (await e.note({ title: 'Unrelated', text: 'Coffee is in the kitchen.' })).id;
+
+    // a preview is not a use: no recall stamp
+    const p = await previewForget(e, { query: 'Retry budget' });
+    expect(p.seeds.map((x) => x.id).sort()).toEqual([a, b, edited].sort());
+    for (const id of [a, b, edited]) expect(e.cache.getMeta(`recall:${id}`)).toBeNull();
+
     const r = await e.forget({ query: 'Retry budget', confirm: true });
-    expect([...r.deleted].sort()).toEqual([a, b].sort()); // the superseded one too
+    expect([...r.deleted].sort()).toEqual([a, b, edited].sort()); // the superseded one and the candidate too
     expect(e.store.readRecord(other)).not.toBeNull();
 
     const all = await e.forget({ all: true, confirm: true });

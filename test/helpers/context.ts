@@ -7,6 +7,7 @@ import type { Context, ElmoryEvent } from '../../src/context.js';
 import { Deriver } from '../../src/derive.js';
 import { Evidence } from '../../src/evidence.js';
 import { defaultExec, gitCommonDir } from '../../src/exec.js';
+import { viewOf } from '../../src/gate.js';
 import { Git } from '../../src/git.js';
 import { checkQuoteAtWrite } from '../../src/quote.js';
 import { type ElmoryRecord, parse, type RecordType, recordId, type Source, type Tag } from '../../src/record.js';
@@ -124,17 +125,22 @@ export async function makeContext(opts: { now?: string } = {}): Promise<TestCont
         if (!known.has(sr.id)) cache.upsertRecord(indexInline(sr));
       }
       for (const id of known) if (!seen.has(id)) cache.deleteRecord(id);
+      return [];
     },
-    async deriver() {
+    view: () => viewOf(store, cache.allRecords()),
+    async deriver(rows) {
       evidence.resetMemo();
       return new Deriver({
-        records: new Map(cache.allRecords().map((r) => [r.id, r])),
+        records: new Map((rows ?? viewOf(store, cache.allRecords())).map((r) => [r.id, r])),
         tombstones: store.readTombstones(),
         trust: store.readTrust(),
         addedBy: await gitObj.addedBy('.elmory'),
         evidence: (row) => evidence.checkAll(row.sources),
       });
     },
+    fetchAddedBy: () => gitObj.addedBy('.elmory'),
+    // One worktree: gc's cross-worktree rule is tested through Elmory (test/gc-worktrees.test.ts).
+    peerDerivers: async () => [],
     emit: (e) => {
       events.push(e);
     },
