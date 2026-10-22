@@ -276,3 +276,58 @@ describe('lint', () => {
     expect(lint(note({ tag: 'opinion' as unknown as Tag }))).toHaveLength(1);
   });
 });
+
+describe('review fixes', () => {
+  it('escapes U+2028 and U+2029 so a lint-clean record always parses back', () => {
+    const r = fact({
+      title: 'a\u2028b',
+      observer: 'x\u2029y',
+      legacyId: 'l\u2028',
+      supersedes: [],
+      cites: [],
+      sources: [
+        { resource: 'src/a\u2029.ts', quote: 'sha256:00', anchor: '000000000000', tokens: 3, commit: 'c\u2028' },
+      ],
+    });
+    expect(lint(r)).toEqual([]);
+    const text = serialize(r);
+    expect(text).not.toMatch(/[\u2028\u2029]/);
+    expect(text).toContain('title: "a\\u2028b"');
+    const back = parse(text).record;
+    expect(back).toEqual(r);
+    expect(serialize(back)).toBe(text);
+    // a hand-written raw U+2028 inside a quoted value is accepted too
+    expect(parse(text.replace('a\\u2028b', 'a\u2028b')).record.title).toBe('a\u2028b');
+  });
+
+  it('treats an undefined optional as absent and never writes "undefined"', () => {
+    const plain = fact({ sources: [{ resource: 'a.ts', quote: 'sha256:00', anchor: 'ab', tokens: 3, commit: 'c1' }] });
+    const withUndefined = {
+      ...plain,
+      tag: undefined,
+      key: undefined,
+      legacyId: undefined,
+      imported: undefined,
+      sources: [{ resource: 'a.ts', quote: 'sha256:00', anchor: 'ab', tokens: 3, commit: 'c1', legacyFile: undefined }],
+    } as unknown as ElmoryRecord;
+    const { tag: _t, key: _k, legacyId: _l, imported: _i, ...stripped } = plain;
+    expect(serialize(withUndefined)).toBe(serialize(stripped as ElmoryRecord));
+    expect(serialize(withUndefined)).not.toContain('undefined');
+    expect(serialize(withUndefined)).toContain('x-elmory-quote: "sha256:00"');
+  });
+
+  it('lint flags a source missing the fields for its kind, and serialize refuses it', () => {
+    const bare = fact({ sources: [{ resource: 'a.ts' } as unknown as ElmoryRecord['sources'][number]] });
+    expect(lint(bare).length).toBeGreaterThan(0);
+    expect(() => serialize(bare)).toThrow(RecordError);
+    const emptyLegacy = fact({ sources: [{ resource: 'a.ts', legacyFile: '' }] });
+    expect(lint(emptyLegacy)).toHaveLength(1);
+  });
+
+  it('a fact is a canonical fixed point and keeps its id through parse', () => {
+    const text = serialize(fact());
+    const back = parse(text).record;
+    expect(serialize(back)).toBe(text);
+    expect(recordId(back)).toBe(recordId(fact()));
+  });
+});

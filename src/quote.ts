@@ -18,7 +18,10 @@ export interface AnchorMap {
 
 const ANCHOR_TOKENS = 8;
 const SEP = '\u001f';
-const TOKEN_RE = /[A-Za-z0-9_]+|[^\sA-Za-z0-9_]/g;
+// The u flag makes the single-character branch match one code point, so an astral character
+// (emoji, math letters) is one token rather than two lone surrogates, which UTF-8 encoding
+// would turn into U+FFFD and make every such character hash alike.
+const TOKEN_RE = /[A-Za-z0-9_]+|[^\sA-Za-z0-9_]/gu;
 const WORD_RE = /^[A-Za-z0-9_]+$/;
 
 /**
@@ -91,7 +94,7 @@ const SECRET_PATTERNS: RegExp[] = [
   /AKIA[0-9A-Z]{16}/,
   /ghp_[A-Za-z0-9]{36}/,
   /github_pat_[A-Za-z0-9_]{22,}/,
-  /sk-[A-Za-z0-9_-]{20,}/,
+  /(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{20,}/, // not the tail of a kebab-case word like disk-…
   /xox[baprs]-[A-Za-z0-9-]{10,}/,
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
   /AIza[0-9A-Za-z_-]{35}/,
