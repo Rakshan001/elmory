@@ -73,6 +73,11 @@ export interface Trust {
   approved: Set<string>;
   rejected: Set<string>;
   signers: Set<string>;
+  /**
+   * id → the commits named by its `approved <id> <commit>` lines: an approval made over a forget
+   * whose signature could not be verified, which refuses only the forget credited to that commit.
+   */
+  approvedCommits?: Map<string, Set<string>>;
 }
 
 type TrustLine = `written ${string}` | `approved ${string}` | `rejected ${string}` | `signer ${string}`;
@@ -80,7 +85,7 @@ type TrustLine = `written ${string}` | `approved ${string}` | `rejected ${string
 const VISIBLE: readonly Area[] = ['facts', 'pending', 'local'];
 const ALL_AREAS: readonly Area[] = ['facts', 'pending', 'local', 'archive'];
 const RECORD_FILE = /^(f_[a-z2-7]{26})\.md$/;
-const TRUST_ID_LINE = /^(written|approved|rejected) f_[a-z2-7]{26}$/;
+const TRUST_ID_LINE = /^(?:(written|approved|rejected) f_[a-z2-7]{26}|approved f_[a-z2-7]{26} (?:[0-9a-f]{40}|[0-9a-f]{64}))$/;
 const TRUST_SIGNER_LINE = /^signer \S[^\r\n]*$/;
 const TOMBSTONE_BODY = /^supersedes: \[([^\]\r\n]*)\]\s*$/;
 
@@ -417,7 +422,7 @@ export class Store {
 
   /** The trust ledger. Lines that do not match the ledger grammar are skipped with a warning. */
   readTrust(): Trust {
-    const trust: Trust = { written: new Set(), approved: new Set(), rejected: new Set(), signers: new Set() };
+    const trust: Trust = { written: new Set(), approved: new Set(), rejected: new Set(), signers: new Set(), approvedCommits: new Map() };
     const rootState = Store.rootState(path.dirname(this.layout.trust));
     if (rootState === 'unsafe' || Store.rootState(this.privateRoot) === 'unsafe') {
       this.warn(`trust: skipped ${this.layout.trust}: symlinked or outside the store`);
@@ -435,12 +440,22 @@ export class Store {
       const line = raw.trim();
       if (line === '') return;
       if (TRUST_ID_LINE.test(line)) {
-        const [verb, id] = line.split(' ') as [string, string];
+        const [verb, id, commit] = line.split(' ') as [string, string, string | undefined];
         // The latest line for an id wins: a `written` or `approved` after a `rejected` re-trusts
-        // it (trustOf checks `rejected` first, so it only has to be dropped here).
+        // it (trustOf checks `rejected` first, so it only has to be dropped here). An approval
+        // naming a commit is an approval too, and also records that commit.
         if (verb === 'written') trust.written.add(id);
-        else if (verb === 'approved') trust.approved.add(id);
-        else trust.rejected.add(id);
+        else if (verb === 'approved') {
+          trust.approved.add(id);
+          if (commit !== undefined) {
+            const set = trust.approvedCommits?.get(id) ?? new Set<string>();
+            set.add(commit);
+            trust.approvedCommits?.set(id, set);
+          }
+        } else {
+          trust.rejected.add(id);
+          trust.approvedCommits?.delete(id); // a later approval must name the commit again
+        }
         if (verb !== 'rejected') trust.rejected.delete(id);
       } else if (TRUST_SIGNER_LINE.test(line)) {
         trust.signers.add(line.slice('signer '.length));

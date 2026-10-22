@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { Cache, type RecordRow } from './cache.js';
 import type { Context, ElmoryEvent } from './context.js';
-import { Deriver, FORGET_UNTRUSTED, committedTombstoneTrusted, forgetRefusable } from './derive.js';
+import { Deriver, FORGET_UNTRUSTED, FORGET_UNVERIFIABLE, committedForgetStanding, forgetCommit } from './derive.js';
 import { Evidence } from './evidence.js';
 import { type Exec, defaultExec, gitCommonDir } from './exec.js';
 import * as gate from './gate.js';
@@ -416,58 +416,63 @@ export class Elmory implements Context {
 
   /**
    * Every candidate with its reason, except those rejected here (reject hides). A record withheld
-   * by an untrusted forget (reason FORGET_UNTRUSTED) is indexed without text, so its title is read
-   * from its file here, for the reviewer only, and never cached.
+   * by a forget (FORGET_UNTRUSTED, FORGET_UNVERIFIABLE) is indexed without text, so its title is
+   * read from its file here, for the reviewer only, and never cached; `commit` names the commit
+   * the forget is credited to, which `approve` will record for one git cannot verify.
    */
-  async review(): Promise<{ id: string; reason: string; title: string }[]> {
+  async review(): Promise<{ id: string; reason: string; title: string; commit?: string }[]> {
     await this.sync();
     // One snapshot of this worktree's view: the Deriver and the loop see the same rows.
     const rows = this.view();
     const d = await this.deriver(rows);
-    const out: { id: string; reason: string; title: string }[] = [];
+    const addedBy = await this.#memoAddedBy();
+    const out: { id: string; reason: string; title: string; commit?: string }[] = [];
     for (const row of rows) {
       const s = await d.state(row.id);
       if (s.state !== 'candidate' || s.reason === 'rejected') continue;
-      let title = row.title;
-      if (s.reason === FORGET_UNTRUSTED) {
+      const item: { id: string; reason: string; title: string; commit?: string } = { id: row.id, reason: s.reason ?? 'untrusted', title: row.title };
+      if (s.reason === FORGET_UNTRUSTED || s.reason === FORGET_UNVERIFIABLE) {
         const sr = this.store.readRecord(row.id);
-        title = sr === null ? '' : gate.indexRecord(sr).title;
+        item.title = sr === null ? '' : gate.indexRecord(sr).title;
+        const commit = forgetCommit(row.id, addedBy);
+        if (commit !== null && commit !== '') item.commit = commit;
       }
-      out.push({ id: row.id, reason: s.reason ?? 'untrusted', title });
+      out.push(item);
     }
     return out;
   }
 
   /**
-   * Append `approved <id>` to the trust ledger. The record must be present in this worktree. The
-   * latest ledger line for an id wins, so approving a rejected record re-trusts it. Approving a
-   * record withheld by an untrusted forget refuses that forget: the record is indexed with its
-   * text again and derived from its evidence, keeping its slot (`reject` accepts the forget).
+   * Append an approval to the trust ledger. The record must be present in this worktree. The
+   * latest ledger line for an id wins, so approving a rejected record re-trusts it. Over a forget
+   * of the record (I3, N2): a trusted one (a local tombstone, or a committed one signed by a key
+   * the ledger lists) is refused; an untrusted one is refused by this approval (`approved <id>`);
+   * one whose signature git cannot verify here is refused only for its credited commit, so the
+   * line names it (`approved <id> <commit>`) and a later forget from another commit stands.
    */
   async approve(id: string): Promise<void> {
+    this.#addedBy = null;
     if (!isRecordId(id)) throw new RecordError(`not a record id: ${id}`, 'id');
-    // A trusted forget (a local tombstone, or a committed one signed by a trusted key) always
-    // wins: an approval refuses only an untrusted forget (I3).
     const trust = this.store.readTrust();
     const addedBy = await this.fetchAddedBy();
+    let commit: string | null = null;
     for (const t of this.store.readTombstones()) {
       if (t.id !== id) continue;
-      if (!t.committed || committedTombstoneTrusted(id, addedBy, trust)) {
+      const standing = t.committed ? committedForgetStanding(id, addedBy, trust) : 'binding';
+      if (standing === 'binding') {
         throw new gate.RefusedError(`${id} was forgotten by a trusted tombstone; an approval cannot bring it back`, 'forgotten');
       }
-      if (!forgetRefusable(id, addedBy, trust)) {
-        const status = addedBy.get(`.elmory/tombstones/${id}`)?.status ?? '';
-        const why =
-          status === 'G'
-            ? 'was forgotten by a commit signed with a key the trust ledger does not list'
-            : `was forgotten by a signed commit whose signature cannot be checked here (git %G? ${JSON.stringify(status)})`;
-        throw new gate.RefusedError(
-          `${id} ${why}; the forget stands (only a forget git reports as unsigned can be refused by approval; delete the tombstone in a commit to refuse this one)`,
-          'forgotten',
-        );
+      if (standing === 'unverifiable') {
+        commit = forgetCommit(id, addedBy);
+        if (commit === null || commit === '') {
+          throw new gate.RefusedError(`${id} was forgotten by a commit git cannot name here; the forget stands`, 'forgotten');
+        }
       }
     }
-    this.#trustLine('approved', id);
+    this.cache.withWriteLock(() => {
+      if (this.store.readRecord(id) === null) throw new RecordError(`no record ${id} in this worktree`, 'not-found');
+      this.store.appendTrust(commit === null ? `approved ${id}` : `approved ${id} ${commit}`);
+    });
   }
 
   /** Append `rejected <id>`: hides the record here; the file stays. */

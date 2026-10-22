@@ -347,6 +347,23 @@ describe('Store symlinks', () => {
 });
 
 describe('Store trust and tombstones', () => {
+  it('an approval may name a commit (approved <id> <commit>); a later rejected drops it (N2)', async () => {
+    const { wt, common } = await gitWorktree();
+    const store = new Store(resolveLayout(wt, common));
+    const a = 'f_' + 'a'.repeat(26);
+    const sha = 'c'.repeat(40);
+    store.appendTrust(`approved ${a} ${sha}`);
+    let t = store.readTrust();
+    expect(t.approved.has(a)).toBe(true);
+    expect(t.approvedCommits?.get(a)).toEqual(new Set([sha]));
+    store.appendTrust(`rejected ${a}`);
+    store.appendTrust(`approved ${a}`);
+    t = store.readTrust();
+    expect(t.approved.has(a)).toBe(true);
+    expect(t.approvedCommits?.has(a)).toBe(false);
+    expect(() => store.appendTrust(`approved ${a} not-a-sha` as `approved ${string}`)).toThrow();
+  });
+
   it('trust ledger round-trips written, approved, rejected and signer lines', async () => {
     const { wt, common } = await gitWorktree();
     const store = new Store(resolveLayout(wt, common));
@@ -357,6 +374,7 @@ describe('Store trust and tombstones', () => {
       approved: new Set(),
       rejected: new Set(),
       signers: new Set(),
+      approvedCommits: new Map(),
     });
     store.appendTrust(`written ${a}`);
     store.appendTrust(`approved ${b}`);
@@ -367,6 +385,7 @@ describe('Store trust and tombstones', () => {
     expect(t.approved).toEqual(new Set([b]));
     expect(t.rejected).toEqual(new Set([a]));
     expect(t.signers).toEqual(new Set(['ssh-ed25519 AAAAC3Nza key@host']));
+    expect(t.approvedCommits).toEqual(new Map());
     expect(fs.readFileSync(path.join(common, 'elmory', 'trust'), 'utf8')).toBe(
       `written ${a}\napproved ${b}\nrejected ${a}\nsigner ssh-ed25519 AAAAC3Nza key@host\n`,
     );

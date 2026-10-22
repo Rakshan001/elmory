@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { Context } from './context.js';
 import type { Cache, RecordRow } from './cache.js';
-import { Deriver, type State, approvedHere, forgetRefusable } from './derive.js';
+import { Deriver, type State, approvedHere, forgetLifted } from './derive.js';
 import type { AddedBy } from './git.js';
 import { checkQuoteAtWrite, containsSecret } from './quote.js';
 import {
@@ -133,10 +133,11 @@ const ENCODED_SEGMENT_MIN = 32;
  */
 function encodedPathSegment(paths: readonly string[]): string | null {
   for (const p of paths) {
-    for (const seg of p.split(/[/\\.]/)) {
-      if (seg.length < ENCODED_SEGMENT_MIN) continue;
-      if (/=$/.test(seg) || seg.includes('+')) return seg;
+    for (const whole of p.split(/[/\\.]/)) {
+      if (whole.length < ENCODED_SEGMENT_MIN) continue;
+      if (/=$/.test(whole) || whole.includes('+')) return whole;
       // A timestamped migration name (`20240101123045_AddUserTable2FA_Columns`) is not base64.
+      const seg = whole;
       if (/^[0-9]+_/.test(seg)) continue;
       const cls = (c: string): number => (/[0-9]/.test(c) ? 0 : /[A-Z]/.test(c) ? 1 : /[a-z]/.test(c) ? 2 : 3);
       const counts = [0, 0, 0, 0];
@@ -146,7 +147,7 @@ function encodedPathSegment(paths: readonly string[]): string | null {
         counts[k] = (counts[k] as number) + 1;
         if (i > 0 && k !== cls(seg[i - 1] as string)) changes++;
       }
-      if ((counts[0] as number) >= 3 && (counts[1] as number) >= 3 && (counts[2] as number) >= 3 && changes * 4 >= seg.length) return seg;
+      if ((counts[0] as number) >= 3 && (counts[1] as number) >= 3 && (counts[2] as number) >= 3 && changes * 4 >= seg.length) return whole;
     }
   }
   return null;
@@ -277,9 +278,10 @@ function withoutText(row: RecordRow, tomb: 'local' | 'committed'): RecordRow {
 const NONE: ReadonlySet<string> = new Set();
 
 /**
- * Ids whose forget the user refused (I3): a committed tombstone alone (no local one) that git
- * positively reports as untrusted (`forgetRefusable`, the Deriver's own rule over the same
- * `addedBy`: a verification error is not "untrusted", N2), for a record the trust ledger approves. The Deriver withholds none of these; the index keeps their
+ * Ids whose forget the user refused (I3): a committed tombstone alone (no local one) that an
+ * approval lifts (`forgetLifted`, the Deriver's own rule over the same `addedBy`: an untrusted
+ * forget under any approval, one git cannot verify only under an approval naming its commit, a
+ * trusted one never; N2). The Deriver withholds none of these; the index keeps their
  * text. A trusted forget (local, or signed by a trusted key) is never lifted by an approval. The
  * ledger is read only when a committed-only tombstone exists.
  */
@@ -289,7 +291,7 @@ export function liftedForgets(store: Store, addedBy: ReadonlyMap<string, AddedBy
   for (const [id, where] of store.tombstoneIds()) {
     if (where !== 'committed') continue;
     trust ??= store.readTrust();
-    if (approvedHere(trust, id) && forgetRefusable(id, addedBy, trust)) out.add(id);
+    if (forgetLifted(id, addedBy, trust)) out.add(id);
   }
   return out;
 }

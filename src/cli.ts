@@ -351,7 +351,9 @@ const VERBS: Record<string, Verb> = {
     async run(e, a) {
       none(a);
       const r = await e.review();
-      return { data: r, text: lines(r.map((c) => `${c.id} ${inline(c.reason)} ${inline(c.title)}`), 'nothing to review') };
+      const row = (c: (typeof r)[number]): string =>
+        `${c.id} ${inline(c.reason)}${c.commit === undefined ? '' : ` (commit ${c.commit})`} ${inline(c.title)}`;
+      return { data: r, text: lines(r.map(row), 'nothing to review') };
     },
     noStore: () => ({ data: [], text: NO_STORE }),
   },

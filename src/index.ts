@@ -11,6 +11,7 @@ export {
   type State,
   type TrustSource,
   FORGET_UNTRUSTED,
+  FORGET_UNVERIFIABLE,
   LABEL_NEWER_FAILS,
   LABEL_UNREVIEWED,
 } from './derive.js';

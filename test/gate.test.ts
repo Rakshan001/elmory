@@ -5,7 +5,7 @@ import { execFileSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, describe, expect, it } from 'vitest';
 import { Elmory, type ElmoryEvent } from '../src/api.js';
-import { type Deriver, FORGET_UNTRUSTED } from '../src/derive.js';
+import { type Deriver, FORGET_UNTRUSTED, FORGET_UNVERIFIABLE } from '../src/derive.js';
 import { type Exec, defaultExec } from '../src/exec.js';
 import { ConflictError, RefusedError, indexRecord, injectionFlag, isRepoPath } from '../src/gate.js';
 import { type ElmoryRecord, type QuoteSource, recordId, serialize } from '../src/record.js';
@@ -1154,22 +1154,42 @@ describe('a trusted forget wins over an approval (I3)', () => {
     expect((await (await e.deriver()).state(late.id)).state).toBe('forgotten');
     expect(hits('impala7marker')).toEqual([]);
 
-    // (N2) verification breaks: the key leaves the allowed signers (git: U), or no allowed
-    // signers file is configured at all (git: N, though the commit is signed). Neither is a
-    // positive "unsigned", so the earlier approval lifts nothing: withheld, and no text.
+    // (N2) the key leaves the allowed signers: git says U, which cannot be judged. The earlier
+    // plain approval lifts nothing: withheld, with its own reason, and no text.
+    const forgetSha = (await git(wt, 'rev-parse', 'HEAD')).trim();
     fs.writeFileSync(allowed, '');
     await e.sync();
-    expect((await (await e.deriver()).state(early.id))).toMatchObject({ state: 'candidate', reason: FORGET_UNTRUSTED });
+    expect(await (await e.deriver()).state(early.id)).toMatchObject({ state: 'candidate', reason: FORGET_UNVERIFIABLE });
     expect(hits('kudu7marker')).toEqual([]);
     expect(e.cache.getRecord(early.id)).toMatchObject({ title: '', text: '' });
+    expect(await e.review()).toContainEqual({ id: early.id, reason: FORGET_UNVERIFIABLE, title: 'Early approved', commit: forgetSha });
+
+    // p9b: a process with no allowed signers file at all (git: N on a signed commit, so `?`).
     const blind = await Elmory.open({ worktree: wt, cacheDir: tmp(), now: () => NOW, observer: 'agent:test' });
     opened.push(blind);
     expect((await blind.fetchAddedBy()).get(`.elmory/tombstones/${early.id}`)).toMatchObject({ signer: null, status: '?' });
     await blind.sync();
-    expect((await (await blind.deriver()).state(early.id))).toMatchObject({ state: 'candidate', reason: FORGET_UNTRUSTED });
+    expect(await (await blind.deriver()).state(early.id)).toMatchObject({ state: 'candidate', reason: FORGET_UNVERIFIABLE });
     expect(blind.cache.search('kudu7marker', { limit: 10, offset: 0 })).toEqual([]);
     expect((await blind.recall({ query: 'kudu7marker' })).abstain).toBe(true);
-    await expect(blind.approve(late.id)).rejects.toMatchObject({ reason: 'forgotten' });
+
+    // An approval made over the unverifiable forget names its commit, and lifts that forget.
+    await blind.approve(late.id);
+    expect(blind.store.readTrust().approvedCommits?.get(late.id)).toEqual(new Set([forgetSha]));
+    await blind.sync();
+    expect((await (await blind.deriver()).state(late.id)).state).toBe('active');
+    expect(blind.cache.search('impala7marker', { limit: 10, offset: 0 }).map((h) => h.id)).toEqual([late.id]);
+    await e.approve(early.id);
+    await e.sync();
+    expect((await (await e.deriver()).state(early.id)).state).toBe('active');
+    expect(hits('kudu7marker')).toEqual([early.id]);
+
+    // The key is trusted again: the forget binds, whatever was approved.
+    fs.writeFileSync(allowed, `tester@example.com namespaces="git" ${keyType} ${keyBody}\n`);
+    await e.sync();
+    expect((await (await e.deriver()).state(early.id)).state).toBe('forgotten');
+    expect(hits('kudu7marker')).toEqual([]);
+    await expect(e.approve(early.id)).rejects.toMatchObject({ reason: 'forgotten' });
   }, 30000);
 });
 
