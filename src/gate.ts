@@ -43,14 +43,16 @@ function looksLikePath(run: string): boolean {
 /**
  * The first phrase that looks like a planted instruction, or null. A flag, never a refusal.
  * Whitespace is collapsed first, so "ignore  previous" matches; a base64-looking run that is
- * really a path is not flagged.
+ * really a path is not flagged. `encoded: false` checks the phrases only (source paths: long
+ * mixed-case segments such as `germanTranslations` are ordinary there).
  */
-export function injectionFlag(text: string): string | null {
+export function injectionFlag(text: string, opts: { encoded?: boolean } = {}): string | null {
   const flat = text.replace(/\s+/g, ' ');
   for (const re of INJECTION) {
     const m = re.exec(flat);
     if (m) return m[0];
   }
+  if (opts.encoded === false) return null;
   for (const m of flat.matchAll(BASE64_RUN)) if (!looksLikePath(m[0])) return m[0];
   return null;
 }
@@ -119,9 +121,12 @@ function recordStrings(r: ElmoryRecord): string[] {
   return out.filter((x): x is string => typeof x === 'string');
 }
 
-/** The fields served to an agent, as one text for the injection flag: title, body, observer, source paths. */
-function servedProse(r: { title: string; body: string; observer: string; paths: readonly string[] }): string {
-  return [r.title, r.body, r.observer, ...r.paths].join('\n');
+/**
+ * The injection flag over the fields served to an agent: title, body and observer with every
+ * check, source paths with the phrase checks only (never the base64 heuristic, I2).
+ */
+function servedFlag(r: { title: string; body: string; observer: string; paths: readonly string[] }): string | null {
+  return injectionFlag([r.title, r.body, r.observer].join('\n')) ?? injectionFlag(r.paths.join('\n'), { encoded: false });
 }
 
 /** The one-line fields the control check covers, named for its message. */
@@ -150,7 +155,8 @@ function controlProblem(fields: { name: string; value: string | undefined }[], b
  * anchor or commit has the wrong shape, a control character in a path included), 'shape' (a
  * control, bidi or line-separator character the write gate refuses in title, observer, key, tag
  * or body), 'secret' (a secret in any field, or a quote field that
- * is not a hash, i.e. code copied into memory). `flagged` covers title, body and observer.
+ * is not a hash, i.e. code copied into memory). `flagged` covers title, body and observer, and
+ * the source paths for instruction phrases only.
  *
  * The version check runs before the name check (the plan lists it after): a newer-format record
  * keeps keys this version drops when re-serialising, so its name never matches here and it would
@@ -210,7 +216,7 @@ export function indexRecord(sr: StoredRecord): RecordRow {
     sources: record.sources,
     paths: record.sources.map((s) => s.resource),
     candidate,
-    flagged: injectionFlag(servedProse({ ...record, paths: record.sources.map((s) => s.resource) })) !== null,
+    flagged: servedFlag({ ...record, paths: record.sources.map((s) => s.resource) }) !== null,
     text: sr.text,
   };
 }
@@ -394,7 +400,7 @@ export function viewOfCache(store: Store, cache: Cache): RecordRow[] {
 const FINGERPRINT_KEY = 'sync:fingerprint';
 const INDEX_RULES_KEY = 'sync:index-rules';
 /** Bump when indexRecord's checks change, so rows indexed under older rules are redone. */
-const INDEX_RULES = '4';
+const INDEX_RULES = '5';
 /** A directory changed this recently may change again within the same mtime tick (racy-clean, V14). */
 const RACY_MS = 2000;
 
@@ -706,7 +712,7 @@ async function prepare(
   }
 
   // 4 injection: advisory only; the index flags it again on every load.
-  const phrase = injectionFlag(servedProse({ title: input.title, body: input.text, observer, paths: sources.map((s) => s.resource) }));
+  const phrase = servedFlag({ title: input.title, body: input.text, observer, paths: sources.map((s) => s.resource) });
   if (phrase !== null) notes.push(`flagged: looks like an instruction to the agent ("${phrase}")`);
   return sources;
 }
