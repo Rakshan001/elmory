@@ -1,5 +1,6 @@
 // The MCP server end to end: the SDK client spawns `node dist/mcp.js` (run `npm run build` first;
 // `npm test` does) over stdio against a temp repo.
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -17,18 +18,23 @@ afterEach(async () => {
   cleanupDirs();
 });
 
-async function connect(): Promise<Client> {
-  const { wt, cacheDir } = await repo();
+async function start(env: Record<string, string>, cwd?: string): Promise<Client> {
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: ['--no-warnings', SERVER],
-    env: { ELMORY_WORKTREE: wt, XDG_CACHE_HOME: cacheDir },
+    env,
+    ...(cwd === undefined ? {} : { cwd }),
     stderr: 'pipe',
   });
   const client = new Client({ name: 'elmory-test', version: '0.0.0' });
   await client.connect(transport);
   clients.push(client);
   return client;
+}
+
+async function connect(env: Record<string, string> = {}): Promise<Client> {
+  const { wt, cacheDir } = await repo();
+  return start({ ELMORY_WORKTREE: wt, XDG_CACHE_HOME: cacheDir, ...env });
 }
 
 async function call(client: Client, name: string, args: Record<string, unknown>): Promise<{ isError: boolean; json: unknown }> {
@@ -107,6 +113,44 @@ describe('mcp server', () => {
     expect(res.isError).toBe(true);
     expect(res.json).toMatchObject({ error: 'refused' });
     expect(typeof (res.json as { reason: unknown }).reason).toBe('string');
+  });
+
+  it('started in a subdirectory, the server serves the git toplevel', async () => {
+    const { wt, cacheDir } = await repo();
+    const client = await start({ XDG_CACHE_HOME: cacheDir }, path.join(wt, 'src'));
+    const written = await call(client, 'elmory_remember', { ...factInput('from a subdirectory') });
+    expect(written.isError, JSON.stringify(written.json)).toBe(false); // the quote path resolved against the root
+    const { id } = written.json as { id: string };
+    expect(await call(client, 'elmory_publish', { ids: [id] })).toMatchObject({ isError: false, json: { published: [id] } });
+    expect(fs.existsSync(path.join(wt, '.elmory', 'facts', `${id}.md`))).toBe(true);
+    expect(fs.existsSync(path.join(wt, 'src', '.elmory'))).toBe(false);
+  });
+
+  it('CLAUDE_PROJECT_DIR is used when ELMORY_WORKTREE is unset', async () => {
+    const { wt, cacheDir } = await repo();
+    const client = await start({ XDG_CACHE_HOME: cacheDir, CLAUDE_PROJECT_DIR: path.join(wt, 'src') }, path.dirname(wt));
+    const written = await call(client, 'elmory_remember', { ...factInput('via claude project dir') });
+    expect(written.isError, JSON.stringify(written.json)).toBe(false);
+    expect(fs.existsSync(path.join(path.dirname(wt), '.elmory'))).toBe(false);
+  });
+
+  it('a title or ELMORY_OBSERVER with control characters is refused (shape)', async () => {
+    const client = await connect();
+    const title = await call(client, 'elmory_note', { title: 'evil \u001b[2Jclear', text: 'body' });
+    expect(title).toMatchObject({ isError: true, json: { error: 'refused', reason: 'shape' } });
+
+    const bad = await connect({ ELMORY_OBSERVER: 'x\ninjected: y' });
+    const note = await call(bad, 'elmory_note', { title: 'fine', text: 'body' });
+    expect(note).toMatchObject({ isError: true, json: { error: 'refused', reason: 'shape' } });
+    expect(await call(bad, 'elmory_recall', { query: 'anything' })).toMatchObject({ isError: false });
+  });
+
+  it('forget goes through Elmory.forget and reports unknown ids', async () => {
+    const client = await connect();
+    const { id } = (await call(client, 'elmory_note', { title: 'short lived', text: 'gone soon' })).json as { id: string };
+    const typo = `f_${'a'.repeat(26)}`;
+    const r = await call(client, 'elmory_forget', { ids: [id, typo] });
+    expect(r).toMatchObject({ isError: false, json: { deleted: [id], cascaded: [], unknown: [typo], compaction: 'done' } });
   });
 
   it('bad arguments are an error result, not a crash', async () => {

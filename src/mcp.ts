@@ -6,15 +6,17 @@
 // than `registerTool`, because `registerTool` takes zod schemas and zod would be a second runtime
 // dependency. Arguments are checked here; the write gate checks everything else.
 //
-// Environment: ELMORY_WORKTREE (default: cwd), ELMORY_OBSERVER (default: agent:mcp).
+// Environment: ELMORY_WORKTREE, else CLAUDE_PROJECT_DIR, else the working directory, resolved to its
+// git toplevel (clients do not promise to start the server at the project root);
+// ELMORY_OBSERVER (default: agent:mcp).
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, type CallToolResult, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { ConflictError, Elmory, RefusedError, type RememberInput } from './api.js';
 import type { State } from './derive.js';
-import { forget } from './forget.js';
 import { RecordError, TAGS, type Tag } from './record.js';
+import { resolveWorktree } from './worktree.js';
 
 const STATES: readonly State[] = ['candidate', 'forgotten', 'superseded', 'conflict', 'stale', 'suspect', 'unknown', 'active'];
 
@@ -33,6 +35,12 @@ interface Tool {
 }
 
 class ArgError extends Error {}
+
+/** Any C0 or C1 control character: never in a title or an observer, which print as one line. */
+const CONTROL = /[\u0000-\u001f\u007f-\u009f]/;
+
+/** Why ELMORY_OBSERVER cannot be stamped on records, or null when it can. Writes are refused while set. */
+let badObserver: string | null = null;
 
 function str(a: Args, k: string): string {
   const v = a[k];
@@ -81,7 +89,10 @@ function quotes(a: Args): { file: string; text: string }[] {
 
 /** The fields remember and note share; optional ones are left out when absent (exactOptionalPropertyTypes). */
 function writeInput(a: Args): Omit<RememberInput, 'quotes'> {
-  const input: Omit<RememberInput, 'quotes'> = { text: str(a, 'text'), title: str(a, 'title') };
+  if (badObserver !== null) throw new RefusedError(badObserver, 'shape');
+  const title = str(a, 'title');
+  if (CONTROL.test(title)) throw new RefusedError('title must be one line of printable characters', 'shape');
+  const input: Omit<RememberInput, 'quotes'> = { text: str(a, 'text'), title };
   const tag = optTag(a);
   const key = optStr(a, 'key');
   const supersedes = optStrs(a, 'supersedes');
@@ -234,10 +245,11 @@ const TOOLS: Tool[] = [
     name: 'elmory_forget',
     description:
       'Delete records by id, with every record that cites them, from files and the search index. Only on a human\'s say-so. ' +
-      'Returns { deleted, cascaded, compaction: "done" | "pending", unreachable }: unreachable lists the copies forget cannot touch ' +
+      'Returns { deleted, cascaded, unknown, compaction: "done" | "pending", unreachable }: unknown lists ids that never existed here ' +
+      '(nothing written for them); unreachable lists the copies forget cannot touch ' +
       '(other branches until the tombstone is committed, git history, agent transcripts, backups…).',
     inputSchema: { type: 'object', properties: { ids: { ...IDS, minItems: 1 } }, required: ['ids'] },
-    run: (m, a) => forget(m, { ids: strs(a, 'ids') }),
+    run: (m, a) => m.forget({ ids: strs(a, 'ids') }),
   },
 ];
 
@@ -257,9 +269,11 @@ function errorResult(e: unknown): CallToolResult {
 }
 
 async function main(): Promise<void> {
+  const observer = process.env.ELMORY_OBSERVER || 'agent:mcp';
+  if (CONTROL.test(observer)) badObserver = 'ELMORY_OBSERVER must be one line of printable characters; fix it and restart the server';
   const elmory = await Elmory.open({
-    worktree: process.env.ELMORY_WORKTREE || process.cwd(),
-    observer: process.env.ELMORY_OBSERVER || 'agent:mcp',
+    worktree: await resolveWorktree(process.env.ELMORY_WORKTREE || process.env.CLAUDE_PROJECT_DIR || process.cwd()),
+    observer,
   });
   const mcp = new McpServer({ name: 'elmory', version: '0.0.0' }, { capabilities: { tools: {} } });
   const byName = new Map(TOOLS.map((t) => [t.name, t]));
