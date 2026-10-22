@@ -449,6 +449,33 @@ describe('forget', () => {
     }
   });
 
+  it('rebuild keeps a pending compaction for the next open (M1)', async () => {
+    const { e } = await setup();
+    e.cache.setMeta('compaction', 'pending');
+    const before = e.cache.generation;
+    await e.rebuild();
+    expect(e.cache.generation).toBeGreaterThan(before);
+    expect(e.cache.getMeta('compaction')).toBe('pending');
+  });
+
+  it('open deletes cache generations retired more than 24 h ago, and keeps younger ones (M1)', async () => {
+    const { wt, cacheDir, e } = await setup();
+    const first = path.join(cacheDir, `cache-${e.cache.generation}.db`);
+    await e.rebuild();
+    const second = path.join(cacheDir, `cache-${e.cache.generation}.db`);
+    await e.rebuild();
+    expect(exists(first) && exists(second)).toBe(true);
+    const lock = new DatabaseSync(path.join(cacheDir, 'lock.db'));
+    try {
+      lock.prepare('UPDATE old SET retired_at = ? WHERE path = ?').run(Date.now() - 25 * 60 * 60 * 1000, first);
+    } finally {
+      lock.close();
+    }
+    await open(wt, cacheDir);
+    expect(exists(first)).toBe(false);
+    expect(exists(second)).toBe(true); // retired just now
+  });
+
   it('archived local records are reached by id, by --query and by --all (C1)', async () => {
     const { wt, cacheDir, e } = await setup();
     const roots = [cacheDir, path.join(wt, '.elmory'), path.join(e.layout.commonDir as string, 'elmory')];

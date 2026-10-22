@@ -217,6 +217,7 @@ export class Elmory implements Context {
       const git = commonDir === null ? null : new Git(exec, layout.worktree);
       const evidence = new Evidence({ worktree: layout.worktree, cache, git });
       Elmory.#retryCompaction(cache);
+      Elmory.#sweepRetired(cache);
       return new Elmory(layout, store, cache, git, evidence, opts.observer ?? DEFAULT_OBSERVER, opts.now ?? (() => new Date().toISOString()), exec);
     } catch (e) {
       cache.close();
@@ -250,6 +251,22 @@ export class Elmory implements Context {
       cache.setMeta('compaction', 'pending');
     } catch {
       // meta says pending unless compact() finished; the next open checks again either way
+    }
+  }
+
+  /**
+   * §9: delete cache generations retired (or left by a killed rebuild) more than 24 h ago, once
+   * per open. Never waits for the lock: a held lock leaves them for the next open.
+   */
+  static #sweepRetired(cache: Cache): void {
+    try {
+      if (cache.otherGenerations().length === 0) return;
+      cache.tryWithWriteLock(() => {
+        cache.sweepOld();
+        return true;
+      });
+    } catch {
+      // the sweep is housekeeping: a failure never fails the open
     }
   }
 
@@ -524,6 +541,9 @@ export class Elmory implements Context {
         const stamp = this.cache.getMeta(`recall:${row.id}`);
         if (stamp !== null) fresh.setMeta(`recall:${row.id}`, stamp);
       }
+      // A forget's pending compaction is still owed: the old generation holding those bytes is
+      // only retired here, and the next open retries (M1).
+      if (this.cache.getMeta('compaction') === 'pending') fresh.setMeta('compaction', 'pending');
     });
   }
 

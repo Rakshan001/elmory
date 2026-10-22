@@ -398,13 +398,14 @@ export function rowsAndStamps(cache: Cache): { rows: RecordRow[]; stamps: Stamps
  * that one. The caller holds the write lock (or owns a fresh rebuild cache).
  */
 export function syncStore(store: Store, cache: Cache, force = false, lifted: ReadonlySet<string> = NONE): void {
+  // Before the files are read (M2): a file edited after its read is never stamped as settled.
+  const at = Date.now();
   const files = new Map<string, StoredRecord>();
   for (const sr of store.listRecords()) if (!files.has(sr.id)) files.set(sr.id, sr);
   const tombstoned = textlessIds(store, lifted);
   const rows = new Map(cache.allRecords().map((r) => [r.id, r]));
   const old = readStamps(cache);
   const stamps: Stamps = new Map();
-  const at = Date.now();
   for (const [id, sr] of files) {
     const row = rows.get(id);
     if (force || row === undefined || !rowIsFor(row, sr, tombstoned)) cache.upsertRecord(indexFile(sr, tombstoned));
