@@ -130,6 +130,12 @@ describe('containsSecret', () => {
     expect(containsSecret('const k = "q8Zr2Lx9";')).toBe(false);
   });
 
+  it('exempts literals containing whitespace from the entropy rule only', () => {
+    expect(containsSecret('const s = "The quick brown fox jumps over the lazy dog";')).toBe(false);
+    expect(containsSecret('const k = "aZ3kQ9xL2mW7pR4tV8bN1cF6hJ0dG5sY";')).toBe(true);
+    expect(containsSecret('const k = "token ghp_' + 'a'.repeat(36) + '";')).toBe(true);
+  });
+
   it('does not flag apiKey: process.env.STRIPE_API_KEY,', () => {
     expect(containsSecret('apiKey: process.env.STRIPE_API_KEY,')).toBe(false);
   });

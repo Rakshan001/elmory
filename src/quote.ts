@@ -113,11 +113,16 @@ function entropy(s: string): number {
   return h;
 }
 
-/** A known key format, or a string literal of ≥ 20 chars with entropy > 4.0 bits/char. */
+/**
+ * A known key format anywhere in the text, or a string literal of ≥ 20 chars with no
+ * whitespace and entropy > 4.0 bits/char.
+ */
 export function containsSecret(text: string): boolean {
   if (SECRET_PATTERNS.some((re) => re.test(text))) return true;
   for (const m of text.matchAll(LITERAL_RE)) {
     const content = m[1] ?? m[2] ?? m[3] ?? '';
+    // A literal with whitespace is prose, not a key: exempt from the entropy rule only.
+    if (/\s/.test(content)) continue;
     if ([...content].length >= 20 && entropy(content) > 4.0) return true;
   }
   return false;
