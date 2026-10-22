@@ -59,6 +59,18 @@ describe('tokenize', () => {
   it('returns no tokens for blank text', () => {
     expect(tokenize(' \n\t ')).toEqual([]);
   });
+
+  it('keeps an emoji or other astral character as one token', () => {
+    expect(tokenize('a😀b')).toEqual(['a', '😀', 'b']);
+    expect(tokenize('𝑥 = 1')).toEqual(['𝑥', '=', '1']);
+  });
+
+  it('tells two different emoji apart in quote and anchor hashes', () => {
+    const a = tokenize('const face = "😀";');
+    const b = tokenize('const face = "😎";');
+    expect(quoteHash(a)).not.toBe(quoteHash(b));
+    expect(anchorHash(a)).not.toBe(anchorHash(b));
+  });
 });
 
 describe('hashes', () => {
@@ -119,6 +131,12 @@ describe('containsSecret', () => {
     expect(containsSecret('t = xoxb-1234567890-abc')).toBe(true);
     expect(containsSecret('-----BEGIN RSA PRIVATE KEY-----')).toBe(true);
     expect(containsSecret('k = AIza' + 'b'.repeat(35))).toBe(true);
+  });
+
+  it('does not take a kebab-case identifier ending in "sk-" for an sk- key', () => {
+    expect(containsSecret('import { mount } from "./disk-management-utils-volume";')).toBe(false);
+    expect(containsSecret('const id = task-runner-scheduler-queue-worker;')).toBe(false);
+    expect(containsSecret('key: "sk-' + 'x'.repeat(24) + '"')).toBe(true);
   });
 
   it('flags a high-entropy string literal of 20+ characters', () => {
