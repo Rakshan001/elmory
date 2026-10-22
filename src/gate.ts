@@ -55,6 +55,15 @@ export function injectionFlag(text: string): string | null {
   return null;
 }
 
+/**
+ * Characters a one-line field (title, observer, key, tag) must not hold: C0 and C1 controls
+ * (DEL included), the bidi embedding / override / isolate controls, and the Unicode line and
+ * paragraph separators. Any of them can make a served line read differently from what is stored.
+ */
+const LINE_FIELD_FORBIDDEN = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069\u2028\u2029]/u;
+/** The same set for a body, minus `\t` and `\n` (checked after `\r\n` / `\r` become `\n`, as stored). */
+const BODY_FORBIDDEN = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069\u2028\u2029]/u;
+
 const QUOTE_HASH = /^sha256:[0-9a-f]{64}$/;
 /** x-elmory-anchor: the 12-hex rendering of the 8-token rolling hash (quote.ts). */
 const ANCHOR = /^[0-9a-f]{12}$/;
@@ -68,9 +77,13 @@ function isQuote(s: Source): s is QuoteSource {
   return typeof (s as Partial<QuoteSource>).quote === 'string';
 }
 
-/** The repo-relative path rule: non-empty, not absolute, no `..` segment, no NUL, ≤ 1024 bytes. */
+/**
+ * The repo-relative path rule: non-empty, not absolute, no `..` segment, ≤ 1024 bytes, and no
+ * NUL or other control, bidi or line-separator character (LINE_FIELD_FORBIDDEN): a path is
+ * served on one line too.
+ */
 export function isRepoPath(p: unknown): p is string {
-  if (typeof p !== 'string' || p === '' || p.includes('\0')) return false;
+  if (typeof p !== 'string' || p === '' || LINE_FIELD_FORBIDDEN.test(p)) return false;
   if (Buffer.byteLength(p, 'utf8') > MAX_PATH_BYTES) return false;
   if (p.startsWith('/') || p.startsWith('\\') || /^[A-Za-z]:/.test(p)) return false;
   return !p.split(/[/\\]/).includes('..');
@@ -111,14 +124,15 @@ function servedProse(r: { title: string; body: string; observer: string; paths: 
   return [r.title, r.body, r.observer, ...r.paths].join('\n');
 }
 
-/**
- * Characters a one-line field (title, observer, key, tag) must not hold: C0 and C1 controls
- * (DEL included), the bidi embedding / override / isolate controls, and the Unicode line and
- * paragraph separators. Any of them can make a served line read differently from what is stored.
- */
-const LINE_FIELD_FORBIDDEN = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069\u2028\u2029]/u;
-/** The same set for a body, minus `\t` and `\n` (checked after `\r\n` / `\r` become `\n`, as stored). */
-const BODY_FORBIDDEN = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069\u2028\u2029]/u;
+/** The one-line fields the control check covers, named for its message. */
+function lineFields(title: string, observer: string, key: string | undefined, tag: string | undefined): { name: string; value: string | undefined }[] {
+  return [
+    { name: 'title', value: title },
+    { name: 'observer', value: observer },
+    { name: 'key', value: key },
+    { name: 'tag', value: tag },
+  ];
+}
 
 /** The first field holding a forbidden control character, or null. */
 function controlProblem(fields: { name: string; value: string | undefined }[], body: string): string | null {
@@ -133,7 +147,9 @@ function controlProblem(fields: { name: string; value: string | undefined }[], b
  * The cache row for a record file, with the index-time checks applied. `candidate` is the first
  * failing check: 'lint' (unparseable), 'version' (written by a newer format, read-only),
  * 'edited' (name ≠ hash of the canonical form), 'lint' (lint errors, or a source whose path,
- * anchor or commit has the wrong shape), 'secret' (a secret in any field, or a quote field that
+ * anchor or commit has the wrong shape, a control character in a path included), 'shape' (a
+ * control, bidi or line-separator character the write gate refuses in title, observer, key, tag
+ * or body), 'secret' (a secret in any field, or a quote field that
  * is not a hash, i.e. code copied into memory). `flagged` covers title, body and observer.
  *
  * The version check runs before the name check (the plan lists it after): a newer-format record
@@ -172,6 +188,7 @@ export function indexRecord(sr: StoredRecord): RecordRow {
   if (readOnly) candidate = 'version';
   else if (recordId(record) !== sr.id) candidate = 'edited';
   else if (lint(record).length > 0 || sourceProblems(record.sources).length > 0) candidate = 'lint';
+  else if (controlProblem(lineFields(record.title, record.observer, record.key, record.tag), record.body) !== null) candidate = 'shape';
   else if (
     recordStrings(record).some(containsSecret) ||
     record.sources.some((s) => isQuote(s) && !QUOTE_HASH.test(s.quote))
@@ -377,7 +394,7 @@ export function viewOfCache(store: Store, cache: Cache): RecordRow[] {
 const FINGERPRINT_KEY = 'sync:fingerprint';
 const INDEX_RULES_KEY = 'sync:index-rules';
 /** Bump when indexRecord's checks change, so rows indexed under older rules are redone. */
-const INDEX_RULES = '3';
+const INDEX_RULES = '4';
 /** A directory changed this recently may change again within the same mtime tick (racy-clean, V14). */
 const RACY_MS = 2000;
 
@@ -638,15 +655,7 @@ async function prepare(
   if (input.key !== undefined && isRecordId(input.key)) {
     throw new RefusedError('a key must not look like a record id', 'key');
   }
-  const control = controlProblem(
-    [
-      { name: 'title', value: input.title },
-      { name: 'observer', value: observer },
-      { name: 'key', value: input.key },
-      { name: 'tag', value: input.tag },
-    ],
-    input.text,
-  );
+  const control = controlProblem(lineFields(input.title, observer, input.key, input.tag), input.text);
   if (control !== null) throw new RefusedError(control, 'shape');
 
   // 1 shape: lint a provisional record whose sources carry the real paths and placeholder hashes.

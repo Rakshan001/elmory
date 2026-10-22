@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { Elmory, type ElmoryEvent } from '../src/api.js';
 import { type Deriver, FORGET_UNTRUSTED } from '../src/derive.js';
 import { type Exec, defaultExec } from '../src/exec.js';
-import { ConflictError, RefusedError, indexRecord, injectionFlag } from '../src/gate.js';
+import { ConflictError, RefusedError, indexRecord, injectionFlag, isRepoPath } from '../src/gate.js';
 import { type ElmoryRecord, type QuoteSource, recordId, serialize } from '../src/record.js';
 
 const dirs: string[] = [];
@@ -798,6 +798,40 @@ describe('write gate: one-line fields (I2/M7)', () => {
     const ok = await e.note({ title: 'Tabs and newlines', text: 'line one\n\tindented\r\nline three', key: 'fmt.ok' });
     expect(ok.state).toBe('active');
     expect(e.cache.getRecord(ok.id)?.body).toBe('line one\n\tindented\nline three');
+  });
+
+  it('a pulled record holding the same characters is candidate: shape (index/write parity)', async () => {
+    const { e } = await setup();
+    const rlo = pulled(e, { title: 'Run deploy\u202Ehs.exe' });
+    const bell = pulled(e, { title: 'Bell body', body: 'ring \u0007 the bell' });
+    const sep = pulled(e, { title: 'Separated', observer: 'agent:x\u2028agent:y' });
+    await e.sync();
+    for (const id of [rlo, bell, sep]) expect(e.cache.getRecord(id)?.candidate).toBe('shape');
+    expect((await e.review()).map((r) => [r.id, r.reason]).sort()).toEqual([rlo, bell, sep].map((id) => [id, 'shape']).sort());
+    expect(await stateOf(e, rlo)).toBe('candidate');
+  });
+
+  it('a source path holding a control, bidi or line-separator character is refused at write and is candidate: lint at index', async () => {
+    for (const bad of ['src/a\u202Eb.ts', 'src/a\nb.ts', 'src/a\u0085b.ts', 'src/a\u2066b.ts', 'src/a\u2029b.ts', 'src/a\u001bb.ts']) {
+      expect(isRepoPath(bad)).toBe(false);
+    }
+    expect(isRepoPath('src/auth.ts')).toBe(true);
+    const { e } = await setup();
+    for (const file of ['src/a\u202Eb.ts', 'src/a\nb.ts', 'src/a\u2028b.ts']) {
+      expect((await refusal(e.remember({ ...fact('Bad path'), quotes: [{ file, text: LINE_A }] }))).reason).toBe('shape');
+    }
+    const r: ElmoryRecord = {
+      type: 'memory/fact',
+      title: 'Plain title',
+      version: 1,
+      recorded: NOW,
+      observer: 'agent:test',
+      supersedes: [],
+      cites: [],
+      sources: [{ resource: 'src/a\u202Eb.ts', quote: `sha256:${'a'.repeat(64)}`, anchor: '0123456789ab', tokens: 9, commit: 'abc1234' }],
+      body: 'Plain body.',
+    };
+    expect(indexRecord({ id: recordId(r), area: 'facts', path: '/x', text: serialize(r) }).candidate).toBe('lint');
   });
 });
 

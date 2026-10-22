@@ -172,12 +172,11 @@ describe('elmory cli', () => {
       body: 'line one \u001b]0;pwned\u0007 tail\r\nline two \u009b31m',
     });
 
-    const r = await run('recall', 'evil');
+    // The index makes such a record candidate: shape (never served), so it shows in review.
+    const r = await run('review');
     expect(r, r.err).toMatchObject({ code: 0 });
     expect(r.out).not.toMatch(RAW_CONTROL);
-    expect(r.out).toContain('## evil \\x1b[2Jclear title');
-    expect(r.out).toContain('line one \\x1b]0;pwned\\x07 tail');
-    expect(r.out).toContain('\\x9b31m');
+    expect(r.out).toBe(`${id} shape evil \\x1b[2Jclear title`);
 
     const h = await run('history', id);
     expect(h, h.err).toMatchObject({ code: 0 });
@@ -185,9 +184,9 @@ describe('elmory cli', () => {
     expect(h.out.split('\n')).toHaveLength(1); // the observer's newline cannot forge a second line
     expect(h.out).toContain('x\\x0ainjected: y');
 
-    const json = await run('recall', 'evil', '--json');
-    const got = JSON.parse(json.out) as { served: { title: string }[] };
-    expect(got.served[0]?.title).toBe('evil \u001b[2Jclear title');
+    const json = await run('review', '--json');
+    const got = JSON.parse(json.out) as { title: string }[];
+    expect(got[0]?.title).toBe('evil \u001b[2Jclear title');
   }, 30000);
 
   it('bidi controls and U+2028/2029 in record text are escaped in human output; --json keeps them', async () => {
