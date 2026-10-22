@@ -132,7 +132,7 @@ unchanged.
 | `elmory forget <id…> \| --query <q> [--confirm] \| --all [--confirm]` | delete, cascade to citing records (archived ones too), report what could not be reached |
 | `elmory publish [id…]` | move pending records into `.elmory/facts/` to commit with the work |
 | `elmory review` | list records not yet trusted here, with the reason |
-| `elmory approve <id>` / `elmory reject <id>` | trust a record / hide it here. For a record withheld by an unsigned forget (`forget requested by an untrusted commit`), approve refuses that forget and reject accepts it; a trusted forget (local, or signed by a trusted key) cannot be approved away (refused, exit `2`) |
+| `elmory approve <id>` / `elmory reject <id>` | trust a record / hide it here. For a record withheld by an untrusted forget (`forget requested by an untrusted commit`), reject accepts the forget; approve refuses it only when git reports the forgetting commit as unsigned. A forget that is local, signed by any key, or whose signature cannot be checked here (gpg or the allowed signers file missing) stands: approve is refused, exit `2` |
 | `elmory gc [--dry-run] [--restore id]` | archive old superseded/stale records and unused notes |
 | `elmory rebuild` | rebuild the cache from the record files |
 | `elmory help` | list every verb (`--json` for a machine-readable list) |

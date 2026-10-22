@@ -682,6 +682,13 @@ export class Cache {
     this.#stmt('INSERT OR REPLACE INTO meta(k, v) VALUES(?, ?)').run(k, v);
   }
 
+  /** Delete every meta row whose key starts with `prefix`; returns how many went. */
+  deleteMetaPrefix(prefix: string): number {
+    this.ensureCurrent();
+    const r = this.#stmt('DELETE FROM meta WHERE substr(k, 1, ?) = ?').run(prefix.length, prefix);
+    return Number(r.changes);
+  }
+
   /**
    * Erase freed bytes (spec §8 step 7): FTS 'optimize' → VACUUM → wal_checkpoint(TRUNCATE),
    * retried up to 20 × 50 ms until busy = 0. 'pending' when a reader still pins the WAL.

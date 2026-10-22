@@ -54,6 +54,21 @@ export function committedTombstoneTrusted(id: string, addedBy: ReadonlyMap<strin
   return !!signer && trust.signers.has(signer);
 }
 
+/**
+ * Whether an approval may refuse the committed tombstone of `id` (I3, N2): it is not trusted, and
+ * git positively says no trusted signature stands behind it: its path has no credit (no commit
+ * left these bytes, or they are uncommitted), the replay check voided the credit (no signature
+ * was asked about), or the credited commit is unsigned (`%G?` = `N`). Any other answer (a good
+ * signature by a key the ledger does not list, an expired or revoked key, gpg or ssh-keygen
+ * missing, an unreadable allowed-signers file) cannot be judged here, and the forget stands.
+ * The one rule for the Deriver, the index and `approve` (fail closed).
+ */
+export function forgetRefusable(id: string, addedBy: ReadonlyMap<string, AddedBy>, trust: Trust): boolean {
+  if (committedTombstoneTrusted(id, addedBy, trust)) return false;
+  const credit = addedBy.get(`.elmory/tombstones/${id}`);
+  return credit === undefined || credit.status === undefined || credit.status === 'N';
+}
+
 /** The ledger's latest word on `id` is `approved` (a later `rejected` drops it, see Store.readTrust). */
 export function approvedHere(trust: Trust, id: string): boolean {
   return trust.approved.has(id) && !trust.rejected.has(id);
@@ -108,8 +123,9 @@ export class Deriver {
     for (const t of this.tombs) {
       if (this.tombstoneTrusted(t)) this.forgotten.add(t.id);
       // An untrusted forget of a record the user approved here is refused (I3): the approval is
-      // the review §8 asks for, and the record keeps its evidence-based state.
-      else if (!approvedHere(input.trust, t.id)) this.forgetUntrusted.add(t.id);
+      // the review §8 asks for, and the record keeps its evidence-based state. Only when git
+      // positively says the forget is unsigned (forgetRefusable, N2); otherwise it stands.
+      else if (!(approvedHere(input.trust, t.id) && forgetRefusable(t.id, input.addedBy, input.trust))) this.forgetUntrusted.add(t.id);
     }
 
     for (const id of input.records.keys()) this.nodes.add(id);

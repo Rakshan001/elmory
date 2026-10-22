@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { Context } from './context.js';
 import type { Cache, RecordRow } from './cache.js';
-import { Deriver, type State, approvedHere, committedTombstoneTrusted } from './derive.js';
+import { Deriver, type State, approvedHere, forgetRefusable } from './derive.js';
 import type { AddedBy } from './git.js';
 import { checkQuoteAtWrite, containsSecret } from './quote.js';
 import {
@@ -275,9 +275,9 @@ function withoutText(row: RecordRow, tomb: 'local' | 'committed'): RecordRow {
 const NONE: ReadonlySet<string> = new Set();
 
 /**
- * Ids whose forget the user refused (I3): a committed tombstone alone (no local one), that is not
- * trusted (`committedTombstoneTrusted`, the Deriver's own rule over the same `addedBy`), for a
- * record the trust ledger approves. The Deriver withholds none of these; the index keeps their
+ * Ids whose forget the user refused (I3): a committed tombstone alone (no local one) that git
+ * positively reports as untrusted (`forgetRefusable`, the Deriver's own rule over the same
+ * `addedBy`: a verification error is not "untrusted", N2), for a record the trust ledger approves. The Deriver withholds none of these; the index keeps their
  * text. A trusted forget (local, or signed by a trusted key) is never lifted by an approval. The
  * ledger is read only when a committed-only tombstone exists.
  */
@@ -287,7 +287,7 @@ export function liftedForgets(store: Store, addedBy: ReadonlyMap<string, AddedBy
   for (const [id, where] of store.tombstoneIds()) {
     if (where !== 'committed') continue;
     trust ??= store.readTrust();
-    if (approvedHere(trust, id) && !committedTombstoneTrusted(id, addedBy, trust)) out.add(id);
+    if (approvedHere(trust, id) && forgetRefusable(id, addedBy, trust)) out.add(id);
   }
   return out;
 }

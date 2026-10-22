@@ -510,7 +510,7 @@ describe('Elmory wiring', () => {
     let calls: string[][] = [];
     const exec: typeof defaultExec = (file, args, opts) => {
       if (args.includes('log') && args.includes('--full-history')) logs++;
-      if (args.includes('--no-walk=unsorted')) lookups++;
+      if (args.some((a) => a.includes('%G?'))) lookups++;
       calls.push(args);
       return defaultExec(file, args, opts);
     };
@@ -536,11 +536,12 @@ describe('Elmory wiring', () => {
     expect(calls.length).toBeLessThanOrEqual(10);
     expect(calls.every((c) => c[0] === 'rev-parse' || c[0] === 'diff')).toBe(true);
 
-    // A new process on the same HEAD reuses the walk stored in the cache.
+    // A new process walks once: the walk decides trust, so it is never kept in the cache (N1).
     const again = await Elmory.open({ worktree: wt, cacheDir, now: () => NOW, observer: 'agent:test', exec });
     opened.push(again);
     expect((await again.recall({ query: 'checkToken' })).abstain).toBe(false);
-    expect(logs).toBe(1);
+    await again.recall({ query: 'checkToken' });
+    expect(logs).toBe(2);
 
     // HEAD moves: one walk; verify walks again whatever HEAD is.
     e.publish();
@@ -549,11 +550,11 @@ describe('Elmory wiring', () => {
     expect(lookups).toBe(0); // nothing was committed yet: no credit to verify
     await e.recall({ query: 'checkToken' });
     await e.recall({ query: 'checkToken' });
-    expect(logs).toBe(2);
+    expect(logs).toBe(3);
     // Signatures are never reused: one batched lookup of the credited commit per fetch.
     expect(lookups).toBe(2);
     expect((await e.verify()).states.active).toBe(2);
-    expect(logs).toBe(3);
+    expect(logs).toBe(4);
 
     const ab = await e.about('src/auth.ts');
     expect(ab.abstain === false && ab.served.map((s) => s.id)).toContain(a.id);
@@ -888,17 +889,18 @@ describe('signature cache (C2)', () => {
     // Revoke the key: same HEAD, same walk, but the signature no longer counts.
     fs.writeFileSync(allowed, '');
     expect((await e.fetchAddedBy()).get(file)).toMatchObject({ signer: null });
-    // A new process on the same HEAD reuses the stored walk, never a stored signer.
+    expect(walks).toBe(2);
+    // A new process walks once (nothing of the walk is kept in the cache, N1), same verdict.
     const again = await Elmory.open({ worktree: wt, cacheDir, now: () => NOW, observer: 'agent:test', exec });
     opened.push(again);
     expect((await again.fetchAddedBy()).get(file)).toMatchObject({ signer: null });
-    expect(walks).toBe(2);
-    expect(again.cache.getMeta(`addedby:${e.layout.worktree}`)).not.toContain('SHA256');
+    expect(walks).toBe(3);
+    expect(again.cache.getMeta(`addedby:${e.layout.worktree}`)).toBeNull();
 
-    // Restore it: counts again, still without a new walk.
+    // Restore it: counts again, without a new walk.
     fs.writeFileSync(allowed, `tester@example.com namespaces="git" ${keyType} ${keyBody}\n`);
     expect((await again.fetchAddedBy()).get(file)?.signer).toBe(signer);
-    expect(walks).toBe(2);
+    expect(walks).toBe(3);
   }, 30000);
 });
 
@@ -1031,6 +1033,17 @@ describe('review of an untrusted forget (I3)', () => {
     expect(['stale', 'suspect']).toContain((await (await e.deriver()).state(id)).state);
   });
 
+  it('a forget committed unsigned (git: N on a commit with no signature) is refused by approve (N2)', async () => {
+    const { e, id } = await underUntrustedForget();
+    await git(e.layout.worktree, 'add', '-A');
+    await git(e.layout.worktree, 'commit', '-q', '--no-verify', '--no-gpg-sign', '-m', 'unsigned forget');
+    expect((await e.fetchAddedBy()).get(`.elmory/tombstones/${id}`)).toMatchObject({ signer: null, status: 'N' });
+    await e.approve(id);
+    await e.sync();
+    expect((await (await e.deriver()).state(id)).state).toBe('active');
+    expect(hits(e, 'okapicode')).toEqual([id]);
+  });
+
   it('reject accepts the forget: the record is hidden and leaves review', async () => {
     const { e, id } = await underUntrustedForget();
     await e.reject(id);
@@ -1050,6 +1063,51 @@ describe('review of an untrusted forget (I3)', () => {
     expect(hits(e, 'okapicode')).toEqual([]);
     expect((await (await e.deriver()).state(id)).reason).toBe('rejected');
   });
+});
+
+describe('the history walk never comes from the cache (N1)', () => {
+  it.skipIf(!hasSshKeygen())('a planted addedby meta row crediting a good-signed commit is ignored, and deleted on open', async () => {
+    const wt = await repo();
+    const cacheDir = tmp();
+    const keys = tmp();
+    const key = path.join(keys, 'k');
+    execFileSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-C', 'tester', '-f', key]);
+    const [keyType, keyBody] = fs.readFileSync(`${key}.pub`, 'utf8').trim().split(' ');
+    const allowed = path.join(keys, 'allowed');
+    fs.writeFileSync(allowed, `tester@example.com namespaces="git" ${keyType} ${keyBody}\n`);
+    await git(wt, 'config', 'gpg.format', 'ssh');
+    await git(wt, 'config', 'user.signingkey', `${key}.pub`);
+    const exec: Exec = (file, args, opts) => defaultExec(file, ['-c', `gpg.ssh.allowedSignersFile=${allowed}`, ...args], opts);
+    const openHere = async (): Promise<Elmory> => {
+      const x = await Elmory.open({ worktree: wt, cacheDir, now: () => NOW, observer: 'agent:test', exec });
+      opened.push(x);
+      return x;
+    };
+    // The user's own signed commit (touching no record), its key trusted.
+    fs.writeFileSync(path.join(wt, 'README'), 'signed\n');
+    await git(wt, 'add', '-A');
+    await git(wt, 'commit', '-q', '--no-verify', '-S', '-m', 'signed');
+    const s1 = (await git(wt, 'rev-parse', 'HEAD')).trim();
+    const fp = (await git(wt, '-c', `gpg.ssh.allowedSignersFile=${allowed}`, 'log', '-1', '--format=%GF')).trim();
+    const e = await openHere();
+    e.store.appendTrust(`signer ${fp}`);
+    // A pulled record, committed unsigned.
+    const id = pulled(e, { title: 'Pulled planted', body: 'The zqxplant story.' });
+    await git(wt, 'add', '-A');
+    await git(wt, 'commit', '-q', '--no-verify', '--no-gpg-sign', '-m', 'unsigned pull');
+    expect(await stateOf(e, id)).toBe('candidate');
+    // Plant a walk that credits the record to the good-signed commit.
+    const head = (await git(wt, 'rev-parse', 'HEAD')).trim();
+    const tree = (await git(wt, 'rev-parse', 'HEAD:.elmory')).trim();
+    const forged = JSON.stringify({ head, tree, entries: [[`.elmory/facts/${id}.md`, s1, true]] });
+    const metaKey = `addedby:${e.layout.worktree}`;
+    e.cache.setMeta(metaKey, forged);
+    const again = await openHere();
+    expect(again.cache.getMeta(metaKey)).toBeNull(); // deleted on open
+    again.cache.setMeta(metaKey, forged); // planted after open: still never read
+    expect(await stateOf(again, id)).toBe('candidate');
+    expect((await again.recall({ query: 'zqxplant' })).abstain).toBe(true);
+  }, 30000);
 });
 
 describe('a trusted forget wins over an approval (I3)', () => {
@@ -1095,14 +1153,22 @@ describe('a trusted forget wins over an approval (I3)', () => {
     expect((await (await e.deriver()).state(late.id)).state).toBe('forgotten');
     expect(hits('impala7marker')).toEqual([]);
 
-    // (a) the key leaves the allowed signers: the forget is now untrusted, so the earlier
-    // approval refuses it and the record comes back with its text.
+    // (N2) verification breaks: the key leaves the allowed signers (git: U), or no allowed
+    // signers file is configured at all (git: N, though the commit is signed). Neither is a
+    // positive "unsigned", so the earlier approval lifts nothing: withheld, and no text.
     fs.writeFileSync(allowed, '');
     await e.sync();
-    expect((await (await e.deriver()).state(early.id)).state).toBe('active');
-    expect(hits('kudu7marker')).toEqual([early.id]);
-    expect((await (await e.deriver()).state(late.id))).toMatchObject({ state: 'candidate', reason: FORGET_UNTRUSTED });
-    expect(hits('impala7marker')).toEqual([]);
+    expect((await (await e.deriver()).state(early.id))).toMatchObject({ state: 'candidate', reason: FORGET_UNTRUSTED });
+    expect(hits('kudu7marker')).toEqual([]);
+    expect(e.cache.getRecord(early.id)).toMatchObject({ title: '', text: '' });
+    const blind = await Elmory.open({ worktree: wt, cacheDir: tmp(), now: () => NOW, observer: 'agent:test' });
+    opened.push(blind);
+    expect((await blind.fetchAddedBy()).get(`.elmory/tombstones/${early.id}`)).toMatchObject({ signer: null, status: '?' });
+    await blind.sync();
+    expect((await (await blind.deriver()).state(early.id))).toMatchObject({ state: 'candidate', reason: FORGET_UNTRUSTED });
+    expect(blind.cache.search('kudu7marker', { limit: 10, offset: 0 })).toEqual([]);
+    expect((await blind.recall({ query: 'kudu7marker' })).abstain).toBe(true);
+    await expect(blind.approve(late.id)).rejects.toMatchObject({ reason: 'forgotten' });
   }, 30000);
 });
 

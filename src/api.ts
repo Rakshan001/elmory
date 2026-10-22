@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { Cache, type RecordRow } from './cache.js';
 import type { Context, ElmoryEvent } from './context.js';
-import { Deriver, FORGET_UNTRUSTED, committedTombstoneTrusted } from './derive.js';
+import { Deriver, FORGET_UNTRUSTED, committedTombstoneTrusted, forgetRefusable } from './derive.js';
 import { Evidence } from './evidence.js';
 import { type Exec, defaultExec, gitCommonDir } from './exec.js';
 import * as gate from './gate.js';
@@ -45,8 +45,11 @@ const DEFAULT_OBSERVER = 'agent:unknown';
 /** The warning a read carries when the index could not be brought up to date (§9). */
 export const INDEX_BUSY = 'index busy; results may be behind';
 
-/** Cache meta key prefix: the history walk (`Git.credited('.elmory')`) of one worktree, with its HEAD and tree. */
-const ADDED_BY_META = 'addedby:';
+/**
+ * Cache meta key prefix an earlier build used to persist the history walk. Trust never comes from
+ * the cache (V1, N1): such rows are deleted on open and never read.
+ */
+const LEGACY_ADDED_BY_META = 'addedby:';
 
 interface WalkEntry {
   head: string;
@@ -57,17 +60,14 @@ interface WalkEntry {
 /**
  * git's addedBy('.elmory') per worktree. The history walk (which commit each path is credited
  * to) is a function of HEAD's history alone, so it is reused while HEAD and HEAD's `.elmory`
- * tree are the ones it was computed at: kept in memory and in the cache meta, so a new process
- * with the same HEAD skips it too. A walk is stored only when HEAD did not move during it.
- * Signatures are never reused: every fetch asks git again for the credited commits (one batched
- * `git log --no-walk`), so a key removed from the keyring or the allowed signers file stops
- * counting at once, and nothing read back from the cache can set a signer. `fresh` walks again
- * whatever the key says (verify).
+ * tree are the ones it was computed at. It decides trust, so it lives in this process's memory
+ * only, never in the cache (N1): a new process walks once. A walk is kept only when HEAD did not
+ * move during it. Signatures are never reused: every fetch asks git again for the credited
+ * commits (one batched `git log --no-walk`), so a key removed from the keyring or the allowed
+ * signers file stops counting at once. `fresh` walks again whatever the key says (verify).
  */
 class CommittedAddedBy {
   readonly #memo = new Map<string, WalkEntry>();
-
-  constructor(private readonly cache: Cache) {}
 
   async get(git: Git, worktree: string, fresh: boolean): Promise<Map<string, AddedBy>> {
     return git.signed(await this.#credits(git, worktree, fresh));
@@ -76,42 +76,13 @@ class CommittedAddedBy {
   async #credits(git: Git, worktree: string, fresh: boolean): Promise<Map<string, Credit>> {
     const key = await git.headKey('.elmory');
     if (key === null) return git.credited('.elmory');
-    if (!fresh) {
-      const hit = this.#memo.get(worktree) ?? this.#fromMeta(worktree);
-      if (hit !== null && hit.head === key.head && hit.tree === key.tree) {
-        this.#memo.set(worktree, hit);
-        return hit.credits;
-      }
-    }
+    const hit = this.#memo.get(worktree);
+    if (!fresh && hit !== undefined && hit.head === key.head && hit.tree === key.tree) return hit.credits;
     const credits = await git.credited('.elmory');
     const after = await git.headKey('.elmory');
-    if (after !== null && after.head === key.head && after.tree === key.tree) {
-      this.#memo.set(worktree, { ...key, credits });
-      try {
-        const entries = [...credits].map(([p, c]) => [p, c.commit, c.verify]);
-        this.cache.setMeta(`${ADDED_BY_META}${worktree}`, JSON.stringify({ head: key.head, tree: key.tree, entries }));
-      } catch {
-        // a busy or read-only cache only costs the next process one walk
-      }
-    }
+    if (after !== null && after.head === key.head && after.tree === key.tree) this.#memo.set(worktree, { ...key, credits });
+    else this.#memo.delete(worktree);
     return credits;
-  }
-
-  #fromMeta(worktree: string): WalkEntry | null {
-    try {
-      const raw = this.cache.getMeta(`${ADDED_BY_META}${worktree}`);
-      if (raw === null) return null;
-      const v = JSON.parse(raw) as { head?: unknown; tree?: unknown; entries?: unknown };
-      if (typeof v.head !== 'string' || typeof v.tree !== 'string' || !Array.isArray(v.entries)) return null;
-      const credits = new Map<string, Credit>();
-      for (const e of v.entries as unknown[]) {
-        if (!Array.isArray(e) || typeof e[0] !== 'string' || typeof e[1] !== 'string' || typeof e[2] !== 'boolean') return null;
-        credits.set(e[0], { commit: e[1], verify: e[2] });
-      }
-      return { head: v.head, tree: v.tree, credits };
-    } catch {
-      return null; // a torn or foreign value: walk again
-    }
   }
 }
 
@@ -193,7 +164,7 @@ export class Elmory implements Context {
   ) {
     this.#now = now;
     this.#exec = exec;
-    this.#committed = new CommittedAddedBy(cache);
+    this.#committed = new CommittedAddedBy();
   }
 
   /**
@@ -218,6 +189,7 @@ export class Elmory implements Context {
       const evidence = new Evidence({ worktree: layout.worktree, cache, git });
       Elmory.#retryCompaction(cache);
       Elmory.#sweepRetired(cache);
+      Elmory.#dropLegacyWalks(cache);
       return new Elmory(layout, store, cache, git, evidence, opts.observer ?? DEFAULT_OBSERVER, opts.now ?? (() => new Date().toISOString()), exec);
     } catch (e) {
       cache.close();
@@ -267,6 +239,15 @@ export class Elmory implements Context {
       });
     } catch {
       // the sweep is housekeeping: a failure never fails the open
+    }
+  }
+
+  /** Delete history walks an earlier build kept in cache meta: never read, so never trusted (N1). */
+  static #dropLegacyWalks(cache: Cache): void {
+    try {
+      cache.deleteMetaPrefix(LEGACY_ADDED_BY_META);
+    } catch {
+      // ignored either way; a busy cache retries on the next open
     }
   }
 
@@ -473,6 +454,17 @@ export class Elmory implements Context {
       if (t.id !== id) continue;
       if (!t.committed || committedTombstoneTrusted(id, addedBy, trust)) {
         throw new gate.RefusedError(`${id} was forgotten by a trusted tombstone; an approval cannot bring it back`, 'forgotten');
+      }
+      if (!forgetRefusable(id, addedBy, trust)) {
+        const status = addedBy.get(`.elmory/tombstones/${id}`)?.status ?? '';
+        const why =
+          status === 'G'
+            ? 'was forgotten by a commit signed with a key the trust ledger does not list'
+            : `was forgotten by a signed commit whose signature cannot be checked here (git %G? ${JSON.stringify(status)})`;
+        throw new gate.RefusedError(
+          `${id} ${why}; the forget stands (only a forget git reports as unsigned can be refused by approval; delete the tombstone in a commit to refuse this one)`,
+          'forgotten',
+        );
       }
     }
     this.#trustLine('approved', id);

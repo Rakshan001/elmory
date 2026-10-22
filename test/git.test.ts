@@ -35,6 +35,11 @@ async function repo(): Promise<string> {
   return wt;
 }
 
+/** addedBy's entries without `status` (the %G? letter), for whole-map comparisons. */
+function plain(m: Map<string, AddedBy>): Map<string, { commit: string; signer: string | null }> {
+  return new Map([...m].map(([k, v]) => [k, { commit: v.commit, signer: v.signer }]));
+}
+
 function write(wt: string, rel: string, body: string): void {
   const abs = path.join(wt, rel);
   fs.mkdirSync(path.dirname(abs), { recursive: true });
@@ -316,7 +321,7 @@ describe('Git', () => {
     await commitAll(wt, 'outside');
     const g = new Git(defaultExec, wt);
     const added = await g.addedBy('.elmory/');
-    expect(added).toEqual(
+    expect(plain(added)).toEqual(
       new Map([
         ['.elmory/facts/f_a.md', { commit: third, signer: null }],
         ['.elmory/facts/f_b.md', { commit: second, signer: null }],
@@ -330,14 +335,14 @@ describe('Git', () => {
     await commitAll(wt, 'add tombstone');
     const merge = await evilMerge(wt, '.elmory/tombstones/f_x');
     const added = await new Git(defaultExec, wt).addedBy('.elmory/');
-    expect(added.get('.elmory/tombstones/f_x')).toEqual({ commit: merge, signer: null });
+    expect(added.get('.elmory/tombstones/f_x')).toMatchObject({ commit: merge, signer: null });
   });
 
   it('a clean merge is not a touch: each path keeps the branch commit that added it', async () => {
     const wt = await repo();
     const { sideAdd, mainAdd, merge } = await cleanMerge(wt, false);
     const added = await new Git(defaultExec, wt).addedBy('.elmory/');
-    expect(added).toEqual(
+    expect(plain(added)).toEqual(
       new Map([
         ['.elmory/tombstones/f_x', { commit: sideAdd, signer: null }],
         ['.elmory/facts/f_main.md', { commit: mainAdd, signer: null }],
@@ -350,23 +355,23 @@ describe('Git', () => {
     const wt = await repo();
     const { a, s, merge, path: tomb } = await sidedMerge(wt, 'ours', false);
     const added = await new Git(defaultExec, wt).addedBy('.elmory/');
-    expect(added.get(tomb)).toEqual({ commit: a, signer: null });
+    expect(added.get(tomb)).toMatchObject({ commit: a, signer: null });
     expect([s, merge]).not.toContain(added.get(tomb)?.commit);
-    expect(added.get('.elmory/facts/f_main.md')).toEqual({ commit: s, signer: null });
+    expect(added.get('.elmory/facts/f_main.md')).toMatchObject({ commit: s, signer: null });
   });
 
   it('merge that keeps the other side attributes to that side', async () => {
     const wt = await repo();
     const { s, path: tomb } = await sidedMerge(wt, 'theirs', false);
     const added = await new Git(defaultExec, wt).addedBy('.elmory/');
-    expect(added.get(tomb)).toEqual({ commit: s, signer: null });
+    expect(added.get(tomb)).toMatchObject({ commit: s, signer: null });
   });
 
   it("restoring an older version is attributed to the restore, not the older version's commit", async () => {
     const wt = await repo();
     const { restore } = await rollbackMerge(wt, false);
     const added = await new Git(defaultExec, wt).addedBy('.elmory/');
-    expect(added.get('.elmory/tombstones/f_x')).toEqual({ commit: restore, signer: null });
+    expect(added.get('.elmory/tombstones/f_x')).toMatchObject({ commit: restore, signer: null });
   });
 
   it('a path no longer in HEAD is absent', async () => {
@@ -377,7 +382,7 @@ describe('Git', () => {
     await git(wt, 'rm', '-q', '.elmory/facts/f_gone.md');
     await commitAll(wt, 'delete');
     const added = await new Git(defaultExec, wt).addedBy('.elmory/');
-    expect(added).toEqual(new Map([['.elmory/facts/f_kept.md', { commit: add, signer: null }]]));
+    expect(plain(added)).toEqual(new Map([['.elmory/facts/f_kept.md', { commit: add, signer: null }]]));
   });
 
   it('addedBy is empty before the first commit', async () => {
@@ -396,6 +401,7 @@ describe('Git', () => {
     expect((await g.addedBy('.elmory/')).get('.elmory/facts/f_m.md')).toEqual({
       commit: sha,
       signer: null,
+      status: 'N',
     });
   });
 
@@ -446,7 +452,7 @@ describe('Git', () => {
       return withSigners(file, args, opts);
     };
     const added = await new Git(spy, wt).addedBy('.elmory/');
-    expect(added.get('.elmory/facts/f_a.md')).toEqual({ commit: signed, signer: expect.stringMatching(/^SHA256:/) });
+    expect(added.get('.elmory/facts/f_a.md')).toMatchObject({ commit: signed, signer: expect.stringMatching(/^SHA256:/) });
     const logs = calls.filter((c) => c.includes('log'));
     expect(logs).toHaveLength(2);
     const [walk, lookup] = logs as [string[], string[]];
@@ -467,7 +473,8 @@ describe('Git', () => {
     };
     const g = new Git(spy, wt);
     expect((await g.addedBy('.elmory/')).get('.elmory/facts/f_a.md')?.signer).toBeNull();
-    expect(calls.filter((c) => c.includes('--no-walk=unsorted'))).toHaveLength(1); // one credited commit, unsigned
+    expect(calls.filter((c) => c.some((a) => a.includes('%G?')))).toHaveLength(1); // one credited commit, unsigned
+    expect(calls.filter((c) => c.includes('--pretty=raw'))).toHaveLength(1); // its N confirmed on the raw object
     calls.length = 0;
     const empty = await repo();
     write(empty, 'src/x.ts', 'x\n');
@@ -511,7 +518,9 @@ describe('Git', () => {
     expect(added.get('.elmory/facts/f_u.md')).toEqual({
       commit: unsigned,
       signer: null,
+      status: 'N', // positively unsigned
     });
+    expect(s?.status).toBe('G');
     // The signer is the key, whatever the author line claims.
     const t = added.get('.elmory/facts/f_t.md');
     expect(t?.commit).toBe(signedForged);
@@ -520,6 +529,8 @@ describe('Git', () => {
     // Without the allowed-signers file the signature is not good, so there is no signer.
     const unverified = await new Git(defaultExec, wt).addedBy('.elmory/');
     expect(unverified.get('.elmory/facts/f_s.md')?.signer).toBeNull();
+    // ...and git cannot judge it: neither good nor unsigned (N2).
+    expect(unverified.get('.elmory/facts/f_s.md')?.status).not.toMatch(/^[GN]$/);
   });
 
   it.skipIf(!hasSshKeygen())('an unsigned edit after a signed add drops the signer', async () => {
@@ -532,7 +543,7 @@ describe('Git', () => {
 
     write(wt, '.elmory/tombstones/f_x', 'supersedes: [f_victim]\n');
     const forged = await commitAll(wt, 'unsigned edit', '--author=Mallory <m@x>');
-    expect((await g.addedBy('.elmory/')).get('.elmory/tombstones/f_x')).toEqual({ commit: forged, signer: null });
+    expect((await g.addedBy('.elmory/')).get('.elmory/tombstones/f_x')).toMatchObject({ commit: forged, signer: null });
     expect(forged).not.toBe(signed);
   });
 
@@ -544,7 +555,7 @@ describe('Git', () => {
     const t = added.get('.elmory/tombstones/f_x');
     expect(t?.commit).toBe(sideAdd);
     expect(t?.signer).toMatch(/^SHA256:/);
-    expect(added.get('.elmory/facts/f_main.md')).toEqual({ commit: mainAdd, signer: null });
+    expect(added.get('.elmory/facts/f_main.md')).toMatchObject({ commit: mainAdd, signer: null });
   });
 
   it.skipIf(!hasSshKeygen())('an unsigned evil merge after a signed add drops the signer', async () => {
@@ -556,7 +567,7 @@ describe('Git', () => {
     expect((await g.addedBy('.elmory/')).get('.elmory/tombstones/f_x')?.signer).toMatch(/^SHA256:/);
 
     const merge = await evilMerge(wt, '.elmory/tombstones/f_x');
-    expect((await g.addedBy('.elmory/')).get('.elmory/tombstones/f_x')).toEqual({ commit: merge, signer: null });
+    expect((await g.addedBy('.elmory/')).get('.elmory/tombstones/f_x')).toMatchObject({ commit: merge, signer: null });
   });
 
   it.skipIf(!hasSshKeygen())("an unsigned merge that keeps the unsigned side's version has no signer", async () => {
@@ -564,7 +575,7 @@ describe('Git', () => {
     const withSigners = await sshSigning(wt);
     const { a, path: tomb } = await sidedMerge(wt, 'ours', true);
     const added = await new Git(withSigners, wt).addedBy('.elmory/');
-    expect(added.get(tomb)).toEqual({ commit: a, signer: null });
+    expect(added.get(tomb)).toMatchObject({ commit: a, signer: null });
     expect(added.get('.elmory/facts/f_main.md')?.signer).toMatch(/^SHA256:/);
   });
 
@@ -582,7 +593,7 @@ describe('Git', () => {
     const withSigners = await sshSigning(wt);
     const { restore } = await rollbackMerge(wt, true);
     const added = await new Git(withSigners, wt).addedBy('.elmory/');
-    expect(added.get('.elmory/tombstones/f_x')).toEqual({ commit: restore, signer: null });
+    expect(added.get('.elmory/tombstones/f_x')).toMatchObject({ commit: restore, signer: null });
   });
 
   it.skipIf(!hasSshKeygen())('a merge that resolves to stale signed bytes has no signer', async () => {
@@ -604,7 +615,7 @@ describe('Git', () => {
     );
     expect(fs.readFileSync(path.join(wt, tomb), 'utf8')).toBe('supersedes: [f_victim]\n');
     const t = (await new Git(withSigners, wt).addedBy('.elmory/')).get(tomb);
-    expect(t).toEqual({ commit: s, signer: null });
+    expect(t).toMatchObject({ commit: s, signer: null });
   });
 
   it.skipIf(!hasSshKeygen())('merge -s ours over a deleted signed tombstone has no signer', async () => {
@@ -693,7 +704,7 @@ describe('Git', () => {
     await git(wt, 'checkout', 'c', '--', tomb);
     await commitAll(wt, 'merge c, take its tombstone');
     expect(fs.readFileSync(path.join(wt, tomb), 'utf8')).toBe('supersedes: [f_victim]\n');
-    expect((await g.addedBy('.elmory/')).get(tomb)).toEqual({ commit: s, signer: null });
+    expect((await g.addedBy('.elmory/')).get(tomb)).toMatchObject({ commit: s, signer: null });
   });
 
   it.skipIf(!hasSshKeygen())('a signed tombstone carried by clean merges on both sides keeps its signer', async () => {

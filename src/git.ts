@@ -13,6 +13,21 @@ export interface RenameResult {
 export interface AddedBy {
   commit: string;
   signer: string | null;
+  /**
+   * git's `%G?` for `commit`, set only when its signature was asked about (the replay check let
+   * the credit count): `G` good; `N` the commit object carries no signature at all (git also
+   * says `N` for a signature it cannot check, e.g. ssh without an allowed signers file, so `N` is
+   * kept only after the raw commit shows no `gpgsig` header, and becomes `?` otherwise);
+   * anything else (`B`, `E`, `U`, `X`, `Y`, `R`, `?`, or '' when git gave no answer) means the
+   * signature could not be judged here.
+   */
+  status?: string;
+}
+
+/** git's word on one commit's signature: `%G?` and, when good, the key. */
+export interface Verdict {
+  status: string;
+  signer: string | null;
 }
 
 /**
@@ -296,20 +311,34 @@ export class Git {
   async signed(credits: ReadonlyMap<string, Credit>): Promise<Map<string, AddedBy>> {
     const commits = new Set<string>();
     for (const c of credits.values()) if (c.verify) commits.add(c.commit);
-    const signers = commits.size === 0 ? new Map<string, string>() : await this.signers([...commits]);
+    const verdicts = commits.size === 0 ? new Map<string, Verdict>() : await this.signers([...commits]);
+    // git's `N` covers "cannot check" too: confirm it on the raw commit (one more call, only when
+    // some credited commit got an `N`).
+    const saidN = [...verdicts].filter(([, v]) => v.status === 'N').map(([c]) => c);
+    if (saidN.length > 0) {
+      const bare = await this.unsignedCommits(saidN);
+      for (const c of saidN) if (!bare.has(c)) (verdicts.get(c) as Verdict).status = '?';
+    }
     const out = new Map<string, AddedBy>();
-    for (const [file, c] of credits) out.set(file, { commit: c.commit, signer: c.verify ? (signers.get(c.commit) ?? null) : null });
+    for (const [file, c] of credits) {
+      if (!c.verify) {
+        out.set(file, { commit: c.commit, signer: null });
+        continue;
+      }
+      const v = verdicts.get(c.commit);
+      out.set(file, { commit: c.commit, signer: v?.signer ?? null, status: v?.status ?? '' });
+    }
     return out;
   }
 
   /**
-   * The key of every commit in `commits` (full shas) that git reports a good signature for (`%G?`
-   * is `G`): its fingerprint, else its key id. One `git log --no-walk` per 500 commits, so gpg or
+   * git's verdict on each commit in `commits` (full shas): `%G?`, and for a good signature (`G`)
+   * its key fingerprint, else its key id. One `git log --no-walk` per 500 commits, so gpg or
    * ssh-keygen runs once per commit asked about and never for the rest of history. A record whose
-   * header is not exactly four fields, or names a commit not asked about, is skipped (no signer).
+   * header is not exactly four fields, or names a commit not asked about, is skipped (no verdict).
    */
-  async signers(commits: readonly string[]): Promise<Map<string, string>> {
-    const out = new Map<string, string>();
+  async signers(commits: readonly string[]): Promise<Map<string, Verdict>> {
+    const out = new Map<string, Verdict>();
     const asked = commits.filter((c) => FULL_SHA.test(c));
     for (let i = 0; i < asked.length; i += SIGNATURE_BATCH) {
       const batch = asked.slice(i, i + SIGNATURE_BATCH);
@@ -330,9 +359,42 @@ export class Git {
         const fields = token.slice(1).split(US);
         if (fields.length !== 4) continue;
         const [hash = '', good = '', fingerprint = '', keyId = ''] = fields;
-        if (!wanted.has(hash) || good !== 'G') continue;
-        const signer = fingerprint || keyId;
-        if (signer !== '') out.set(hash, signer);
+        if (!wanted.has(hash)) continue;
+        const signer = good === 'G' ? fingerprint || keyId : '';
+        out.set(hash, { status: good, signer: signer === '' ? null : signer });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * The commits in `commits` (full shas) whose raw object has no signature header (`gpgsig`,
+   * `gpgsig-sha256`), from `git log --no-walk --pretty=raw`, one call per 500. Headers are read
+   * only up to the blank line that ends them (the message after it is indented and never read),
+   * and a block is attributed only to a commit asked about; anything unparsed counts as signed.
+   */
+  async unsignedCommits(commits: readonly string[]): Promise<Set<string>> {
+    const out = new Set<string>();
+    const asked = commits.filter((c) => FULL_SHA.test(c));
+    for (let i = 0; i < asked.length; i += SIGNATURE_BATCH) {
+      const batch = asked.slice(i, i + SIGNATURE_BATCH);
+      const wanted = new Set(batch);
+      const res = await this.run(['log', '--no-show-signature', '--no-walk=unsorted', '--pretty=raw', '-z', ...batch, '--']);
+      if (res.code !== 0) throw new Error(`git log failed: ${res.stderr.trim() || `exit ${res.code}`}`);
+      for (const block of splitZ(res.stdout)) {
+        const lines = block.replace(/^\n/, '').split('\n');
+        const hash = /^commit ([0-9a-f]{40}|[0-9a-f]{64})$/.exec(lines[0] ?? '')?.[1];
+        if (hash === undefined || !wanted.has(hash)) continue;
+        let signed = false;
+        let ended = false;
+        for (const line of lines.slice(1)) {
+          if (line === '') {
+            ended = true;
+            break;
+          }
+          if (/^gpgsig(?:-sha256)? /.test(line)) signed = true;
+        }
+        if (ended && !signed) out.add(hash);
       }
     }
     return out;
