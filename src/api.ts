@@ -1,7 +1,8 @@
 // The Elmory object (spec §3 layer 1) and the Context every flow receives.
 
 import fs from 'node:fs';
-import { Cache, CacheBusyError, type RecordRow } from './cache.js';
+import path from 'node:path';
+import { Cache, type RecordRow } from './cache.js';
 import type { Context, ElmoryEvent } from './context.js';
 import { Deriver } from './derive.js';
 import { Evidence } from './evidence.js';
@@ -12,6 +13,7 @@ import { type AddedBy, Git } from './git.js';
 import * as flows from './recall.js';
 import { RecordError, isRecordId } from './record.js';
 import { type Layout, Store, resolveLayout } from './store.js';
+import { resolveWorktree } from './worktree.js';
 
 export type { Context, ElmoryEvent } from './context.js';
 
@@ -42,25 +44,6 @@ export type {
 const DEFAULT_OBSERVER = 'agent:unknown';
 /** The warning a read carries when the index could not be brought up to date (§9). */
 export const INDEX_BUSY = 'index busy; results may be behind';
-
-/**
- * The top level of the work tree containing `dir` (git rev-parse --show-toplevel); `dir` itself
- * outside git. Inside a repository but outside any work tree (a bare repo, or inside `.git`)
- * there is no place for `.elmory/facts`, so that throws.
- */
-async function workTreeRoot(exec: Exec, dir: string): Promise<string> {
-  let top: string | null = null;
-  try {
-    const res = await exec('git', ['rev-parse', '--show-toplevel'], { cwd: dir });
-    const out = res.stdout.replace(/\r?\n$/, '');
-    if (res.code === 0 && out !== '') top = out;
-  } catch {
-    // git could not run: gitCommonDir decides below
-  }
-  if (top !== null) return top;
-  if ((await gitCommonDir(exec, dir)) !== null) throw new Error(`not inside a git work tree: ${dir}`);
-  return dir;
-}
 
 /**
  * git's addedBy for `.elmory`, minus every path whose working-tree bytes differ from HEAD (N0):
@@ -125,11 +108,19 @@ export class Elmory implements Context {
     this.#exec = exec;
   }
 
-  /** show-toplevel → gitCommonDir → resolveLayout → Store.ensureDirs → Cache.open(projectId, cacheDir) → Git (null without git) → Evidence */
+  /**
+   * resolveWorktree (the git toplevel) → gitCommonDir → resolveLayout → Store.ensureDirs →
+   * Cache.open(projectId, cacheDir) → Git (null without git) → Evidence. Inside a repository but
+   * outside any work tree (a bare repo, or inside `.git`) there is no place for `.elmory/facts`:
+   * the directory resolveWorktree falls back to has no `.git` entry of its own, and that throws.
+   */
   static async open(opts: OpenOptions): Promise<Elmory> {
     const exec = opts.exec ?? defaultExec;
-    const worktree = await workTreeRoot(exec, opts.worktree);
+    const worktree = await resolveWorktree(opts.worktree, exec);
     const commonDir = await gitCommonDir(exec, worktree);
+    if (commonDir !== null && !fs.existsSync(path.join(worktree, '.git'))) {
+      throw new Error(`not inside a git work tree: ${opts.worktree}`);
+    }
     const layout = resolveLayout(worktree, commonDir);
     const store = new Store(layout);
     store.ensureDirs();
@@ -145,12 +136,32 @@ export class Elmory implements Context {
     }
   }
 
-  /** §8 step 7: a forget that left compaction pending is retried once here; failure keeps it pending. */
+  /**
+   * §8 step 7: a forget that left compaction pending is retried once here, as forget runs it:
+   * compact, then delete every other cache generation. It is `done` only when compaction
+   * finished and no other generation is left (one still held elsewhere keeps the forgotten
+   * bytes); any failure keeps it pending for the next open.
+   */
   static #retryCompaction(cache: Cache): void {
     try {
-      if (cache.getMeta('compaction') === 'pending') cache.compact();
+      if (cache.getMeta('compaction') !== 'pending') return;
     } catch {
-      // still pending: meta keeps saying so, and the next open tries again
+      return;
+    }
+    let done = false;
+    try {
+      // compact() writes `done` or `pending` itself; `done` is withdrawn below unless the sweep empties.
+      done = cache.compact() === 'done';
+      cache.sweepOld(0);
+      if (cache.otherGenerations().length > 0) done = false;
+    } catch {
+      done = false;
+    }
+    if (done) return;
+    try {
+      cache.setMeta('compaction', 'pending');
+    } catch {
+      // meta says pending unless compact() finished; the next open checks again either way
     }
   }
 
@@ -169,13 +180,12 @@ export class Elmory implements Context {
   async sync(opts: { full?: boolean } = {}): Promise<string[]> {
     this.#addedBy = null;
     if (opts.full !== true && !gate.syncNeeded(this.store, this.cache)) return [];
-    try {
-      this.cache.withWriteLock(() => gate.syncIfChanged(this.store, this.cache, opts.full === true));
-    } catch (e) {
-      if (e instanceof CacheBusyError) return [INDEX_BUSY];
-      throw e;
-    }
-    return [];
+    // tryWithWriteLock never waits: a held lock is null at once, not the 5 s busy timeout.
+    const ran = this.cache.tryWithWriteLock(() => {
+      gate.syncIfChanged(this.store, this.cache, opts.full === true);
+      return true;
+    });
+    return ran === null ? [INDEX_BUSY] : [];
   }
 
   /**
@@ -274,15 +284,20 @@ export class Elmory implements Context {
 
   /**
    * Move pending records into this worktree's `.elmory/facts` (all pending when `ids` is
-   * omitted). Only pending moves: naming a local record is refused (`RefusedError('local')`, V25).
+   * omitted). Only pending moves: naming a local record is refused (`RefusedError('local')`,
+   * V25), and naming any other id not in pending is refused (`RefusedError('unknown-id')`).
+   * Every id is checked before anything moves.
    */
   publish(ids?: string[]): string[] {
     this.#addedBy = null;
     return this.cache.withWriteLock(() => {
+      const pending = new Set(this.store.ids('pending'));
       for (const id of ids ?? []) {
+        if (pending.has(id)) continue;
         if (this.store.readRecord(id)?.area === 'local') {
           throw new gate.RefusedError(`${id} is local and is never published`, 'local');
         }
+        throw new gate.RefusedError(`no pending record ${id} to publish`, 'unknown-id');
       }
       const moved = this.store.publish(ids);
       gate.syncIfChanged(this.store, this.cache);

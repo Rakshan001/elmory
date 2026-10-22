@@ -518,7 +518,8 @@ export class ConflictError extends Error {
 
 /**
  * reasons: 'shape' | 'quote:<QuoteRefusal>' | 'secret' | 'forgotten' | 'untracked' | 'too-large' |
- * 'key' (a key spelled like a record id) | 'unknown-id' (supersedes an id not present here) |
+ * 'key' (a key spelled like a record id) | 'unknown-id' (supersedes an id not present here, or
+ * publish of an id not in pending) |
  * 'local-ref' (a shareable record citing or superseding a local one, L7) | 'local' (publish of a
  * local record) | 'include' (a state recall never serves)
  */

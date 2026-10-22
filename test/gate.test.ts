@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { DatabaseSync } from 'node:sqlite';
 import { afterEach, describe, expect, it } from 'vitest';
 import { Elmory, type ElmoryEvent } from '../src/api.js';
 import { type Deriver, FORGET_UNTRUSTED } from '../src/derive.js';
@@ -119,6 +120,15 @@ function settle(e: Elmory, files = false): void {
   for (const dir of [l.facts, l.pending, l.local]) {
     if (!fs.existsSync(dir)) continue;
     for (const n of fs.readdirSync(dir)) if (n.endsWith('.md')) fs.utimesSync(path.join(dir, n), past, past);
+  }
+}
+
+function thrown(fn: () => unknown): unknown {
+  try {
+    fn();
+    return null;
+  } catch (x) {
+    return x;
   }
 }
 
@@ -631,6 +641,65 @@ describe('Elmory api fixes', () => {
     expect(e.layout.facts).toBe(path.join(fs.realpathSync(wt), '.elmory', 'facts'));
     expect((await e.remember(fact('From a subdirectory'))).state).toBe('active');
     await expect(Elmory.open({ worktree: path.join(wt, '.git'), cacheDir: tmp() })).rejects.toThrow(/work tree/);
+  });
+
+  it('publish refuses an id that is not pending: unknown-id, and nothing moves (M8)', async () => {
+    const { e } = await setup();
+    const a = await e.note({ title: 'Pending one', text: 'a' });
+    const missing = `f_${'a'.repeat(26)}`;
+    expect(thrown(() => e.publish([a.id, missing]))).toMatchObject({ name: 'RefusedError', reason: 'unknown-id' });
+    expect(thrown(() => e.publish(['not-an-id']))).toMatchObject({ name: 'RefusedError', reason: 'unknown-id' });
+    expect(e.store.readRecord(a.id)?.area).toBe('pending');
+    expect(e.publish([a.id])).toEqual([a.id]);
+    // published: no longer pending
+    expect(thrown(() => e.publish([a.id]))).toMatchObject({ name: 'RefusedError', reason: 'unknown-id' });
+    expect(e.publish([])).toEqual([]);
+  });
+
+  it('open resolves the worktree with resolveWorktree: a symlinked subdirectory is its toplevel; a bare repo throws (I1)', async () => {
+    const wt = await repo();
+    const link = path.join(tmp(), 'link');
+    fs.symlinkSync(path.join(wt, 'src'), link);
+    const e = await open(link);
+    expect(e.layout.worktree).toBe(fs.realpathSync(wt));
+    const bare = path.join(tmp(), 'bare.git');
+    await git(path.dirname(bare), 'init', '-q', '--bare', bare);
+    await expect(Elmory.open({ worktree: bare, cacheDir: tmp() })).rejects.toThrow(/work tree/);
+  });
+
+  it('a pending compaction is retried on open: compact, sweep other generations, done when none is left (N2)', async () => {
+    const { wt, cacheDir, e } = await setup();
+    await e.note({ title: 'Something', text: 'to compact' });
+    await e.rebuild(); // the old generation stays on disk until swept
+    expect(e.cache.otherGenerations().length).toBeGreaterThan(0);
+    e.cache.setMeta('compaction', 'pending');
+    e.close();
+    const again = await open(wt, cacheDir);
+    expect(again.cache.otherGenerations()).toEqual([]);
+    expect(again.cache.getMeta('compaction')).toBe('done');
+  });
+
+  it('a compaction retry that cannot sweep stays pending (N2)', async () => {
+    const { wt, cacheDir, e } = await setup();
+    await e.note({ title: 'Something', text: 'to compact' });
+    await e.rebuild();
+    e.cache.setMeta('compaction', 'pending');
+    e.close();
+    // Another process holds the write lock: compact() finishes, the sweep cannot run.
+    const holder = new DatabaseSync(path.join(cacheDir, 'lock.db'));
+    holder.exec('BEGIN IMMEDIATE');
+    const saved = process.env.ELMORY_TEST_BUSY_MS;
+    process.env.ELMORY_TEST_BUSY_MS = '50';
+    try {
+      const again = await open(wt, cacheDir);
+      expect(again.cache.otherGenerations().length).toBeGreaterThan(0);
+      expect(again.cache.getMeta('compaction')).toBe('pending');
+    } finally {
+      if (saved === undefined) delete process.env.ELMORY_TEST_BUSY_MS;
+      else process.env.ELMORY_TEST_BUSY_MS = saved;
+      holder.exec('ROLLBACK');
+      holder.close();
+    }
   });
 
   it('publish never moves a local record and refuses one by id (I2, V25)', async () => {

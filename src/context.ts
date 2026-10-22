@@ -18,7 +18,8 @@ export interface Context {
   /**
    * Incremental load: a no-op without the lock when nothing changed; otherwise index new files
    * with indexRecord and delete rows whose file is gone, under the write lock. Never throws
-   * CacheBusyError: when the lock is busy it returns a warning and the cache stays as it was.
+   * CacheBusyError and never waits for the lock: when it is held it returns a warning at once
+   * and the cache stays as it was.
    * `full` re-reads every record file even when nothing seems to have changed.
    */
   sync(opts?: { full?: boolean }): Promise<string[]>;
