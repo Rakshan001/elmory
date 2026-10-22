@@ -8,3 +8,4 @@ export { DEFAULT_BUDGET_TOKENS, estimateTokens } from './recall.js';
 export type { Derived, State, TrustSource } from './derive.js';
 export { UNREACHABLE, previewForget } from './forget.js';
 export type { ForgetPreview, ForgetPreviewScope } from './forget.js';
+export { resolveWorktree } from './worktree.js';
