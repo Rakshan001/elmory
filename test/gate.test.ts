@@ -505,7 +505,8 @@ describe('Elmory wiring', () => {
     await e.recall({ query: 'checkToken' });
     await e.recall({ query: 'checkToken' });
     expect(logs).toBe(2);
-    expect(lookups).toBe(1); // one batched lookup for the one commit that is credited
+    // Signatures are never reused: one batched lookup of the credited commit per fetch.
+    expect(lookups).toBe(2);
     expect((await e.verify()).states.active).toBe(2);
     expect(logs).toBe(3);
 
@@ -807,6 +808,52 @@ describe('signed tombstones (N0)', () => {
     const d = await (await e.deriver()).state(gone.id);
     expect(d).toMatchObject({ state: 'candidate', reason: FORGET_UNTRUSTED });
     expect(await stateOf(e, keep.id)).toBe('active');
+  }, 30000);
+});
+
+describe('signature cache (C2)', () => {
+  it.skipIf(!hasSshKeygen())('a key removed from the allowed signers stops counting with HEAD unchanged; the cache never sets a signer', async () => {
+    const wt = await repo();
+    const keys = tmp();
+    const key = path.join(keys, 'k');
+    execFileSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-C', 'tester', '-f', key]);
+    const [keyType, keyBody] = fs.readFileSync(`${key}.pub`, 'utf8').trim().split(' ');
+    const allowed = path.join(keys, 'allowed');
+    fs.writeFileSync(allowed, `tester@example.com namespaces="git" ${keyType} ${keyBody}\n`);
+    await git(wt, 'config', 'gpg.format', 'ssh');
+    await git(wt, 'config', 'user.signingkey', `${key}.pub`);
+    let walks = 0;
+    const exec: Exec = (file, args, opts) => {
+      if (args.includes('--full-history')) walks++;
+      return defaultExec(file, ['-c', `gpg.ssh.allowedSignersFile=${allowed}`, ...args], opts);
+    };
+    const cacheDir = tmp();
+    const e = await Elmory.open({ worktree: wt, cacheDir, now: () => NOW, observer: 'agent:test', exec });
+    opened.push(e);
+    const n = await e.note({ title: 'Signed note', text: 'Committed with a signature.' });
+    e.publish([n.id]);
+    await git(wt, 'add', '-A');
+    await git(wt, 'commit', '-q', '--no-verify', '-S', '-m', 'publish');
+    const file = `.elmory/facts/${n.id}.md`;
+    const signer = (await e.fetchAddedBy()).get(file)?.signer;
+    expect(signer).toMatch(/^SHA256:/);
+    e.store.appendTrust(`signer ${signer as string}`);
+    expect(walks).toBe(2); // the write's fetch (before the commit) and this one
+
+    // Revoke the key: same HEAD, same walk, but the signature no longer counts.
+    fs.writeFileSync(allowed, '');
+    expect((await e.fetchAddedBy()).get(file)).toMatchObject({ signer: null });
+    // A new process on the same HEAD reuses the stored walk, never a stored signer.
+    const again = await Elmory.open({ worktree: wt, cacheDir, now: () => NOW, observer: 'agent:test', exec });
+    opened.push(again);
+    expect((await again.fetchAddedBy()).get(file)).toMatchObject({ signer: null });
+    expect(walks).toBe(2);
+    expect(again.cache.getMeta(`addedby:${e.layout.worktree}`)).not.toContain('SHA256');
+
+    // Restore it: counts again, still without a new walk.
+    fs.writeFileSync(allowed, `tester@example.com namespaces="git" ${keyType} ${keyBody}\n`);
+    expect((await again.fetchAddedBy()).get(file)?.signer).toBe(signer);
+    expect(walks).toBe(2);
   }, 30000);
 });
 

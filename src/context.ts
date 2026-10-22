@@ -32,8 +32,8 @@ export interface Context {
   deriver(rows?: readonly RecordRow[]): Promise<Deriver>;
   /**
    * git.addedBy('.elmory') for HEAD now (the history walk is reused while HEAD and its
-   * `.elmory` tree are unchanged), minus paths whose working-tree bytes differ from HEAD, which
-   * is checked on every call; an empty map without git.
+   * `.elmory` tree are unchanged; signatures are checked on every call), minus paths whose
+   * working-tree bytes differ from HEAD, also checked on every call; an empty map without git.
    */
   fetchAddedBy(): Promise<Map<string, AddedBy>>;
   /**

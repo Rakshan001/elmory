@@ -15,6 +15,16 @@ export interface AddedBy {
   signer: string | null;
 }
 
+/**
+ * The history walk's answer for one path (see `Git.credited`): the credited commit, and whether
+ * its signature may count (`verify`: the header was well formed and the replay check kept it).
+ * It holds no signature: whether a key is good is asked of git each time (`Git.signed`).
+ */
+export interface Credit {
+  commit: string;
+  verify: boolean;
+}
+
 /** Commits per signature lookup: keeps the argument list far below any ARG_MAX. */
 const SIGNATURE_BATCH = 500;
 const RS = '\x1e';
@@ -163,6 +173,10 @@ export class Git {
    * which commit each path is credited to and which credits survive the replay check; only those
    * commits are then verified, in one `git log --no-walk` (see `signers`).
    *
+   * `credited` is the walk (it depends on HEAD's history only, so a caller may reuse it while
+   * HEAD stays put); `signed` adds the signatures. Never reuse a signer: a key removed from the
+   * keyring or the allowed signers file must stop counting at once.
+   *
    * Three git calls at most: one `ls-tree` for HEAD's blobs, one `log` for the walk, and one
    * `log --no-walk` for the signatures (none when no credit survives). Output is NUL-separated,
    * so paths are taken verbatim and are only ever read from the slot after a change line;
@@ -175,7 +189,12 @@ export class Git {
    * unattributed.
    */
   async addedBy(relDir: string): Promise<Map<string, AddedBy>> {
-    const result = new Map<string, AddedBy>();
+    return this.signed(await this.credited(relDir));
+  }
+
+  /** The walk half of `addedBy`: per path, the credited commit and whether its signature may count. */
+  async credited(relDir: string): Promise<Map<string, Credit>> {
+    const result = new Map<string, Credit>();
     // HEAD's blobs first: if HEAD moves before the log runs, the log only gains commits, and a
     // record still counts only when it produced the exact bytes read here.
     const headBlobs = await this.headBlobs(relDir);
@@ -256,28 +275,31 @@ export class Git {
         mergeSeen.set(key, seen);
         if (seen < parentCount) continue;
       }
-      result.set(file, { commit, signer: null });
+      result.set(file, { commit, verify: false });
       if (wellFormed) eligible.add(file);
     }
 
-    // Replay check first; only the credits that survive it are worth a signature check.
-    const toVerify = new Map<string, string[]>();
+    // Replay check: only the credits that survive it are worth a signature check.
     for (const [file, entry] of result) {
       if (!eligible.has(file)) continue;
       const touches = newer.get(file);
       if (touches !== undefined && (!ancestryComplete || descendsFrom(parentsOf, touches, entry.commit))) continue;
-      const files = toVerify.get(entry.commit) ?? [];
-      files.push(file);
-      toVerify.set(entry.commit, files);
-    }
-    if (toVerify.size === 0) return result;
-    const signers = await this.signers([...toVerify.keys()]);
-    for (const [c, files] of toVerify) {
-      const signer = signers.get(c);
-      if (signer === undefined) continue;
-      for (const file of files) (result.get(file) as AddedBy).signer = signer;
+      entry.verify = true;
     }
     return result;
+  }
+
+  /**
+   * The signature half of `addedBy`: every credit with its signer, asked of git now for the
+   * commits whose `verify` is set (one batched `signers` lookup; none when no credit may count).
+   */
+  async signed(credits: ReadonlyMap<string, Credit>): Promise<Map<string, AddedBy>> {
+    const commits = new Set<string>();
+    for (const c of credits.values()) if (c.verify) commits.add(c.commit);
+    const signers = commits.size === 0 ? new Map<string, string>() : await this.signers([...commits]);
+    const out = new Map<string, AddedBy>();
+    for (const [file, c] of credits) out.set(file, { commit: c.commit, signer: c.verify ? (signers.get(c.commit) ?? null) : null });
+    return out;
   }
 
   /**
@@ -329,10 +351,11 @@ export class Git {
   }
 
   /**
-   * Blob id of every file under `relDir` in HEAD's tree (submodules are not files). Null for an
-   * unborn HEAD, which has no history to report; any other failure is an error.
+   * Blob id of every file under `relDir` in HEAD's tree (submodules are not files), keyed by its
+   * repo-relative path. Null for an unborn HEAD, which has no history to report; any other
+   * failure is an error.
    */
-  private async headBlobs(relDir: string): Promise<Map<string, string> | null> {
+  async headBlobs(relDir: string): Promise<Map<string, string> | null> {
     const res = await this.run(['ls-tree', '-r', '-z', '--full-name', 'HEAD', '--', literal(relDir)]);
     if (res.code !== 0) {
       if ((await this.head()) === null) return null;

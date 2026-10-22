@@ -9,7 +9,7 @@ import { Evidence } from './evidence.js';
 import { type Exec, defaultExec, gitCommonDir } from './exec.js';
 import * as gate from './gate.js';
 import { type ForgetReport, type ForgetScope, forget } from './forget.js';
-import { type AddedBy, Git } from './git.js';
+import { type AddedBy, type Credit, Git } from './git.js';
 import * as flows from './recall.js';
 import { RecordError, isRecordId } from './record.js';
 import { type Layout, Store, resolveLayout } from './store.js';
@@ -45,65 +45,70 @@ const DEFAULT_OBSERVER = 'agent:unknown';
 /** The warning a read carries when the index could not be brought up to date (§9). */
 export const INDEX_BUSY = 'index busy; results may be behind';
 
-/** Cache meta key prefix: git's addedBy('.elmory') for one worktree, with the HEAD and tree it is for. */
+/** Cache meta key prefix: the history walk (`Git.credited('.elmory')`) of one worktree, with its HEAD and tree. */
 const ADDED_BY_META = 'addedby:';
 
-interface AddedByEntry {
+interface WalkEntry {
   head: string;
   tree: string;
-  map: Map<string, AddedBy>;
+  credits: Map<string, Credit>;
 }
 
 /**
- * git's addedBy('.elmory') per worktree, reused while HEAD and HEAD's `.elmory` tree are the
- * ones it was computed at (it is a function of HEAD's history alone). Kept in memory and in the
- * cache meta, so a new process with the same HEAD skips the history walk too; each lookup costs
- * one `rev-parse`. A result is stored only when HEAD did not move during the walk. `fresh`
- * recomputes it whatever the key says (verify: a signing key added to gpg or to the allowed
- * signers file since the walk is picked up there, or when HEAD moves).
+ * git's addedBy('.elmory') per worktree. The history walk (which commit each path is credited
+ * to) is a function of HEAD's history alone, so it is reused while HEAD and HEAD's `.elmory`
+ * tree are the ones it was computed at: kept in memory and in the cache meta, so a new process
+ * with the same HEAD skips it too. A walk is stored only when HEAD did not move during it.
+ * Signatures are never reused: every fetch asks git again for the credited commits (one batched
+ * `git log --no-walk`), so a key removed from the keyring or the allowed signers file stops
+ * counting at once, and nothing read back from the cache can set a signer. `fresh` walks again
+ * whatever the key says (verify).
  */
 class CommittedAddedBy {
-  readonly #memo = new Map<string, AddedByEntry>();
+  readonly #memo = new Map<string, WalkEntry>();
 
   constructor(private readonly cache: Cache) {}
 
   async get(git: Git, worktree: string, fresh: boolean): Promise<Map<string, AddedBy>> {
+    return git.signed(await this.#credits(git, worktree, fresh));
+  }
+
+  async #credits(git: Git, worktree: string, fresh: boolean): Promise<Map<string, Credit>> {
     const key = await git.headKey('.elmory');
-    if (key === null) return git.addedBy('.elmory');
+    if (key === null) return git.credited('.elmory');
     if (!fresh) {
       const hit = this.#memo.get(worktree) ?? this.#fromMeta(worktree);
       if (hit !== null && hit.head === key.head && hit.tree === key.tree) {
         this.#memo.set(worktree, hit);
-        return new Map(hit.map);
+        return hit.credits;
       }
     }
-    const map = await git.addedBy('.elmory');
+    const credits = await git.credited('.elmory');
     const after = await git.headKey('.elmory');
     if (after !== null && after.head === key.head && after.tree === key.tree) {
-      const entry = { ...key, map };
-      this.#memo.set(worktree, entry);
+      this.#memo.set(worktree, { ...key, credits });
       try {
-        this.cache.setMeta(`${ADDED_BY_META}${worktree}`, JSON.stringify({ head: key.head, tree: key.tree, entries: [...map].map(([p, a]) => [p, a.commit, a.signer]) }));
+        const entries = [...credits].map(([p, c]) => [p, c.commit, c.verify]);
+        this.cache.setMeta(`${ADDED_BY_META}${worktree}`, JSON.stringify({ head: key.head, tree: key.tree, entries }));
       } catch {
         // a busy or read-only cache only costs the next process one walk
       }
     }
-    return new Map(map);
+    return credits;
   }
 
-  #fromMeta(worktree: string): AddedByEntry | null {
+  #fromMeta(worktree: string): WalkEntry | null {
     try {
       const raw = this.cache.getMeta(`${ADDED_BY_META}${worktree}`);
       if (raw === null) return null;
       const v = JSON.parse(raw) as { head?: unknown; tree?: unknown; entries?: unknown };
       if (typeof v.head !== 'string' || typeof v.tree !== 'string' || !Array.isArray(v.entries)) return null;
-      const map = new Map<string, AddedBy>();
+      const credits = new Map<string, Credit>();
       for (const e of v.entries as unknown[]) {
-        if (!Array.isArray(e) || typeof e[0] !== 'string' || typeof e[1] !== 'string') return null;
-        if (e[2] !== null && typeof e[2] !== 'string') return null;
-        map.set(e[0], { commit: e[1], signer: e[2] as string | null });
+        if (!Array.isArray(e) || typeof e[0] !== 'string' || typeof e[1] !== 'string' || typeof e[2] !== 'boolean') return null;
+        credits.set(e[0], { commit: e[1], verify: e[2] });
       }
-      return { head: v.head, tree: v.tree, map };
+      return { head: v.head, tree: v.tree, credits };
     } catch {
       return null; // a torn or foreign value: walk again
     }
@@ -165,7 +170,7 @@ export class Elmory implements Context {
   readonly #exec: Exec;
   /** signedAddedBy for this worktree, shared by deriver() calls until the next sync() or write. */
   #addedBy: Promise<Map<string, AddedBy>> | null = null;
-  /** git's addedBy per (worktree, HEAD, `.elmory` tree): the history walk runs once per HEAD. */
+  /** git's addedBy per worktree: the history walk runs once per (HEAD, `.elmory` tree); signatures every fetch. */
   readonly #committed: CommittedAddedBy;
   /** Set by a full sync (verify): the next fetch walks the history again whatever HEAD is. */
   #freshWalk = false;
@@ -269,7 +274,8 @@ export class Elmory implements Context {
   /**
    * A new Deriver (and a fresh evidence memo) per request over `rows` (default: the cache now);
    * call `sync()` first. fetchAddedBy is memoised per instance until `sync()` or a write; under
-   * it, the history walk is reused while HEAD and its `.elmory` tree stay the same.
+   * it, the history walk is reused while HEAD and its `.elmory` tree stay the same (signatures
+   * are checked again on every fetch).
    */
   async deriver(rows?: readonly RecordRow[]): Promise<Deriver> {
     const addedBy = await this.#memoAddedBy();
