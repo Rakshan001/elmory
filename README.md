@@ -14,7 +14,8 @@ small immutable Markdown records.
   could not reach.
 
 Release 1 covers coding agents only. The core is TypeScript on Node ≥ 24 with no runtime
-dependencies (`node:sqlite`, `node:crypto`); the MCP server adds the MCP SDK.
+dependencies (`node:sqlite`, `node:crypto`); the MCP server adds the MCP SDK. It needs git ≥ 2.31
+(signature attribution uses `git log --diff-merges=separate`).
 
 **Status:** release 1 core complete, unpublished. It is not on npm yet; until it is, install
 from source (below).
@@ -131,20 +132,27 @@ unchanged.
 | `elmory forget <id…> \| --query <q> [--confirm] \| --all [--confirm]` | delete, cascade to citing records (archived ones too), report what could not be reached |
 | `elmory publish [id…]` | move pending records into `.elmory/facts/` to commit with the work |
 | `elmory review` | list records not yet trusted here, with the reason |
-| `elmory approve <id>` / `elmory reject <id>` | trust a record / hide it here |
+| `elmory approve <id>` / `elmory reject <id>` | trust a record / hide it here. For a record withheld by an unsigned forget (`forget requested by an untrusted commit`), approve refuses that forget and reject accepts it; a trusted forget (local, or signed by a trusted key) cannot be approved away (refused, exit `2`) |
 | `elmory gc [--dry-run] [--restore id]` | archive old superseded/stale records and unused notes |
 | `elmory rebuild` | rebuild the cache from the record files |
 | `elmory help` | list every verb (`--json` for a machine-readable list) |
+| `elmory --version` | the installed version |
 
 Exit codes: `0` ok, `1` error, `2` refused, `3` conflict, `4` abstain. A `forget` whose ids all
-never existed here exits `1` (nothing was written).
+never existed here exits `1` (nothing was written). Outside a git repository, in a directory
+with no `.elmory`, the read-only verbs (`recall`, `about`, `history`, `verify`, `review`) answer
+"no Elmory store here" and create nothing (`recall` and `about` exit `4`); a write creates the
+store there.
 
 `forget --query` matches every record containing **any** of the words (they are OR-joined, as in
 `recall`), in every state (candidates included, so they appear in the preview), plus archived
 record files whose text matches, plus every record citing a match. So `forget --query` and
 `forget --all` without `--confirm` only list the matches and the cascade, then exit `2`; check
 the list, then run the same command with `--confirm`. Ids that never existed are reported as
-`unknown` and nothing is written for them.
+`unknown` and nothing is written for them. An id whose file is in another worktree's
+`.elmory/facts` (or only in HEAD) is forgotten too: both tombstones are written, its cache row is
+deleted, every worktree stops serving it at its next sync, and a `note:` line says its file stays
+there until it is deleted in that worktree.
 
 ## Storage layout
 
@@ -157,7 +165,8 @@ the list, then run the same command with `--confirm`. Ids that never existed are
   local/<id>.md                           private; never published
   trust                                   ledger, approvals, trusted signers (append-only)
   tombstones/<id>                         local forgets, effective at once in every worktree
-  archive/<id>.md                         gc'd, recoverable
+  archive/<id>.md                         gc'd pending records, recoverable
+  archive/local/<id>.md                   gc'd local records, restored as local
 ~/Library/Caches/elmory/<project-id>/     $XDG_CACHE_HOME/elmory/… when set; ~/.cache/elmory/… off macOS
   lock.db  cache-<n>.db
 ```
@@ -195,6 +204,26 @@ the list, then run the same command with `--confirm`. Ids that never existed are
   values keep separate caches; a forget drops the text from another cache only when a process
   using it next syncs, and does not compact it.
 - **Notes are not code-checked.** They are labelled so, ranked lower, and collected by `gc`.
+- **Switching worktrees re-reads record files.** The cache is shared by every worktree of a clone
+  and remembers one sync stamp, so the first read after another worktree synced re-reads this
+  worktree's record files (about 0.15 s at 5 000 records) instead of trusting the stamp.
+
+## Differences from the spec
+
+Release 1 differs from [the spec](docs/specs/2026-10-21-elmory-memory-design.md) here:
+
+- **No `resolve` verb (§6.3).** Resolve a conflict with `remember` or `note` passing every head
+  in `--supersedes a,b`; the write gate's compare-and-set is the same.
+- **The short-quote rule is "one line", not "one whole line" (§4.3).** A quote under 16 tokens
+  must sit on one line with at least 3 word tokens and 24 non-space characters, and may be part
+  of that line; longer quotes may span lines. Either way it must be unique in the file.
+- **Superseded records are filtered after derivation, not in the search (§7.2).** Whether a
+  record is superseded depends on whether its successor holds in this worktree, so the search
+  is not pre-filtered; recall pages through the ranked hits instead.
+- **A tombstoned record file that comes back is indexed without its text (§4.6)** rather than
+  deleted again, so forgotten bytes never re-enter the cache and the record stays forgotten.
+- **No approve tool over MCP.** Approval is a human act, so `approve` and `reject` are CLI-only,
+  and `elmory_review` results carry a note that their titles are untrusted data.
 
 ## Docs
 

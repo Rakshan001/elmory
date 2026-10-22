@@ -1,7 +1,6 @@
 # Elmory — evidence-checked memory for coding agents (architecture v3.1)
 
-- **Status:** draft for owner review. Not approved, not built. No code until the owner approves
-  this spec, then a written implementation plan.
+- **Status:** release 1 built (2026-10-23); see README › Differences from the spec
 - **Date:** 2026-10-21
 - **Replaces:** [v2, five-type design](history/2026-10-21-five-type-memory-system-design.md). v2 stays as
   history.
