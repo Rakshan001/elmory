@@ -64,7 +64,7 @@ export class Deriver {
   private readonly forgetUntrusted = new Set<string>();
   /** Chain nodes: every record and every trusted tombstone id. */
   private readonly nodes = new Set<string>();
-  /** Undirected supersedes edges between nodes. */
+  /** Undirected supersedes edges between nodes, from effective superseders and trusted tombstones only. */
   private readonly adj = new Map<string, Set<string>>();
   /** target → records (any trust) whose `supersedes` names it */
   private readonly recordSupersededBy = new Map<string, string[]>();
@@ -91,10 +91,13 @@ export class Deriver {
     for (const id of this.forgotten) this.nodes.add(id);
 
     for (const row of input.records.values()) {
+      // Only an effective superseder (trusted, non-candidate) joins chains: an untrusted record
+      // naming two unrelated heads must not merge them into one chain and make both conflict.
+      const effective = this.staticCandidate(row.id) === null;
       for (const target of new Set(row.supersedes)) {
         if (!this.nodes.has(target)) continue; // unknown id: the edge is absent
-        push(this.recordSupersededBy, target, row.id);
-        this.link(row.id, target);
+        push(this.recordSupersededBy, target, row.id); // every record: the unreviewed label needs it
+        if (effective) this.link(row.id, target);
       }
     }
     for (const t of input.tombstones) {
@@ -129,7 +132,10 @@ export class Deriver {
     return !!signer && this.input.trust.signers.has(signer);
   }
 
-  /** Ids of the connected component over supersedes edges (records and tombstone nodes), sorted. */
+  /**
+   * Ids of the connected component over the supersedes edges of trusted, non-candidate records
+   * and trusted tombstones (tombstone nodes included), sorted.
+   */
   chainOf(idOrKey: string): string[] {
     const starts = this.nodes.has(idOrKey)
       ? [idOrKey]

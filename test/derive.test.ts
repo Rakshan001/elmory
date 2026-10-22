@@ -149,6 +149,21 @@ describe('derive', () => {
     expect(x.labels).toContain(UNREVIEWED);
   });
 
+  it('an untrusted record superseding two unrelated heads does not merge their chains', async () => {
+    const { d } = setup([rec('X', { key: 'x' }), rec('Y', { key: 'y' }), rec('U', { area: 'facts', supersedes: ['X', 'Y'] })], {
+      untrusted: ['U'],
+    });
+    expect(d.chainOf('X')).toEqual(['X']);
+    expect(d.chainOf('Y')).toEqual(['Y']);
+    expect(d.chainOf('U')).toEqual(['U']);
+    for (const id of ['X', 'Y']) {
+      const s = await d.state(id);
+      expect(s).toMatchObject({ state: 'active', head: true });
+      expect(s.labels).toContain(UNREVIEWED);
+    }
+    expect((await d.state('U')).state).toBe('candidate');
+  });
+
   it('forget B in A←B←C: C head, A superseded, B forgotten', async () => {
     const { d } = setup(
       [rec('A'), rec('B', { supersedes: ['A'] }), rec('C', { supersedes: ['B'] })],
