@@ -3,9 +3,12 @@
 // handler. Exit codes: 0 ok, 1 other error, 2 refused, 3 conflict, 4 abstain. Errors go to stderr
 // as one line; `--json` prints the result (or the error) as JSON on stdout.
 
+import fs from 'node:fs';
 import os from 'node:os';
+import path from 'node:path';
 import { type ParseArgsConfig, parseArgs } from 'node:util';
 import { ConflictError, Elmory, RefusedError } from './api.js';
+import { defaultExec, gitCommonDir } from './exec.js';
 import type { Abstain, RecallResult, Served } from './api.js';
 import type { State } from './derive.js';
 import { type ForgetPreviewScope, type ForgetScope, previewForget } from './forget.js';
@@ -53,6 +56,18 @@ interface Verb {
   summary: string;
   options: Options;
   run(e: Elmory, a: Args): Promise<Outcome>;
+  /**
+   * Read-only verbs only: the answer outside git where no `.elmory` exists, given without opening
+   * (and so without creating) a store (M3).
+   */
+  noStore?: (a: Args) => Outcome;
+}
+
+const NO_STORE = 'no Elmory store here';
+
+/** recall and about outside any store: an abstain, exit 4. */
+function noStoreAbstain(): Outcome {
+  return { data: { abstain: true, reason: NO_STORE, hints: [], warnings: [] }, text: `I don't know: ${NO_STORE}`, code: EXIT_ABSTAIN };
 }
 
 interface Args {
@@ -242,6 +257,7 @@ const VERBS: Record<string, Verb> = {
       }
       return served(await e.recall(opts));
     },
+    noStore: noStoreAbstain,
   },
   about: {
     usage: 'about <path|key>',
@@ -250,6 +266,7 @@ const VERBS: Record<string, Verb> = {
     async run(e, a) {
       return served(await e.about(one(a, 'path or key')));
     },
+    noStore: noStoreAbstain,
   },
   history: {
     usage: 'history <id|key>',
@@ -265,6 +282,7 @@ const VERBS: Record<string, Verb> = {
       );
       return { data: h, text: lines(rows, `no history for ${inline(target)}`), warnings: h.warnings };
     },
+    noStore: () => ({ data: { entries: [], warnings: [NO_STORE] }, text: NO_STORE }),
   },
   verify: {
     usage: 'verify [--files a,b]',
@@ -281,6 +299,10 @@ const VERBS: Record<string, Verb> = {
       const changed = r.changed.map((c) => `${c.id} ${c.from ?? 'new'} → ${c.to}`);
       return { data: r, text: [...changed, counts === '' ? 'no records' : counts].join('\n'), warnings: r.warnings };
     },
+    noStore: () => ({
+      data: { changed: [], states: Object.fromEntries(Object.keys(STATES).map((s) => [s, 0])), warnings: [NO_STORE] },
+      text: NO_STORE,
+    }),
   },
   forget: {
     usage: 'forget <id…> | --query <q> [--confirm] | --all [--confirm]',
@@ -331,6 +353,7 @@ const VERBS: Record<string, Verb> = {
       const r = await e.review();
       return { data: r, text: lines(r.map((c) => `${c.id} ${inline(c.reason)} ${inline(c.title)}`), 'nothing to review') };
     },
+    noStore: () => ({ data: [], text: NO_STORE }),
   },
   approve: {
     usage: 'approve <id>',
@@ -411,6 +434,7 @@ function helpText(): string {
     'elmory: evidence-checked memory for coding agents',
     '',
     'usage: elmory [--json] [--worktree <path>] [--observer <s>] <verb> [args]',
+    '       elmory --version',
     '       (--worktree: the git toplevel of that path, default the current directory)',
     '',
     ...Object.entries(VERBS).map(([name, v]) => `  ${name.padEnd(width)}  ${v.summary}\n  ${' '.repeat(width)}  elmory ${v.usage}`),
@@ -419,6 +443,22 @@ function helpText(): string {
     'forget --query matches records containing ANY of its words (OR); run it without --confirm first to see them.',
     'exit codes: 0 ok, 1 error, 2 refused, 3 conflict, 4 abstain (I don\'t know)',
   ].join('\n');
+}
+
+/** The package version, from the package.json next to dist/. */
+function version(): string {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version?: unknown };
+    return typeof pkg.version === 'string' ? pkg.version : 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
+/** Outside any git repository, with no `.elmory` in the directory: opening would create a store. */
+async function noStoreAt(worktree: string): Promise<boolean> {
+  if (fs.existsSync(path.join(worktree, '.elmory'))) return false;
+  return (await gitCommonDir(defaultExec, worktree)) === null;
 }
 
 function helpJson(): unknown {
@@ -481,6 +521,10 @@ function checkObserver(observer: string): string {
 async function main(argv: string[]): Promise<number> {
   const { name, rest } = splitVerb(argv);
   let json = rest.includes('--json');
+  if (name === '--version' || name === '-V') {
+    process.stdout.write(`${json ? JSON.stringify({ version: version() }) : `elmory ${version()}`}\n`);
+    return EXIT_OK;
+  }
   if (name === undefined || name === 'help' || name === '--help' || name === '-h') {
     process.stdout.write(`${json ? JSON.stringify(helpJson()) : helpText()}\n`);
     return EXIT_OK;
@@ -506,8 +550,10 @@ async function main(argv: string[]): Promise<number> {
   try {
     const observer = checkObserver(str(args, 'observer') ?? defaultObserver());
     const worktree = await resolveWorktree(str(args, 'worktree') ?? process.cwd());
-    e = await Elmory.open({ worktree, observer });
-    const out = await verb.run(e, args);
+    const out =
+      verb.noStore !== undefined && (await noStoreAt(worktree))
+        ? verb.noStore(args)
+        : await verb.run((e = await Elmory.open({ worktree, observer })), args);
     process.stdout.write(`${json ? JSON.stringify(out.data) : multiline(out.text)}\n`);
     if (!json) for (const w of out.warnings ?? []) process.stderr.write(`elmory ${name}: warning: ${inline(w)}\n`);
     if (out.stderr !== undefined) process.stderr.write(`elmory ${name}: ${out.stderr}\n`);
