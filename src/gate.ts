@@ -28,7 +28,7 @@ import type { Layout, StoredRecord, Store, Tombstone, Trust } from './store.js';
 // index-time checks (§4.4)
 
 const INJECTION: readonly RegExp[] = [
-  /(ignore|disregard|forget) (all |any |the )?(previous|prior|above) (instructions|messages|rules)/i,
+  /(ignore|disregard|forget) (all |any |the )?(previous|prior|above|earlier|preceding) (instructions|messages|rules)/i,
   /always run/i,
   /(curl|wget)\b[^\n]*(\||&&|;)\s*(sudo )?(sh|bash|zsh)\b/i,
 ];
@@ -106,9 +106,27 @@ function recordStrings(r: ElmoryRecord): string[] {
   return out.filter((x): x is string => typeof x === 'string');
 }
 
-/** The fields served as prose: title, body, observer. */
-function servedProse(r: { title: string; body: string; observer: string }): string {
-  return `${r.title}\n${r.body}\n${r.observer}`;
+/** The fields served to an agent, as one text for the injection flag: title, body, observer, source paths. */
+function servedProse(r: { title: string; body: string; observer: string; paths: readonly string[] }): string {
+  return [r.title, r.body, r.observer, ...r.paths].join('\n');
+}
+
+/**
+ * Characters a one-line field (title, observer, key, tag) must not hold: C0 and C1 controls
+ * (DEL included), the bidi embedding / override / isolate controls, and the Unicode line and
+ * paragraph separators. Any of them can make a served line read differently from what is stored.
+ */
+const LINE_FIELD_FORBIDDEN = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069\u2028\u2029]/u;
+/** The same set for a body, minus `\t` and `\n` (checked after `\r\n` / `\r` become `\n`, as stored). */
+const BODY_FORBIDDEN = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069\u2028\u2029]/u;
+
+/** The first field holding a forbidden control character, or null. */
+function controlProblem(fields: { name: string; value: string | undefined }[], body: string): string | null {
+  for (const f of fields) {
+    if (f.value !== undefined && LINE_FIELD_FORBIDDEN.test(f.value)) return `${f.name} must not contain control, bidi or line-separator characters`;
+  }
+  if (BODY_FORBIDDEN.test(body.replace(/\r\n?/g, '\n'))) return 'text may contain no control characters other than tab and newline';
+  return null;
 }
 
 /**
@@ -175,7 +193,7 @@ export function indexRecord(sr: StoredRecord): RecordRow {
     sources: record.sources,
     paths: record.sources.map((s) => s.resource),
     candidate,
-    flagged: injectionFlag(servedProse(record)) !== null,
+    flagged: injectionFlag(servedProse({ ...record, paths: record.sources.map((s) => s.resource) })) !== null,
     text: sr.text,
   };
 }
@@ -234,7 +252,7 @@ export function viewOf(store: Store, rows: readonly RecordRow[]): RecordRow[] {
 const FINGERPRINT_KEY = 'sync:fingerprint';
 const INDEX_RULES_KEY = 'sync:index-rules';
 /** Bump when indexRecord's checks change, so rows indexed under older rules are redone. */
-const INDEX_RULES = '2';
+const INDEX_RULES = '3';
 /** A directory changed this recently may change again within the same mtime tick (racy-clean, V14). */
 const RACY_MS = 2000;
 
@@ -494,6 +512,16 @@ async function prepare(
   if (input.key !== undefined && isRecordId(input.key)) {
     throw new RefusedError('a key must not look like a record id', 'key');
   }
+  const control = controlProblem(
+    [
+      { name: 'title', value: input.title },
+      { name: 'observer', value: observer },
+      { name: 'key', value: input.key },
+      { name: 'tag', value: input.tag },
+    ],
+    input.text,
+  );
+  if (control !== null) throw new RefusedError(control, 'shape');
 
   // 1 shape: lint a provisional record whose sources carry the real paths and placeholder hashes.
   for (const q of quotes) {
@@ -543,7 +571,7 @@ async function prepare(
   }
 
   // 4 injection: advisory only; the index flags it again on every load.
-  const phrase = injectionFlag(servedProse({ title: input.title, body: input.text, observer }));
+  const phrase = injectionFlag(servedProse({ title: input.title, body: input.text, observer, paths: sources.map((s) => s.resource) }));
   if (phrase !== null) notes.push(`flagged: looks like an instruction to the agent ("${phrase}")`);
   return sources;
 }
