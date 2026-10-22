@@ -113,12 +113,52 @@ describe('Evidence', () => {
 
     const contentId = createHash('sha256').update(fs.readFileSync(path.join(wt, 'src/price.ts'))).digest('hex');
     expect(ev.contentId('src/price.ts')).toBe(contentId);
-    expect(cache.getEvidence(contentId, src.quote)).toBe('found');
+    expect(cache.getEvidence(contentId, `${src.quote}|${src.anchor}|${src.tokens}`)).toBe('found');
 
     ev.resetMemo();
     expect(await ev.check(src)).toEqual({ outcome: 'holds', detail: 'found', path: 'src/price.ts' });
     expect(await evidence(wt, cache).check(second)).toMatchObject({ outcome: 'holds' });
     expect(buildAnchorMap).toHaveBeenCalledTimes(1);
+  });
+
+  it('a crafted source with the same quote hash but a wrong anchor or token count cannot poison the honest one', async () => {
+    const { wt, src } = await setup();
+    const cache = openCache();
+    const ev = evidence(wt, cache);
+    const badAnchor = { ...src, anchor: '000000000000' };
+    const badTokens = { ...src, tokens: src.tokens + 1 };
+    expect(await ev.check(badAnchor)).toMatchObject({ outcome: 'suspect', detail: 'not-found' });
+    expect(await ev.check(badTokens)).toMatchObject({ outcome: 'suspect', detail: 'not-found' });
+    expect(await ev.check(src)).toEqual({ outcome: 'holds', detail: 'found', path: 'src/price.ts' });
+
+    // Independent rows over one content id; a fresh request still gets each result from the cache.
+    expect(await evidence(wt, cache).check(src)).toMatchObject({ outcome: 'holds' });
+    expect(await evidence(wt, cache).check(badAnchor)).toMatchObject({ outcome: 'suspect' });
+  });
+
+  it('an unchanged file is served from the stat cache without reading its bytes', async () => {
+    const { wt } = await setup();
+    const cache = openCache();
+    const abs = path.join(wt, 'src/price.ts');
+    // Backdate the mtime past the 2 s racy window so the stat entry is trusted.
+    const past = new Date(Date.now() - 10_000);
+    fs.utimesSync(abs, past, past);
+
+    const ev = evidence(wt, cache);
+    const read = vi.spyOn(fs, 'readFileSync');
+    try {
+      const id = ev.contentId('src/price.ts');
+      expect(id).toBe(createHash('sha256').update(FILE).digest('hex'));
+      expect(read.mock.calls.filter((c) => c[0] === abs)).toHaveLength(1);
+
+      ev.resetMemo();
+      read.mockClear();
+      expect(ev.contentId('src/price.ts')).toBe(id);
+      expect(evidence(wt, cache).contentId('src/price.ts')).toBe(id);
+      expect(read.mock.calls.filter((c) => c[0] === abs)).toHaveLength(0);
+    } finally {
+      read.mockRestore();
+    }
   });
 
   it('an edited identifier makes it suspect', async () => {

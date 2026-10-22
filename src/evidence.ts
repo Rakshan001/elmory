@@ -41,6 +41,15 @@ type Probe =
 
 const sha256 = (b: Buffer): string => createHash('sha256').update(b).digest('hex');
 
+/**
+ * The evidence row key. The quote hash alone is not enough: a crafted record with a real quote
+ * hash but a wrong anchor or token count would store `not-found` and make an honest record with
+ * the same quote suspect. Honest records with one quote share all three, so they still share rows.
+ */
+function evidenceKey(src: QuoteSource): string {
+  return `${src.quote}|${src.anchor}|${src.tokens}`;
+}
+
 function isLegacy(s: Source): s is LegacyFileSource {
   return 'legacyFile' in s;
 }
@@ -149,12 +158,13 @@ export class Evidence {
 
     const id = this.contentId(relPath);
     if (id === null) return report('unknown', 'unreadable');
-    let result = this.#cache.getEvidence(id, src.quote);
+    const key = evidenceKey(src);
+    let result = this.#cache.getEvidence(id, key);
     if (result === null) {
       const map = this.#anchorMap(p.abs, id);
       if (map === null) return report('unknown', 'unreadable');
       result = locate(map, src);
-      this.#cache.putEvidence(id, src.quote, result);
+      this.#cache.putEvidence(id, key, result);
     }
     return result === 'found' ? report('holds', 'found') : report('suspect', result);
   }
