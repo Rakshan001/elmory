@@ -108,16 +108,21 @@ export class Git {
   }
 
   /**
-   * For each file present-after-change under `relDir` in HEAD's history (added, modified,
-   * renamed in, type-changed, including changes a merge makes against its first parent): the
-   * most recent such commit and its signer. One `git log` call; the first entry in log order
-   * wins, so a later unsigned edit or merge replaces an earlier signed add. A signed file that
-   * arrives through an unsigned merge commit is attributed to that merge (no signer).
+   * For each file under `relDir` in HEAD's history: the most recent commit that touched it
+   * (added, modified, renamed in, type-changed; deletes are ignored) and that commit's signer.
+   * One `git log` call; the first touch in log order wins, so a later unsigned edit replaces an
+   * earlier signed add.
+   *
+   * Merges are diffed against each parent separately (`-m`). A merge touches a path only when
+   * the path differs from EVERY parent, i.e. the merge itself edited it (an "evil merge"). A
+   * path that a clean merge just carries over from one side is not a touch, so it keeps the
+   * branch commit that made the change, and its signer.
    *
    * The format prints only git-computed fields, never author-controlled text, so nothing a
    * committer writes can contain the separators. Paths are C-quoted by git when they hold
-   * control characters. As defence in depth, a header that is not exactly four fields with a
-   * full sha first gets `signer: null` (and an empty `commit` when the sha is not valid).
+   * control characters. As defence in depth, a header that is not exactly five fields with full
+   * shas gets `signer: null` (and an empty `commit` when its sha is not valid), and is treated as
+   * a single-parent commit.
    */
   async addedBy(relDir: string): Promise<Map<string, AddedBy>> {
     const result = new Map<string, AddedBy>();
@@ -128,13 +133,13 @@ export class Git {
       // %G? verifies the signature itself. --show-signature (or log.showSignature) would print
       // the verification text to stdout between records, where it would parse as file paths.
       '--no-show-signature',
-      // Every non-delete change, each path on its own (no rename pairing), and merge commits
-      // diffed against their first parent, so an edit made inside a merge is attributed to it.
+      // Every non-delete change, each path on its own (no rename pairing), and one record per
+      // parent for a merge, so a merge's own edits can be told apart from carried-over changes.
       '--no-renames',
       '--diff-filter=d',
-      '--diff-merges=first-parent',
+      '--diff-merges=separate',
       '--name-only',
-      '--format=%x1e%H%x1f%G?%x1f%GF%x1f%GK',
+      '--format=%x1e%H%x1f%P%x1f%G?%x1f%GF%x1f%GK',
       '--',
       literal(relDir),
     ]);
@@ -143,15 +148,27 @@ export class Git {
       if ((await this.head()) === null) return result;
       throw new Error(`git log failed: ${res.stderr.trim() || `exit ${res.code}`}`);
     }
+    // Per (merge, path): in how many of the merge's per-parent diffs the path has appeared.
+    const mergeSeen = new Map<string, number>();
     for (const record of res.stdout.split(RS).slice(1)) {
       const lines = record.split('\n');
       const fields = (lines[0] ?? '').split(US);
-      const [hash = '', good = '', fingerprint = '', keyId = ''] = fields;
-      const wellFormed = fields.length === 4 && FULL_SHA.test(hash);
+      const [hash = '', parentList = '', good = '', fingerprint = '', keyId = ''] = fields;
+      const parents = parentList === '' ? [] : parentList.split(' ');
+      const wellFormed = fields.length === 5 && FULL_SHA.test(hash) && parents.every((p) => FULL_SHA.test(p));
       const commit = FULL_SHA.test(hash) ? hash : '';
       const signer = wellFormed && good === 'G' ? fingerprint || keyId || null : null;
+      const parentCount = wellFormed ? parents.length : 1;
       for (const file of lines.slice(1)) {
         if (file === '' || result.has(file)) continue;
+        if (parentCount > 1) {
+          // Merge records for one commit are consecutive and come before every older commit,
+          // so recording the touch when the last parent's diff lists the path keeps log order.
+          const key = `${commit}\0${file}`;
+          const seen = (mergeSeen.get(key) ?? 0) + 1;
+          mergeSeen.set(key, seen);
+          if (seen < parentCount) continue;
+        }
         result.set(file, { commit, signer });
       }
     }

@@ -88,6 +88,27 @@ async function evilMerge(wt: string, tombstone: string): Promise<string> {
   return commitAll(wt, 'merge side');
 }
 
+/**
+ * A clean --no-ff merge, committed unsigned: branch `side` adds a tombstone (signed when asked)
+ * while the current branch adds a fact, so the merge differs from both parents under .elmory/.
+ */
+async function cleanMerge(
+  wt: string,
+  signSide: boolean,
+): Promise<{ sideAdd: string; mainAdd: string; merge: string }> {
+  await commitAll(wt, 'base', '--allow-empty');
+  const main = (await git(wt, 'branch', '--show-current')).trim();
+  await git(wt, 'checkout', '-q', '-b', 'side');
+  write(wt, '.elmory/tombstones/f_x', 'supersedes: []\n');
+  const sideAdd = await commitAll(wt, 'side adds tombstone', ...(signSide ? ['-S'] : []));
+  await git(wt, 'checkout', '-q', main);
+  write(wt, '.elmory/facts/f_main.md', 'main\n');
+  const mainAdd = await commitAll(wt, 'main adds fact');
+  await git(wt, 'merge', '-q', '--no-ff', '--no-verify', '-m', 'merge side', 'side');
+  const merge = (await git(wt, 'rev-parse', 'HEAD')).trim();
+  return { sideAdd, mainAdd, merge };
+}
+
 describe('Git', () => {
   it('head is null before the first commit and a sha after it', async () => {
     const wt = await repo();
@@ -215,6 +236,19 @@ describe('Git', () => {
     expect(added.get('.elmory/tombstones/f_x')).toEqual({ commit: merge, signer: null });
   });
 
+  it('a clean merge is not a touch: each path keeps the branch commit that added it', async () => {
+    const wt = await repo();
+    const { sideAdd, mainAdd, merge } = await cleanMerge(wt, false);
+    const added = await new Git(defaultExec, wt).addedBy('.elmory/');
+    expect(added).toEqual(
+      new Map([
+        ['.elmory/tombstones/f_x', { commit: sideAdd, signer: null }],
+        ['.elmory/facts/f_main.md', { commit: mainAdd, signer: null }],
+      ]),
+    );
+    expect([sideAdd, mainAdd]).not.toContain(merge);
+  });
+
   it('addedBy is empty before the first commit', async () => {
     const wt = await repo();
     const g = new Git(defaultExec, wt);
@@ -306,6 +340,17 @@ describe('Git', () => {
     const forged = await commitAll(wt, 'unsigned edit', '--author=Mallory <m@x>');
     expect((await g.addedBy('.elmory/')).get('.elmory/tombstones/f_x')).toEqual({ commit: forged, signer: null });
     expect(forged).not.toBe(signed);
+  });
+
+  it.skipIf(!hasSshKeygen())('a clean unsigned merge keeps the signer of the branch commit', async () => {
+    const wt = await repo();
+    const withSigners = await sshSigning(wt);
+    const { sideAdd, mainAdd } = await cleanMerge(wt, true);
+    const added = await new Git(withSigners, wt).addedBy('.elmory/');
+    const t = added.get('.elmory/tombstones/f_x');
+    expect(t?.commit).toBe(sideAdd);
+    expect(t?.signer).toMatch(/^SHA256:/);
+    expect(added.get('.elmory/facts/f_main.md')).toEqual({ commit: mainAdd, signer: null });
   });
 
   it.skipIf(!hasSshKeygen())('an unsigned evil merge after a signed add drops the signer', async () => {
