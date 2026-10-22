@@ -426,6 +426,69 @@ describe('Git', () => {
     }
   });
 
+  it.skipIf(!hasSshKeygen())('signatures are verified only for credited commits, in one lookup, never during the walk (C2)', async () => {
+    const wt = await repo();
+    const withSigners = await sshSigning(wt);
+    write(wt, '.elmory/facts/f_a.md', 'a\n');
+    const signed = await commitAll(wt, 'signed record', '-S');
+    const main = (await git(wt, 'branch', '--show-current')).trim();
+    // GitHub-style history: many signed merges, none touching .elmory.
+    for (let i = 0; i < 12; i++) {
+      await git(wt, 'checkout', '-q', '-b', `b${i}`);
+      write(wt, `src/f${i}.txt`, `${i}\n`);
+      await commitAll(wt, `c${i}`);
+      await git(wt, 'checkout', '-q', main);
+      await git(wt, 'merge', '-q', '--no-ff', '--no-verify', '-S', '-m', `merge ${i}`, `b${i}`);
+    }
+    const calls: string[][] = [];
+    const spy: Exec = (file, args, opts) => {
+      calls.push(args);
+      return withSigners(file, args, opts);
+    };
+    const added = await new Git(spy, wt).addedBy('.elmory/');
+    expect(added.get('.elmory/facts/f_a.md')).toEqual({ commit: signed, signer: expect.stringMatching(/^SHA256:/) });
+    const logs = calls.filter((c) => c.includes('log'));
+    expect(logs).toHaveLength(2);
+    const [walk, lookup] = logs as [string[], string[]];
+    expect(walk.some((a) => a.includes('%G'))).toBe(false);
+    expect(lookup).toContain('--no-walk=unsorted');
+    expect(lookup.filter((a) => /^[0-9a-f]{40,64}$/.test(a))).toEqual([signed]);
+  }, 30000);
+
+  it('no signature lookup runs when no credit survives', async () => {
+    const wt = await repo();
+    write(wt, '.elmory/facts/f_a.md', 'a\n');
+    await commitAll(wt, 'unsigned record');
+    write(wt, '.elmory/facts/f_a.md', 'b\n');
+    const calls: string[][] = [];
+    const spy: Exec = (file, args, opts) => {
+      calls.push(args);
+      return defaultExec(file, args, opts);
+    };
+    const g = new Git(spy, wt);
+    expect((await g.addedBy('.elmory/')).get('.elmory/facts/f_a.md')?.signer).toBeNull();
+    expect(calls.filter((c) => c.includes('--no-walk=unsorted'))).toHaveLength(1); // one credited commit, unsigned
+    calls.length = 0;
+    const empty = await repo();
+    write(empty, 'src/x.ts', 'x\n');
+    await commitAll(empty, 'no records');
+    expect((await new Git(spy, empty).addedBy('.elmory/')).size).toBe(0);
+    expect(calls.filter((c) => c.includes('--no-walk=unsorted'))).toHaveLength(0);
+  });
+
+  it('headKey names HEAD and the tree of the path, or - when HEAD has no such path', async () => {
+    const wt = await repo();
+    const g = new Git(defaultExec, wt);
+    expect(await g.headKey('.elmory')).toBeNull();
+    write(wt, 'src/x.ts', 'x\n');
+    const first = await commitAll(wt, 'first');
+    expect(await g.headKey('.elmory')).toEqual({ head: first, tree: '-' });
+    write(wt, '.elmory/facts/f_a.md', 'a\n');
+    const second = await commitAll(wt, 'second');
+    const tree = (await git(wt, 'rev-parse', 'HEAD:.elmory')).trim();
+    expect(await g.headKey('.elmory')).toEqual({ head: second, tree });
+  });
+
   it.skipIf(!hasSshKeygen())('signed commit reports a signer', async () => {
     const wt = await repo();
     const withSigners = await sshSigning(wt);

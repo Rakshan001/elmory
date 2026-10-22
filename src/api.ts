@@ -45,13 +45,85 @@ const DEFAULT_OBSERVER = 'agent:unknown';
 /** The warning a read carries when the index could not be brought up to date (§9). */
 export const INDEX_BUSY = 'index busy; results may be behind';
 
+/** Cache meta key prefix: git's addedBy('.elmory') for one worktree, with the HEAD and tree it is for. */
+const ADDED_BY_META = 'addedby:';
+
+interface AddedByEntry {
+  head: string;
+  tree: string;
+  map: Map<string, AddedBy>;
+}
+
 /**
- * git's addedBy for `.elmory`, minus every path whose working-tree bytes differ from HEAD (N0):
- * the signature covers the committed bytes, not an uncommitted edit of them.
+ * git's addedBy('.elmory') per worktree, reused while HEAD and HEAD's `.elmory` tree are the
+ * ones it was computed at (it is a function of HEAD's history alone). Kept in memory and in the
+ * cache meta, so a new process with the same HEAD skips the history walk too; each lookup costs
+ * one `rev-parse`. A result is stored only when HEAD did not move during the walk. `fresh`
+ * recomputes it whatever the key says (verify: a signing key added to gpg or to the allowed
+ * signers file since the walk is picked up there, or when HEAD moves).
  */
-async function signedAddedBy(exec: Exec, git: Git, worktree: string): Promise<Map<string, AddedBy>> {
+class CommittedAddedBy {
+  readonly #memo = new Map<string, AddedByEntry>();
+
+  constructor(private readonly cache: Cache) {}
+
+  async get(git: Git, worktree: string, fresh: boolean): Promise<Map<string, AddedBy>> {
+    const key = await git.headKey('.elmory');
+    if (key === null) return git.addedBy('.elmory');
+    if (!fresh) {
+      const hit = this.#memo.get(worktree) ?? this.#fromMeta(worktree);
+      if (hit !== null && hit.head === key.head && hit.tree === key.tree) {
+        this.#memo.set(worktree, hit);
+        return new Map(hit.map);
+      }
+    }
+    const map = await git.addedBy('.elmory');
+    const after = await git.headKey('.elmory');
+    if (after !== null && after.head === key.head && after.tree === key.tree) {
+      const entry = { ...key, map };
+      this.#memo.set(worktree, entry);
+      try {
+        this.cache.setMeta(`${ADDED_BY_META}${worktree}`, JSON.stringify({ head: key.head, tree: key.tree, entries: [...map].map(([p, a]) => [p, a.commit, a.signer]) }));
+      } catch {
+        // a busy or read-only cache only costs the next process one walk
+      }
+    }
+    return new Map(map);
+  }
+
+  #fromMeta(worktree: string): AddedByEntry | null {
+    try {
+      const raw = this.cache.getMeta(`${ADDED_BY_META}${worktree}`);
+      if (raw === null) return null;
+      const v = JSON.parse(raw) as { head?: unknown; tree?: unknown; entries?: unknown };
+      if (typeof v.head !== 'string' || typeof v.tree !== 'string' || !Array.isArray(v.entries)) return null;
+      const map = new Map<string, AddedBy>();
+      for (const e of v.entries as unknown[]) {
+        if (!Array.isArray(e) || typeof e[0] !== 'string' || typeof e[1] !== 'string') return null;
+        if (e[2] !== null && typeof e[2] !== 'string') return null;
+        map.set(e[0], { commit: e[1], signer: e[2] as string | null });
+      }
+      return { head: v.head, tree: v.tree, map };
+    } catch {
+      return null; // a torn or foreign value: walk again
+    }
+  }
+}
+
+/**
+ * git's addedBy for `.elmory` (from `committed`), minus every path whose working-tree bytes
+ * differ from HEAD (N0): the signature covers the committed bytes, not an uncommitted edit of
+ * them. The diff runs every time: it depends on the working tree, not on HEAD.
+ */
+async function signedAddedBy(
+  exec: Exec,
+  git: Git,
+  worktree: string,
+  committed: CommittedAddedBy,
+  fresh = false,
+): Promise<Map<string, AddedBy>> {
   const [addedBy, diff] = await Promise.all([
-    git.addedBy('.elmory'),
+    committed.get(git, worktree, fresh),
     exec('git', ['diff', '--no-relative', '--name-only', '-z', 'HEAD', '--', ':(literal).elmory'], { cwd: worktree }),
   ]);
   if (addedBy.size === 0) return addedBy;
@@ -91,8 +163,12 @@ export class Elmory implements Context {
   readonly #handlers = new Set<(e: ElmoryEvent) => void>();
   readonly #now: () => string;
   readonly #exec: Exec;
-  /** git's addedBy('.elmory'), shared by deriver() calls until the next sync() or write. */
+  /** signedAddedBy for this worktree, shared by deriver() calls until the next sync() or write. */
   #addedBy: Promise<Map<string, AddedBy>> | null = null;
+  /** git's addedBy per (worktree, HEAD, `.elmory` tree): the history walk runs once per HEAD. */
+  readonly #committed: CommittedAddedBy;
+  /** Set by a full sync (verify): the next fetch walks the history again whatever HEAD is. */
+  #freshWalk = false;
 
   private constructor(
     readonly layout: Layout,
@@ -106,6 +182,7 @@ export class Elmory implements Context {
   ) {
     this.#now = now;
     this.#exec = exec;
+    this.#committed = new CommittedAddedBy(cache);
   }
 
   /**
@@ -179,6 +256,7 @@ export class Elmory implements Context {
    */
   async sync(opts: { full?: boolean } = {}): Promise<string[]> {
     this.#addedBy = null;
+    if (opts.full === true) this.#freshWalk = true;
     if (opts.full !== true && !gate.syncNeeded(this.store, this.cache)) return [];
     // tryWithWriteLock never waits: a held lock is null at once, not the 5 s busy timeout.
     const ran = this.cache.tryWithWriteLock(() => {
@@ -190,8 +268,8 @@ export class Elmory implements Context {
 
   /**
    * A new Deriver (and a fresh evidence memo) per request over `rows` (default: the cache now);
-   * call `sync()` first. git's addedBy is memoised per instance (one `git log` instead of one per
-   * call) and dropped by `sync()` and by every write.
+   * call `sync()` first. fetchAddedBy is memoised per instance until `sync()` or a write; under
+   * it, the history walk is reused while HEAD and its `.elmory` tree stay the same.
    */
   async deriver(rows?: readonly RecordRow[]): Promise<Deriver> {
     const addedBy = await this.#memoAddedBy();
@@ -203,8 +281,12 @@ export class Elmory implements Context {
     return gate.viewOfCache(this.store, this.cache);
   }
 
-  fetchAddedBy(): Promise<Map<string, AddedBy>> {
-    return this.git === null ? Promise.resolve(new Map()) : signedAddedBy(this.#exec, this.git, this.layout.worktree);
+  async fetchAddedBy(): Promise<Map<string, AddedBy>> {
+    if (this.git === null) return new Map();
+    const fresh = this.#freshWalk;
+    const out = await signedAddedBy(this.#exec, this.git, this.layout.worktree, this.#committed, fresh);
+    if (fresh) this.#freshWalk = false;
+    return out;
   }
 
   #memoAddedBy(): Promise<Map<string, AddedBy>> {
@@ -237,7 +319,7 @@ export class Elmory implements Context {
         records: new Map(gate.viewOfCache(store, this.cache).map((r) => [r.id, r])),
         tombstones: store.readTombstones(),
         trust: store.readTrust(),
-        addedBy: await signedAddedBy(this.#exec, git, layout.worktree),
+        addedBy: await signedAddedBy(this.#exec, git, layout.worktree, this.#committed),
         evidence: (row) => evidence.checkAll(row.sources),
       });
       out.push({ worktree: layout.worktree, deriver });

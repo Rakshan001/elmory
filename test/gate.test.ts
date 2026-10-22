@@ -457,31 +457,61 @@ describe('without git', () => {
 });
 
 describe('Elmory wiring', () => {
-  it('read flows are methods; addedBy is one git log per write and is reused until sync', async () => {
+  it('read flows are methods; the history walk runs once per HEAD and repeated reads run no git log', async () => {
     const wt = await repo();
-    let logs = 0;
+    const cacheDir = tmp();
+    let logs = 0; // history walks
+    let lookups = 0; // signature lookups of credited commits
+    let calls: string[][] = [];
     const exec: typeof defaultExec = (file, args, opts) => {
-      if (args.includes('log')) logs++;
+      if (args.includes('log') && args.includes('--full-history')) logs++;
+      if (args.includes('--no-walk=unsorted')) lookups++;
+      calls.push(args);
       return defaultExec(file, args, opts);
     };
-    const e = await Elmory.open({ worktree: wt, cacheDir: tmp(), now: () => NOW, observer: 'agent:test', exec });
+    const e = await Elmory.open({ worktree: wt, cacheDir, now: () => NOW, observer: 'agent:test', exec });
     opened.push(e);
 
     const a = await e.remember(fact('Token check'));
     expect(logs).toBe(1);
     await e.deriver();
     await e.deriver();
-    expect(logs).toBe(2); // the write dropped the memo; one fetch serves both calls
     await e.sync();
     await e.deriver();
+    await e.remember(fact('Session refresh', LINE_B));
+    expect(logs).toBe(1); // same HEAD: the walk is reused across reads, syncs and writes
+
+    calls = [];
+    for (let i = 0; i < 5; i++) {
+      const r = await e.recall({ query: 'checkToken' });
+      expect(r.abstain === false && r.served.map((s) => s.id)).toContain(a.id);
+    }
+    expect(logs).toBe(1);
+    // Per recall: one rev-parse (the HEAD key) and one diff (uncommitted .elmory edits), nothing else.
+    expect(calls.length).toBeLessThanOrEqual(10);
+    expect(calls.every((c) => c[0] === 'rev-parse' || c[0] === 'diff')).toBe(true);
+
+    // A new process on the same HEAD reuses the walk stored in the cache.
+    const again = await Elmory.open({ worktree: wt, cacheDir, now: () => NOW, observer: 'agent:test', exec });
+    opened.push(again);
+    expect((await again.recall({ query: 'checkToken' })).abstain).toBe(false);
+    expect(logs).toBe(1);
+
+    // HEAD moves: one walk; verify walks again whatever HEAD is.
+    e.publish();
+    await git(wt, 'add', '-A');
+    await git(wt, 'commit', '-q', '--no-verify', '-m', 'publish');
+    expect(lookups).toBe(0); // nothing was committed yet: no credit to verify
+    await e.recall({ query: 'checkToken' });
+    await e.recall({ query: 'checkToken' });
+    expect(logs).toBe(2);
+    expect(lookups).toBe(1); // one batched lookup for the one commit that is credited
+    expect((await e.verify()).states.active).toBe(2);
     expect(logs).toBe(3);
 
-    const r = await e.recall({ query: 'checkToken' });
-    expect(r.abstain === false && r.served.map((s) => s.id)).toEqual([a.id]);
     const ab = await e.about('src/auth.ts');
-    expect(ab.abstain === false && ab.served.map((s) => s.id)).toEqual([a.id]);
+    expect(ab.abstain === false && ab.served.map((s) => s.id)).toContain(a.id);
     expect((await e.history(a.id)).entries.map((h) => h.id)).toEqual([a.id]);
-    expect((await e.verify()).states.active).toBe(1);
     expect(await e.gc({ dryRun: true })).toEqual({ archived: [], committed: [], staleHere: [], skipped: [], dryRun: true });
   });
 });

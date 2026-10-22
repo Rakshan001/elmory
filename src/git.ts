@@ -15,6 +15,8 @@ export interface AddedBy {
   signer: string | null;
 }
 
+/** Commits per signature lookup: keeps the argument list far below any ARG_MAX. */
+const SIGNATURE_BATCH = 500;
 const RS = '\x1e';
 const US = '\x1f';
 /** A full or abbreviated object name. Anything else (refs, options) is refused before git sees it. */
@@ -51,7 +53,7 @@ function splitZ(out: string): string[] {
 
 /**
  * Thin wrapper over `git` through an injectable `Exec`. Every method is one git invocation
- * (`addedBy` is two) and nothing is cached here. Paths are repo-relative with forward slashes (git's own form), and
+ * (`addedBy` is up to three) and nothing is cached here. Paths are repo-relative with forward slashes (git's own form), and
  * `worktree` is the work tree's top level.
  */
 export class Git {
@@ -156,10 +158,16 @@ export class Git {
    * commits (`--parents`), which keeps ancestry among the listed commits exact. Deletes are read
    * as touches but never credited.
    *
-   * Two git calls: one `ls-tree` for HEAD's blobs, then one `log`. Output is NUL-separated, so
-   * paths are taken verbatim and are only ever read from the slot after a change line; nothing a
-   * committer writes can be read as a header. The header prints only git-computed fields. As
-   * defence in depth, a header that is not exactly five fields with full shas gets
+   * Signatures are not read during the walk: `--full-history` lists every merge in history, and
+   * asking for `%G?` there would run gpg or ssh-keygen once per signed merge. The walk decides
+   * which commit each path is credited to and which credits survive the replay check; only those
+   * commits are then verified, in one `git log --no-walk` (see `signers`).
+   *
+   * Three git calls at most: one `ls-tree` for HEAD's blobs, one `log` for the walk, and one
+   * `log --no-walk` for the signatures (none when no credit survives). Output is NUL-separated,
+   * so paths are taken verbatim and are only ever read from the slot after a change line;
+   * nothing a committer writes can be read as a header. Headers print only git-computed fields.
+   * As defence in depth, a walk header that is not exactly two fields with full shas gets
    * `signer: null` (and an empty `commit` when its sha is not valid), is treated as a
    * single-parent commit, and leaves the ancestry incomplete, so every signer that needs the
    * replay check is dropped; a change line that does not parse counts as a touch that did not
@@ -174,8 +182,8 @@ export class Git {
     if (headBlobs === null) return result;
     const res = await this.run([
       'log',
-      // %G? verifies the signature itself. --show-signature (or log.showSignature) would print
-      // the verification text to stdout between records.
+      // No signature is read here (see above); this also keeps log.showSignature from printing
+      // verification text to stdout between records.
       '--no-show-signature',
       // Children before parents, whatever the commit dates say.
       '--topo-order',
@@ -190,14 +198,14 @@ export class Git {
       '--raw',
       '--no-abbrev',
       '-z',
-      '--format=%x1e%H%x1f%P%x1f%G?%x1f%GF%x1f%GK',
+      '--format=%x1e%H%x1f%P',
       '--',
       literal(relDir),
     ]);
     if (res.code !== 0) throw new Error(`git log failed: ${res.stderr.trim() || `exit ${res.code}`}`);
 
     let commit = '';
-    let signer: string | null = null;
+    let wellFormed = false;
     let parentCount = 1;
     let ancestryComplete = true;
     // Listed commit → its listed parents (rewritten by --parents).
@@ -207,17 +215,18 @@ export class Git {
     const newer = new Map<string, string[]>();
     // Per (merge, path): how many of the merge's per-parent diffs list the path.
     const mergeSeen = new Map<string, number>();
+    // Credited paths whose header was well formed: only these may get a signer.
+    const eligible = new Set<string>();
     const tokens = splitZ(res.stdout);
     for (let i = 0; i < tokens.length; i++) {
       // The first change line after a header starts on a new line.
       const token = (tokens[i] ?? '').replace(/^\n/, '');
       if (token.startsWith(RS)) {
         const fields = token.slice(1).split(US);
-        const [hash = '', parentList = '', good = '', fingerprint = '', keyId = ''] = fields;
+        const [hash = '', parentList = ''] = fields;
         const parents = parentList === '' ? [] : parentList.split(' ');
-        const wellFormed = fields.length === 5 && FULL_SHA.test(hash) && parents.every((p) => FULL_SHA.test(p));
+        wellFormed = fields.length === 2 && FULL_SHA.test(hash) && parents.every((p) => FULL_SHA.test(p));
         commit = FULL_SHA.test(hash) ? hash : '';
-        signer = wellFormed && good === 'G' ? fingerprint || keyId || null : null;
         parentCount = wellFormed ? parents.length : 1;
         if (wellFormed) parentsOf.set(hash, parents);
         else ancestryComplete = false;
@@ -247,15 +256,76 @@ export class Git {
         mergeSeen.set(key, seen);
         if (seen < parentCount) continue;
       }
-      result.set(file, { commit, signer });
+      result.set(file, { commit, signer: null });
+      if (wellFormed) eligible.add(file);
     }
 
+    // Replay check first; only the credits that survive it are worth a signature check.
+    const toVerify = new Map<string, string[]>();
     for (const [file, entry] of result) {
+      if (!eligible.has(file)) continue;
       const touches = newer.get(file);
-      if (entry.signer === null || touches === undefined) continue;
-      if (!ancestryComplete || descendsFrom(parentsOf, touches, entry.commit)) entry.signer = null;
+      if (touches !== undefined && (!ancestryComplete || descendsFrom(parentsOf, touches, entry.commit))) continue;
+      const files = toVerify.get(entry.commit) ?? [];
+      files.push(file);
+      toVerify.set(entry.commit, files);
+    }
+    if (toVerify.size === 0) return result;
+    const signers = await this.signers([...toVerify.keys()]);
+    for (const [c, files] of toVerify) {
+      const signer = signers.get(c);
+      if (signer === undefined) continue;
+      for (const file of files) (result.get(file) as AddedBy).signer = signer;
     }
     return result;
+  }
+
+  /**
+   * The key of every commit in `commits` (full shas) that git reports a good signature for (`%G?`
+   * is `G`): its fingerprint, else its key id. One `git log --no-walk` per 500 commits, so gpg or
+   * ssh-keygen runs once per commit asked about and never for the rest of history. A record whose
+   * header is not exactly four fields, or names a commit not asked about, is skipped (no signer).
+   */
+  async signers(commits: readonly string[]): Promise<Map<string, string>> {
+    const out = new Map<string, string>();
+    const asked = commits.filter((c) => FULL_SHA.test(c));
+    for (let i = 0; i < asked.length; i += SIGNATURE_BATCH) {
+      const batch = asked.slice(i, i + SIGNATURE_BATCH);
+      const wanted = new Set(batch);
+      const res = await this.run([
+        'log',
+        '--no-show-signature',
+        '--no-walk=unsorted',
+        '-z',
+        '--format=%x1e%H%x1f%G?%x1f%GF%x1f%GK',
+        ...batch,
+        '--',
+      ]);
+      if (res.code !== 0) throw new Error(`git log failed: ${res.stderr.trim() || `exit ${res.code}`}`);
+      for (const raw of splitZ(res.stdout)) {
+        const token = raw.replace(/^\n/, '').replace(/\n$/, '');
+        if (!token.startsWith(RS)) continue;
+        const fields = token.slice(1).split(US);
+        if (fields.length !== 4) continue;
+        const [hash = '', good = '', fingerprint = '', keyId = ''] = fields;
+        if (!wanted.has(hash) || good !== 'G') continue;
+        const signer = fingerprint || keyId;
+        if (signer !== '') out.set(hash, signer);
+      }
+    }
+    return out;
+  }
+
+  /**
+   * HEAD's commit and the tree id of `relDir` in it (`-` when HEAD has no such path), in one
+   * `rev-parse`; null for an unborn HEAD or outside a repository. A key for results that are a
+   * function of HEAD's history, such as `addedBy`.
+   */
+  async headKey(relDir: string): Promise<{ head: string; tree: string } | null> {
+    const res = await this.run(['rev-parse', 'HEAD', `HEAD:${relDir}`]);
+    const [head = '', tree = ''] = res.stdout.split('\n');
+    if (!FULL_SHA.test(head)) return null;
+    return { head, tree: res.code === 0 && FULL_SHA.test(tree) ? tree : '-' };
   }
 
   /**
