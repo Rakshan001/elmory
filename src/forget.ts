@@ -2,6 +2,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { type SearchDoc, matchDocs } from './cache.js';
 import type { Context } from './context.js';
 import { RefusedError, syncStore } from './gate.js';
 import { RecordError, isRecordId, parse } from './record.js';
@@ -18,7 +19,10 @@ export interface ForgetReport {
   cascaded: string[];
   /** Ids asked for that never existed here: not tombstoned, not in `deleted`. */
   unknown: string[];
-  /** `done` only when wal_checkpoint(TRUNCATE) returned busy = 0 and no other cache generation is left. */
+  /**
+   * `done` only when wal_checkpoint(TRUNCATE) returned busy = 0 and no other cache generation is
+   * left. When nothing was deleted no compaction runs, and this is what an earlier forget left.
+   */
   compaction: 'done' | 'pending';
   /** What forget cannot reach: the seven strings of §8 step 8, in that order. */
   unreachable: string[];
@@ -51,11 +55,14 @@ interface Node {
   supersedes: string[];
   /** published: it needs a committed tombstone too */
   facts: boolean;
+  /** An archived record's searchable fields (it has no index row); absent for indexed records. */
+  doc?: SearchDoc;
 }
 
 /**
  * The regular record files in the archive area (never indexed, but forget must reach them, §8
- * steps 2 and 6). A file that does not parse still counts, with no links, so `--all` deletes it.
+ * steps 2 and 6). A file that does not parse still counts, with no links, so `--all` deletes it,
+ * and its whole text is what a query matches against.
  */
 function archivedNodes(ctx: Context): Map<string, Node> {
   const out = new Map<string, Node>();
@@ -78,10 +85,13 @@ function archivedNodes(ctx: Context): Map<string, Node> {
     }
     let node: Node = { title: '', cites: [], supersedes: [], facts: false };
     try {
-      const r = parse(fs.readFileSync(file, 'utf8')).record;
-      node = { title: r.title, cites: r.cites.filter(isRecordId), supersedes: r.supersedes.filter(isRecordId), facts: false };
+      const text = fs.readFileSync(file, 'utf8');
+      node.doc = { id, title: '', body: text, key: null, paths: [] };
+      const r = parse(text).record;
+      const doc = { id, title: r.title, body: r.body, key: r.key ?? null, paths: r.sources.map((s) => s.resource) };
+      node = { title: r.title, cites: r.cites.filter(isRecordId), supersedes: r.supersedes.filter(isRecordId), facts: false, doc };
     } catch {
-      // unparseable: still a file holding text, so still deletable
+      // unreadable or unparseable: still a file holding text, so still deletable
     }
     out.set(id, node);
   }
@@ -154,10 +164,19 @@ async function seedsOf(ctx: Context, scope: ForgetScope | ForgetPreviewScope, co
     if (typeof scope.query !== 'string') throw new RefusedError('query must be a string', 'shape');
     // Straight from the search, not through recall: recall serves only the states `include` may
     // name (never candidate or forgotten) and stamps `recall:<id>`, so a preview would count as a
-    // use. Every record of this worktree's view that matches is a seed, whatever its state.
+    // use. Every record of this worktree's view that matches is a seed, whatever its state, and
+    // so is every archived record file that matches (read and matched in memory: archived
+    // records have no index row). Terms are OR-joined, as in recall.
     await ctx.sync();
-    const mine = new Set(ctx.view().map((r) => r.id));
-    return ctx.cache.search(scope.query, { limit: Number.MAX_SAFE_INTEGER, offset: 0 }).flatMap((h) => (mine.has(h.id) ? [h.id] : []));
+    const nodes = graph(ctx);
+    const indexed = ctx.cache
+      .search(scope.query, { limit: Number.MAX_SAFE_INTEGER, offset: 0 })
+      .flatMap((h) => {
+        const n = nodes.get(h.id);
+        return n !== undefined && n.doc === undefined ? [h.id] : []; // in this worktree's view
+      });
+    const archived = matchDocs(scope.query, [...nodes.values()].flatMap((n) => (n.doc === undefined ? [] : [n.doc])));
+    return [...indexed, ...archived];
   }
   if ((scope as { all?: unknown }).all === true) {
     await ctx.sync();
@@ -194,6 +213,8 @@ export async function forget(ctx: Context, scope: ForgetScope): Promise<ForgetRe
     // 2 cascade: every record (indexed or archived) citing a forgotten id, transitively
     const p = plan(ctx, asked);
     const ids = [...p.seeds, ...p.cascaded];
+    // Nothing exists here to delete (e.g. only unknown ids): write nothing, not even meta.
+    if (ids.length === 0) return { deleted: [], cascaded: [], unknown: p.unknown };
 
     // 3 tombstones (fsynced by the store's atomic write). A tombstone already on disk keeps its
     // supersedes, so forgetting an id twice never cuts it out of its chain.
@@ -217,6 +238,12 @@ export async function forget(ctx: Context, scope: ForgetScope): Promise<ForgetRe
     ctx.cache.setMeta('compaction', 'pending');
     return { deleted: p.seeds, cascaded: p.cascaded, unknown: p.unknown };
   });
+
+  // Nothing was deleted: no compaction to run. Report what an earlier forget left, if anything.
+  if (deleted.length === 0 && cascaded.length === 0) {
+    const compaction = ctx.cache.getMeta('compaction') === 'pending' ? 'pending' : 'done';
+    return { deleted, cascaded, unknown, compaction, unreachable: [...UNREACHABLE] };
+  }
 
   // 7 compact; 'pending' stays in meta and is retried on the next open. The deletion has
   // happened, so a failing compaction is reported as pending, never thrown.

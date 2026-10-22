@@ -199,6 +199,49 @@ function tx<T>(db: DatabaseSync, fn: () => T): T {
   }
 }
 
+/**
+ * The FTS5 MATCH expression for a user query: every term (split on whitespace and NUL) becomes a
+ * quoted phrase, OR-joined, so FTS syntax in the query is never interpreted. Null without terms.
+ */
+function ftsQuery(query: string): string | null {
+  const terms = query
+    .replaceAll('\0', ' ') // FTS5 ends a quoted string at a NUL ("unterminated string")
+    .split(/\s+/)
+    .filter((t) => t.length > 0)
+    .map((t) => `"${t.replaceAll('"', '""')}"`);
+  return terms.length === 0 ? null : terms.join(' OR ');
+}
+
+/** The searchable fields of a record that is not in the index (an archived file). */
+export interface SearchDoc {
+  id: string;
+  title: string;
+  body: string;
+  key: string | null;
+  paths: string[];
+}
+
+/**
+ * The ids among `docs` that `Cache.search` would match for `query`: the same columns, tokenizer
+ * and query escaping, in a private in-memory database that never touches disk. Sorted by id.
+ */
+export function matchDocs(query: string, docs: readonly SearchDoc[]): string[] {
+  const match = ftsQuery(query);
+  if (match === null || docs.length === 0) return [];
+  const db = new sqlite.DatabaseSync(':memory:');
+  try {
+    db.exec('PRAGMA temp_store=MEMORY; CREATE VIRTUAL TABLE docs USING fts5(id UNINDEXED, title, body, key, paths)');
+    const insert = db.prepare('INSERT INTO docs(id, title, body, key, paths) VALUES(?, ?, ?, ?, ?)');
+    for (const d of docs) insert.run(d.id, d.title, d.body, d.key, JSON.stringify(d.paths));
+    return db
+      .prepare('SELECT DISTINCT id FROM docs WHERE docs MATCH ? ORDER BY id')
+      .all(match)
+      .map((r) => str(r.id));
+  } finally {
+    db.close();
+  }
+}
+
 /** Apply the schema unless it is already there (a hand-deleted cache file comes back empty). */
 function ensureSchema(db: DatabaseSync): void {
   const has = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'records'").get();
@@ -549,27 +592,23 @@ export class Cache {
   }
 
   /**
-   * Full-text search (spec §7.2 step 1). The query is escaped: every term (split on whitespace and NUL)
-   * becomes a quoted phrase, OR-joined, so FTS syntax in the query is never interpreted.
+   * Full-text search (spec §7.2 step 1). The query is escaped (`ftsQuery`): every term becomes a
+   * quoted phrase, OR-joined, so FTS syntax in the query is never interpreted.
    * score = -bm25(title 4, body 1, key 2, paths 1): higher is better; results are best first.
    */
   search(query: string, opts: { limit: number; offset: number; excludeIds?: Set<string> }): { id: string; score: number }[] {
     for (const [k, v] of [['limit', opts.limit], ['offset', opts.offset]] as const) {
       if (!Number.isSafeInteger(v) || v < 0) throw new RangeError(`search: ${k} must be a non-negative integer`);
     }
-    const terms = query
-      .replaceAll('\0', ' ') // FTS5 ends a quoted string at a NUL ("unterminated string")
-      .split(/\s+/)
-      .filter((t) => t.length > 0)
-      .map((t) => `"${t.replaceAll('"', '""')}"`);
-    if (terms.length === 0) return [];
+    const match = ftsQuery(query);
+    if (match === null) return [];
     this.ensureCurrent();
     const rows = this.#stmt(
       `SELECT r.id AS id, bm25(records_fts, 4.0, 1.0, 2.0, 1.0) AS rank
          FROM records_fts JOIN records r ON r.rowid = records_fts.rowid
         WHERE records_fts MATCH ? AND r.id NOT IN (SELECT value FROM json_each(?))
         ORDER BY rank, r.id LIMIT ? OFFSET ?`,
-    ).all(terms.join(' OR '), JSON.stringify([...(opts.excludeIds ?? [])]), opts.limit, opts.offset);
+    ).all(match, JSON.stringify([...(opts.excludeIds ?? [])]), opts.limit, opts.offset);
     return rows.map((r) => ({ id: str(r.id), score: -Number(r.rank) }));
   }
 

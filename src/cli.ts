@@ -296,6 +296,10 @@ const VERBS: Record<string, Verb> = {
       if (r.unknown.length > 0) out.push(`unknown (no such record here; nothing written): ${r.unknown.join(', ')}`);
       out.push(`compaction: ${r.compaction}`);
       if (r.unreachable.length > 0) out.push('not reachable from here:', ...r.unreachable.map((u) => `  ${u}`));
+      // Every id asked for was unknown: nothing happened, which a script must be able to see.
+      if ('ids' in scope && r.deleted.length === 0) {
+        return { data: r, text: out.join('\n'), code: EXIT_ERROR, stderr: `no such record here: ${r.unknown.join(', ')}; nothing written` };
+      }
       return { data: r, text: out.join('\n') };
     },
   },

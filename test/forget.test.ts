@@ -325,6 +325,59 @@ describe('forget', () => {
     expect(again).toMatchObject({ deleted: [real], unknown: [] });
   });
 
+  it('a forget of only unknown ids writes nothing and runs no compaction', async () => {
+    const { e } = await setup();
+    const typo = `f_${'b'.repeat(26)}`;
+    let compactions = 0;
+    let sweeps = 0;
+    e.cache.compact = () => {
+      compactions++;
+      return 'done';
+    };
+    e.cache.sweepOld = () => {
+      sweeps++;
+      return [];
+    };
+    const r = await e.forget({ ids: [typo] });
+    expect(r).toMatchObject({ deleted: [], cascaded: [], unknown: [typo], compaction: 'done' });
+    expect([compactions, sweeps]).toEqual([0, 0]);
+    expect(e.cache.getMeta('compaction')).toBeNull();
+    expect(exists(path.join(e.layout.localTombstones, typo))).toBe(false);
+
+    // an earlier forget's pending compaction is reported as it stands, not as done
+    e.cache.setMeta('compaction', 'pending');
+    expect((await e.forget({ ids: [typo] })).compaction).toBe('pending');
+    expect(compactions).toBe(0);
+  });
+
+  it('--query also seeds archived record files whose text matches, OR per term', async () => {
+    const { wt, cacheDir, e } = await setup();
+    const live = (await e.note({ title: 'Live note', text: 'The kestrel4 cache is warm.' })).id;
+    const archived = (await e.note({ title: 'Archived note', text: 'Old Plover4 deploy notes.' })).id;
+    const citer = (await e.note({ title: 'Citer', text: 'See the archived one.', cites: [archived] })).id;
+    const kept = (await e.note({ title: 'Kept archived', text: 'Nothing to see.' })).id;
+    for (const id of [archived, kept]) e.store.archive(id); // as gc would
+    // an archived file that no longer parses still holds text a query must reach
+    const broken = `f_${'c'.repeat(26)}`;
+    fs.writeFileSync(path.join(e.layout.archive, `${broken}.md`), 'not a record: plover4 again\n');
+    await e.sync();
+
+    // same tokenizer as the index: case-folded, and either word is enough
+    const p = await previewForget(e, { query: 'PLOVER4 kestrel4' });
+    expect(p.seeds.map((x) => x.id)).toEqual([live, ...[archived, broken].sort()]);
+    expect(p.seeds.find((x) => x.id === archived)?.title).toBe('Archived note');
+    expect(p.cascaded.map((x) => x.id)).toEqual([citer]);
+    expect(exists(path.join(e.layout.archive, `${archived}.md`))).toBe(true); // a preview deletes nothing
+
+    const r = await e.forget({ query: 'PLOVER4 kestrel4', confirm: true });
+    expect([...r.deleted].sort()).toEqual([live, archived, broken].sort());
+    expect(r.cascaded).toEqual([citer]);
+    for (const id of [archived, broken]) expect(exists(path.join(e.layout.archive, `${id}.md`))).toBe(false);
+    expect(exists(path.join(e.layout.archive, `${kept}.md`))).toBe(true);
+    const roots = [cacheDir, path.join(wt, '.elmory'), path.join(e.layout.commonDir as string, 'elmory')];
+    expect(occurrences(roots, 'lover4')).toBe(0);
+  });
+
   it('previewForget lists the seeds and the cascade with titles and deletes nothing', async () => {
     const { e } = await setup();
     const a = (await e.note({ title: 'Deploy freeze', text: 'No deploys on Fridays.' })).id;

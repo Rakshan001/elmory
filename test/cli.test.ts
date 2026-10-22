@@ -229,14 +229,22 @@ describe('elmory cli', () => {
     expect((await run('recall', 'freeze')).code).toBe(4);
   }, 30000);
 
-  it('forget of an id that never existed reports it as unknown', async () => {
+  it('forget of only ids that never existed reports them as unknown and exits 1', async () => {
     const { run } = await setup();
     const typo = `f_${'a'.repeat(26)}`;
     const r = await run('forget', typo, '--json');
-    expect(r, r.err).toMatchObject({ code: 0 });
+    expect(r.code).toBe(1);
     expect(JSON.parse(r.out)).toMatchObject({ deleted: [], unknown: [typo] });
+    expect(r.err).toBe(`elmory forget: no such record here: ${typo}; nothing written`);
     const human = await run('forget', typo);
+    expect(human.code).toBe(1);
     expect(human.out).toContain(`unknown (no such record here; nothing written): ${typo}`);
+
+    // one real id among them: the forget happened, exit 0
+    const real = JSON.parse((await run('note', 'Real one', '--title', 'real', '--json')).out) as { id: string };
+    const mixed = await run('forget', real.id, typo, '--json');
+    expect(mixed, mixed.err).toMatchObject({ code: 0 });
+    expect(JSON.parse(mixed.out)).toMatchObject({ deleted: [real.id], unknown: [typo] });
   }, 30000);
 
   it('global flags work before the verb; help --json lists the verbs', async () => {
