@@ -1,0 +1,12 @@
+import { spawn } from 'node:child_process';
+import { rmSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
+for (const f of ['lock.db', 'lock.db-wal', 'lock.db-shm', 'cas.db', 'cas.db-wal', 'cas.db-shm']) rmSync(f, { force: true });
+const run = (...a) => new Promise(r => { const p = spawn(process.execPath, ['--no-warnings', 'lock_child.mjs', ...a], { stdio: ['ignore', 'pipe', 'inherit'] }); let o = ''; p.stdout.on('data', d => o += d); p.on('exit', () => { process.stdout.write(o); r(); }); });
+const wait = n => new Promise(r => setTimeout(r, n));
+console.log('-- A holds BEGIN IMMEDIATE 1500 ms; B (busy_timeout 5000) and C (busy_timeout 500) start 200 ms later');
+const a = run('A', 5000, 1500); await wait(200);
+await Promise.all([a, run('B', 5000, 0), run('C', 500, 0)]);
+console.log('-- CAS: 10 processes, same expected head h0');
+const c = new DatabaseSync('cas.db'); c.exec("PRAGMA journal_mode=WAL; CREATE TABLE chain(head TEXT); INSERT INTO chain VALUES('h0')"); c.close();
+await Promise.all(Array.from({ length: 10 }, (_, i) => run('P' + i, 5000, 0, 'cas')));
