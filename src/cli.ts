@@ -139,16 +139,25 @@ function writeInput(a: Args, quotes: { file: string; text: string }[] | undefine
 //
 // Record text comes from other people's commits. Before it reaches a terminal every C0/C1
 // control character (ESC, CSI, OSC, CR, BEL…) is shown as a visible `\x..` escape, so a record
-// cannot move the cursor, rewrite lines, set the title or reach the clipboard. One-line fields
-// (title, observer, key, reason…) escape newlines and tabs too, so they cannot forge a line.
+// cannot move the cursor, rewrite lines, set the title or reach the clipboard. Bidi controls
+// (embeddings, overrides, isolates, marks) and the Unicode line and paragraph separators are shown
+// as `\u....`, so a record cannot reorder what is displayed ("Trojan Source") or break a line
+// where the terminal or a log viewer does. One-line fields (title, observer, key, reason…) escape
+// newlines and tabs too, so they cannot forge a line.
 // `--json` output is left exactly as the api returned it.
 
 /** Any C0 or C1 control character, DEL included. */
 const CONTROL = /[\u0000-\u001f\u007f-\u009f]/;
-const CONTROLS = new RegExp(CONTROL.source, 'g');
+/** Bidi controls (U+061C, U+200E/F, U+202A–202E, U+2066–2069) and U+2028/2029. */
+const INVISIBLE = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069\u2028\u2029]/;
+const ESCAPED = new RegExp(`${CONTROL.source}|${INVISIBLE.source}`, 'g');
 
 function escapeControls(s: string, keep: string): string {
-  return s.replace(CONTROLS, (c) => (keep.includes(c) ? c : `\\x${c.charCodeAt(0).toString(16).padStart(2, '0')}`));
+  return s.replace(ESCAPED, (c) => {
+    if (keep.includes(c)) return c;
+    const code = c.charCodeAt(0);
+    return code <= 0xff ? `\\x${code.toString(16).padStart(2, '0')}` : `\\u${code.toString(16).padStart(4, '0')}`;
+  });
 }
 
 /** A one-line field: every control character escaped, newlines and tabs included. */

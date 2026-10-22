@@ -190,6 +190,24 @@ describe('elmory cli', () => {
     expect(got.served[0]?.title).toBe('evil \u001b[2Jclear title');
   }, 30000);
 
+  it('bidi controls and U+2028/2029 in record text are escaped in human output; --json keeps them', async () => {
+    const { wt, cacheDir, run } = await setup();
+    const title = 'admin \u202eexe.txt\u202c \u2066iso\u2069';
+    const observer = 'x\u2028injected: y\u2029z \u200f';
+    const id = await plant(wt, cacheDir, { type: 'memory/note', title, observer, body: 'plain body' });
+
+    const h = await run('history', id);
+    expect(h, h.err).toMatchObject({ code: 0 });
+    expect(h.out).not.toMatch(/[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069\u2028\u2029]/);
+    expect(h.out.split('\n')).toHaveLength(1);
+    expect(h.out).toContain('admin \\u202eexe.txt\\u202c \\u2066iso\\u2069');
+    expect(h.out).toContain('x\\u2028injected: y\\u2029z \\u200f');
+
+    const json = await run('history', id, '--json');
+    const got = JSON.parse(json.out) as { entries: { title: string; observer: string }[] };
+    expect(got.entries[0]).toMatchObject({ title, observer });
+  }, 30000);
+
   it('--title and --observer with control characters are refused', async () => {
     const { run } = await setup();
     const title = await run('note', 'body text', '--title', 't \u001b[2Jclear');
