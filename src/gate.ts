@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { Context } from './context.js';
 import type { Cache, RecordRow } from './cache.js';
-import { Deriver, type State } from './derive.js';
+import { Deriver, type State, approvedHere } from './derive.js';
 import type { AddedBy } from './git.js';
 import { checkQuoteAtWrite, containsSecret } from './quote.js';
 import {
@@ -237,6 +237,23 @@ function withoutText(row: RecordRow, tomb: 'local' | 'committed'): RecordRow {
   return { ...row, title: '', body: '', observer: '', key, tag: null, sources: [], paths: [], text: '' };
 }
 
+/**
+ * `Store.tombstoneIds` minus the ids under a committed tombstone alone that the trust ledger
+ * approves: the user reviewed that forget and refused it (I3), so the record is indexed with its
+ * text again. A local tombstone is never lifted. The ledger is read only when a committed-only
+ * tombstone exists.
+ */
+function textlessIds(store: Store): Map<string, 'local' | 'committed'> {
+  const ids = store.tombstoneIds();
+  let trust: Trust | null = null;
+  for (const [id, where] of [...ids]) {
+    if (where !== 'committed') continue;
+    trust ??= store.readTrust();
+    if (approvedHere(trust, id)) ids.delete(id);
+  }
+  return ids;
+}
+
 /** indexRecord, emptied of text when the id is tombstoned. */
 function indexFile(sr: StoredRecord, tombstoned: Tombstoned): RecordRow {
   const row = indexRecord(sr);
@@ -327,7 +344,7 @@ export function rowsAndStamps(cache: Cache): { rows: RecordRow[]; stamps: Stamps
 export function syncStore(store: Store, cache: Cache, force = false): void {
   const files = new Map<string, StoredRecord>();
   for (const sr of store.listRecords()) if (!files.has(sr.id)) files.set(sr.id, sr);
-  const tombstoned = store.tombstoneIds();
+  const tombstoned = textlessIds(store);
   const rows = new Map(cache.allRecords().map((r) => [r.id, r]));
   const old = readStamps(cache);
   const stamps: Stamps = new Map();
@@ -368,7 +385,7 @@ export function viewOf(store: Store, rows: readonly RecordRow[], stamps: Stamps 
   for (const area of ['facts', 'pending', 'local'] as const) {
     for (const id of store.ids(area)) if (!want.has(id)) want.set(id, area);
   }
-  const tombstoned = store.tombstoneIds();
+  const tombstoned = textlessIds(store);
   const byId = new Map(rows.map((r) => [r.id, r]));
   const out: RecordRow[] = [];
   for (const [id, area] of want) {
@@ -827,7 +844,7 @@ async function write(ctx: Context, type: RecordType, input: RememberInput): Prom
           path: path.join(ctx.layout[area], `${newId}.md`),
           text: serialize(record),
         };
-        const row = indexFile(stored, tombstones.length === 0 ? new Map() : ctx.store.tombstoneIds());
+        const row = indexFile(stored, tombstones.length === 0 ? new Map() : textlessIds(ctx.store));
         ctx.cache.upsertRecord(row);
         const stamps = readStamps(ctx.cache);
         stampInto(stamps, stored, Date.now());

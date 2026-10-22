@@ -982,6 +982,65 @@ describe('tombstoned record files (M3)', () => {
   });
 });
 
+describe('review of an untrusted forget (I3)', () => {
+  const hits = (e: Elmory, q: string) => e.cache.search(q, { limit: 10, offset: 0 }).map((h) => h.id);
+
+  /** A trusted published fact under an unsigned committed tombstone. */
+  async function underUntrustedForget(): Promise<{ e: Elmory; id: string }> {
+    const { e } = await setup();
+    const { id } = await e.remember({ ...fact('Okapi token check'), key: 'okapi.check', text: 'The okapicode check runs first.' });
+    e.publish([id]);
+    fs.mkdirSync(e.layout.tombstones, { recursive: true });
+    fs.writeFileSync(path.join(e.layout.tombstones, id), 'supersedes: []\n');
+    await e.sync();
+    expect(await (await e.deriver()).state(id)).toMatchObject({ state: 'candidate', reason: FORGET_UNTRUSTED });
+    expect(hits(e, 'okapicode')).toEqual([]);
+    return { e, id };
+  }
+
+  it('review lists it with its real title; the title is not cached', async () => {
+    const { e, id } = await underUntrustedForget();
+    expect(await e.review()).toEqual([{ id, reason: FORGET_UNTRUSTED, title: 'Okapi token check' }]);
+    expect(e.cache.getRecord(id)).toMatchObject({ title: '', body: '', text: '' });
+  });
+
+  it('approve refuses the forget: the record is indexed with its text, derived from its evidence, keeps its slot', async () => {
+    const { e, id } = await underUntrustedForget();
+    await e.approve(id);
+    expect(await e.review()).toEqual([]);
+    const d = await (await e.deriver()).state(id);
+    expect(d).toMatchObject({ state: 'active', trusted: true });
+    expect(e.cache.getRecord(id)?.title).toBe('Okapi token check');
+    expect(hits(e, 'okapicode')).toEqual([id]);
+    const r = await e.recall({ query: 'okapicode' });
+    expect(r.abstain === false && r.served.map((s) => [s.id, s.state])).toEqual([[id, 'active']]);
+    expect((await conflict(e.note({ title: 'Okapi', text: 'x', key: 'okapi.check' }))).heads).toEqual([id]);
+    // Evidence still counts: the quoted line goes away, the record no longer holds.
+    fs.writeFileSync(path.join(e.layout.worktree, 'src/auth.ts'), SOURCE.replace(LINE_A, '// gone'));
+    expect(['stale', 'suspect']).toContain((await (await e.deriver()).state(id)).state);
+  });
+
+  it('reject accepts the forget: the record is hidden and leaves review', async () => {
+    const { e, id } = await underUntrustedForget();
+    await e.reject(id);
+    expect(await e.review()).toEqual([]);
+    expect(await (await e.deriver()).state(id)).toMatchObject({ state: 'candidate', reason: 'rejected' });
+    expect((await e.recall({ query: 'okapicode' })).abstain).toBe(true);
+    expect(e.cache.getRecord(id)).toMatchObject({ title: '', text: '' });
+  });
+
+  it('a later reject withdraws an approval: the forget holds again, without text', async () => {
+    const { e, id } = await underUntrustedForget();
+    await e.approve(id);
+    await e.sync();
+    expect(hits(e, 'okapicode')).toEqual([id]);
+    await e.reject(id);
+    await e.sync();
+    expect(hits(e, 'okapicode')).toEqual([]);
+    expect((await (await e.deriver()).state(id)).reason).toBe('rejected');
+  });
+});
+
 describe('injection flag over paths (R5)', () => {
   it('a source path carrying an instruction is flagged, at index time and at write', async () => {
     const r: ElmoryRecord = {

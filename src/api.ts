@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { Cache, type RecordRow } from './cache.js';
 import type { Context, ElmoryEvent } from './context.js';
-import { Deriver } from './derive.js';
+import { Deriver, FORGET_UNTRUSTED } from './derive.js';
 import { Evidence } from './evidence.js';
 import { type Exec, defaultExec, gitCommonDir } from './exec.js';
 import * as gate from './gate.js';
@@ -393,7 +393,11 @@ export class Elmory implements Context {
     });
   }
 
-  /** Every candidate with its reason, except those rejected here (reject hides). */
+  /**
+   * Every candidate with its reason, except those rejected here (reject hides). A record withheld
+   * by an untrusted forget (reason FORGET_UNTRUSTED) is indexed without text, so its title is read
+   * from its file here, for the reviewer only, and never cached.
+   */
   async review(): Promise<{ id: string; reason: string; title: string }[]> {
     await this.sync();
     // One snapshot of this worktree's view: the Deriver and the loop see the same rows.
@@ -403,14 +407,21 @@ export class Elmory implements Context {
     for (const row of rows) {
       const s = await d.state(row.id);
       if (s.state !== 'candidate' || s.reason === 'rejected') continue;
-      out.push({ id: row.id, reason: s.reason ?? 'untrusted', title: row.title });
+      let title = row.title;
+      if (s.reason === FORGET_UNTRUSTED) {
+        const sr = this.store.readRecord(row.id);
+        title = sr === null ? '' : gate.indexRecord(sr).title;
+      }
+      out.push({ id: row.id, reason: s.reason ?? 'untrusted', title });
     }
     return out;
   }
 
   /**
    * Append `approved <id>` to the trust ledger. The record must be present in this worktree. The
-   * latest ledger line for an id wins, so approving a rejected record re-trusts it.
+   * latest ledger line for an id wins, so approving a rejected record re-trusts it. Approving a
+   * record withheld by an untrusted forget refuses that forget: the record is indexed with its
+   * text again and derived from its evidence, keeping its slot (`reject` accepts the forget).
    */
   async approve(id: string): Promise<void> {
     this.#trustLine('approved', id);

@@ -45,6 +45,11 @@ interface Base {
 type Problem = { state: 'stale' | 'suspect' | 'unknown'; reason: string };
 const SEVERITY: readonly Problem['state'][] = ['stale', 'suspect', 'unknown'];
 
+/** The ledger's latest word on `id` is `approved` (a later `rejected` drops it, see Store.readTrust). */
+export function approvedHere(trust: Trust, id: string): boolean {
+  return trust.approved.has(id) && !trust.rejected.has(id);
+}
+
 function push(map: Map<string, string[]>, key: string, value: string): void {
   const list = map.get(key);
   if (list) list.push(value);
@@ -60,7 +65,7 @@ export class Deriver {
   private readonly input: DeriveInput;
   /** ids named by a trusted tombstone */
   private readonly forgotten = new Set<string>();
-  /** ids named only by an untrusted tombstone */
+  /** ids named only by an untrusted tombstone, and not approved here (an approval refuses that forget) */
   private readonly forgetUntrusted = new Set<string>();
   /** One tombstone per id: the local copy when there is one, else the committed copy. */
   private readonly tombs: Tombstone[];
@@ -91,7 +96,12 @@ export class Deriver {
       if (prev === undefined || (prev.committed && !t.committed)) byId.set(t.id, t);
     }
     this.tombs = [...byId.values()];
-    for (const t of this.tombs) (this.tombstoneTrusted(t) ? this.forgotten : this.forgetUntrusted).add(t.id);
+    for (const t of this.tombs) {
+      if (this.tombstoneTrusted(t)) this.forgotten.add(t.id);
+      // An untrusted forget of a record the user approved here is refused (I3): the approval is
+      // the review §8 asks for, and the record keeps its evidence-based state.
+      else if (!approvedHere(input.trust, t.id)) this.forgetUntrusted.add(t.id);
+    }
 
     for (const id of input.records.keys()) this.nodes.add(id);
     for (const id of this.forgotten) this.nodes.add(id);
