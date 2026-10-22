@@ -124,17 +124,21 @@ export async function makeContext(opts: { now?: string } = {}): Promise<TestCont
         if (!known.has(sr.id)) cache.upsertRecord(indexInline(sr));
       }
       for (const id of known) if (!seen.has(id)) cache.deleteRecord(id);
+      return [];
     },
-    async deriver() {
+    async deriver(rows) {
       evidence.resetMemo();
       return new Deriver({
-        records: new Map(cache.allRecords().map((r) => [r.id, r])),
+        records: new Map((rows ?? cache.allRecords()).map((r) => [r.id, r])),
         tombstones: store.readTombstones(),
         trust: store.readTrust(),
         addedBy: await gitObj.addedBy('.elmory'),
         evidence: (row) => evidence.checkAll(row.sources),
       });
     },
+    fetchAddedBy: () => gitObj.addedBy('.elmory'),
+    // One worktree: gc's cross-worktree rule is tested through Elmory (test/gc-worktrees.test.ts).
+    peerDerivers: async () => [],
     emit: (e) => {
       events.push(e);
     },

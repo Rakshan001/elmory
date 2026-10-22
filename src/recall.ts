@@ -1,9 +1,10 @@
 // The read flows (spec §7.2–§7.4, §7.6): recall, about, history, verify and gc. Each is a function
 // of the Context; state is always derived for the asking worktree, never read back from the cache.
 
-import type { RecordRow } from './cache.js';
+import { CacheBusyError, type RecordRow } from './cache.js';
 import type { Context } from './context.js';
 import { type Derived, type Deriver, LABEL_NEWER_FAILS, LABEL_UNREVIEWED, type State, type TrustSource } from './derive.js';
+import { RefusedError } from './gate.js';
 import { RecordError, type RecordType } from './record.js';
 
 export const DEFAULT_BUDGET_TOKENS = 1500;
@@ -17,6 +18,11 @@ const GC_NOTE_DAYS = 180;
 /** Every state, in the order of the §4.6 table. */
 const STATES: readonly State[] = ['candidate', 'forgotten', 'superseded', 'conflict', 'stale', 'suspect', 'unknown', 'active'];
 const SERVED_BY_DEFAULT: readonly State[] = ['active', 'conflict'];
+/**
+ * What `include` may add (§4.6). `candidate` (untrusted, edited, secret, rejected) is seen only
+ * through review, and `forgotten` never: neither is one argument away from an agent.
+ */
+const INCLUDABLE: readonly State[] = ['active', 'conflict', 'superseded', 'stale', 'suspect', 'unknown'];
 
 export type Warning = '⚠ conflict' | '⚠ flagged' | '⚠ older value' | '⚠ unreviewed newer value';
 
@@ -24,7 +30,7 @@ export interface RecallOptions {
   query: string;
   /** default 1500 */
   budgetTokens?: number;
-  /** states served in addition to active and conflict */
+  /** states served in addition to active and conflict: superseded, stale, suspect, unknown */
   include?: State[];
 }
 
@@ -48,6 +54,8 @@ export interface RecallResult {
   served: Served[];
   abstain: false;
   tokensUsed: number;
+  /** e.g. 'index busy; results may be behind' */
+  warnings: string[];
 }
 
 /** reason: 'no records match' | 'N matches but none hold: <state counts>' (or none fit the budget); hints name ids and states. */
@@ -55,6 +63,7 @@ export interface Abstain {
   abstain: true;
   reason: string;
   hints: string[];
+  warnings: string[];
 }
 
 export interface HistoryEntry {
@@ -67,9 +76,16 @@ export interface HistoryEntry {
   forgotten: boolean;
 }
 
+export interface HistoryResult {
+  /** oldest first */
+  entries: HistoryEntry[];
+  warnings: string[];
+}
+
 export interface VerifyResult {
   changed: { id: string; from: State | null; to: State }[];
   states: Record<State, number>;
+  warnings: string[];
 }
 
 export interface GcResult {
@@ -77,6 +93,10 @@ export interface GcResult {
   archived: string[];
   /** records in the committed facts area that are due: reported, never moved (delete them in a commit) */
   committed: string[];
+  /** superseded or stale here, but not in another worktree of this repository: left in place */
+  staleHere: string[];
+  /** old notes gc cannot judge, e.g. reason 'no recall history' (no stamp, as after a rebuild) */
+  skipped: { id: string; reason: string }[];
   dryRun: boolean;
 }
 
@@ -137,6 +157,18 @@ async function stateOf(d: Deriver, id: string): Promise<Derived | null> {
   }
 }
 
+/** `include` checked against the allow-list; anything else is refused (I3). */
+function checkInclude(include: unknown): State[] {
+  if (include === undefined) return [];
+  if (!Array.isArray(include)) throw new RefusedError('include must be a list of states', 'include');
+  for (const s of include) {
+    if (!(INCLUDABLE as readonly unknown[]).includes(s)) {
+      throw new RefusedError(`include cannot name ${JSON.stringify(s)}: candidates are seen through review, forgotten records never`, 'include');
+    }
+  }
+  return include as State[];
+}
+
 function hintList(items: string[]): string[] {
   if (items.length <= MAX_HINTS) return items;
   return [...items.slice(0, MAX_HINTS), `… and ${items.length - MAX_HINTS} more`];
@@ -152,6 +184,7 @@ async function serve(
   batches: AsyncIterable<RecordRow[]> | Iterable<RecordRow[]>,
   include: readonly State[],
   budget: number,
+  warnings: string[],
 ): Promise<RecallResult | Abstain> {
   if (!Number.isFinite(budget) || budget < 0) throw new RangeError('budgetTokens must be a non-negative number');
   const keep = new Set<State>([...SERVED_BY_DEFAULT, ...include]);
@@ -186,14 +219,15 @@ async function serve(
   if (served.length > 0) {
     const now = ctx.now();
     for (const s of served) ctx.cache.setMeta(`recall:${s.id}`, now);
-    return { served, abstain: false, tokensUsed };
+    return { served, abstain: false, tokensUsed, warnings };
   }
-  if (matches === 0) return { abstain: true, reason: 'no records match', hints: [] };
+  if (matches === 0) return { abstain: true, reason: 'no records match', hints: [], warnings };
   if (overBudget !== null) {
     return {
       abstain: true,
       reason: `${matches} matches but none fit the budget of ${budget} tokens`,
       hints: [`${overBudget.id} is ${overBudget.state} and needs ${estimateTokens(overBudget)} tokens`],
+      warnings,
     };
   }
   const summary = STATES.filter((s) => counts[s] > 0)
@@ -203,18 +237,22 @@ async function serve(
     abstain: true,
     reason: `${matches} matches but none hold: ${summary}`,
     hints: hintList(held.map((h) => `${h.id} is ${h.state}${h.reason !== null ? ` (${h.reason})` : ''}`)),
+    warnings,
   };
 }
 
+function sameScore(a: number, b: number): boolean {
+  return Math.abs(b - a) <= 1e-9 * Math.abs(a);
+}
+
 /** Facts before notes among hits whose scores are equal; otherwise the search order stands. */
-function factsFirstOnTies(hits: { id: string; score: number }[], rows: Map<string, RecordRow>): string[] {
+export function factsFirstOnTies(hits: { id: string; score: number }[], rows: Map<string, RecordRow>): string[] {
   const out: string[] = [];
   let i = 0;
   while (i < hits.length) {
     const first = hits[i] as { score: number };
     let j = i + 1;
-    const eps = 1e-9 * Math.abs(first.score);
-    while (j < hits.length && Math.abs((hits[j] as { score: number }).score - first.score) <= eps) j++;
+    while (j < hits.length && sameScore(first.score, (hits[j] as { score: number }).score)) j++;
     const run = hits.slice(i, j).map((h) => h.id);
     const isFact = (id: string): boolean => rows.get(id)?.type === 'memory/fact';
     out.push(...run.filter(isFact), ...run.filter((id) => !isFact(id)));
@@ -229,29 +267,36 @@ function factsFirstOnTies(hits: { id: string; score: number }[], rows: Map<strin
  * serve, and an abstain must be able to say the matches were superseded.
  */
 export async function recall(ctx: Context, opts: RecallOptions): Promise<RecallResult | Abstain> {
-  await ctx.sync();
+  const include = checkInclude(opts.include);
+  const warnings = await ctx.sync();
   const d = await ctx.deriver();
   const cache = ctx.cache;
-  async function* pages(): AsyncGenerator<RecordRow[]> {
-    for (let offset = 0; ; offset += PAGE) {
-      const hits = cache.search(opts.query, { limit: PAGE, offset });
+  // The ordered id list is taken once (M4): a row another process indexes mid-request cannot
+  // shift a page boundary and serve a record twice.
+  const hits = cache.search(opts.query, { limit: Number.MAX_SAFE_INTEGER, offset: 0 });
+  function* pages(): Generator<RecordRow[]> {
+    for (let i = 0; i < hits.length; ) {
+      // A page never splits a run of equal scores, so facts-first holds across page boundaries.
+      let j = Math.min(i + PAGE, hits.length);
+      while (j < hits.length && sameScore((hits[j - 1] as { score: number }).score, (hits[j] as { score: number }).score)) j++;
+      const page = hits.slice(i, j);
       const rows = new Map<string, RecordRow>();
-      for (const h of hits) {
+      for (const h of page) {
         const row = cache.getRecord(h.id);
         if (row !== null) rows.set(h.id, row);
       }
-      yield factsFirstOnTies(hits, rows).flatMap((id) => rows.get(id) ?? []);
-      if (hits.length < PAGE) return;
+      yield factsFirstOnTies(page, rows).flatMap((id) => rows.get(id) ?? []);
+      i = j;
     }
   }
-  return serve(ctx, d, pages(), opts.include ?? [], opts.budgetTokens ?? DEFAULT_BUDGET_TOKENS);
+  return serve(ctx, d, pages(), include, opts.budgetTokens ?? DEFAULT_BUDGET_TOKENS, warnings);
 }
 
 /** Records quoting the path, or in the chain of the records with that key; then §7.2 steps 2–5. */
 export async function about(ctx: Context, pathOrKey: string): Promise<RecallResult | Abstain> {
-  await ctx.sync();
-  const d = await ctx.deriver();
+  const warnings = await ctx.sync();
   const rows = ctx.cache.allRecords();
+  const d = await ctx.deriver(rows);
   const byId = new Map(rows.map((r) => [r.id, r]));
   const target = normPath(pathOrKey);
   const ids = new Set<string>();
@@ -263,15 +308,15 @@ export async function about(ctx: Context, pathOrKey: string): Promise<RecallResu
   const ordered = [...ids]
     .map((id) => byId.get(id) as RecordRow)
     .sort((a, b) => Number(b.type === 'memory/fact') - Number(a.type === 'memory/fact') || (a.id < b.id ? -1 : 1));
-  return serve(ctx, d, [ordered], [], DEFAULT_BUDGET_TOKENS);
+  return serve(ctx, d, [ordered], [], DEFAULT_BUDGET_TOKENS, warnings);
 }
 
 /** The chain of an id or key, oldest root first (topological over supersedes; ties by id). */
-export async function history(ctx: Context, idOrKey: string): Promise<HistoryEntry[]> {
-  await ctx.sync();
+export async function history(ctx: Context, idOrKey: string): Promise<HistoryResult> {
+  const warnings = await ctx.sync();
   const d = await ctx.deriver();
   const chain = d.chainOf(idOrKey);
-  if (chain.length === 0) return [];
+  if (chain.length === 0) return { entries: [], warnings };
   const members = new Set(chain);
   const tombs = new Map<string, { supersedes: Set<string>; trusted: boolean }>();
   for (const t of ctx.store.readTombstones()) {
@@ -316,18 +361,22 @@ export async function history(ctx: Context, idOrKey: string): Promise<HistoryEnt
     remaining.delete(next);
   }
   order.push(...[...remaining].sort());
-  return order.map((id) => entries.get(id) as HistoryEntry);
+  return { entries: order.map((id) => entries.get(id) as HistoryEntry), warnings };
 }
 
-/** §7.4: derive every record (or those quoting one of `files`), report and emit state changes. */
+/**
+ * §7.4: derive every record (or those quoting one of `files`), report and emit state changes.
+ * The load is a full one: every record file is re-read, so a record edited in place is caught.
+ */
 export async function verify(ctx: Context, opts: { files?: string[] } = {}): Promise<VerifyResult> {
-  await ctx.sync();
-  const d = await ctx.deriver();
+  const warnings = await ctx.sync({ full: true });
+  const rows = ctx.cache.allRecords();
+  const d = await ctx.deriver(rows);
   const worktree = ctx.layout.worktree;
   const files = opts.files === undefined ? null : new Set(opts.files.map(normPath));
   const states = emptyCounts();
   const changed: VerifyResult['changed'] = [];
-  for (const row of ctx.cache.allRecords()) {
+  for (const row of rows) {
     if (files !== null && !row.paths.some((p) => files.has(p))) continue;
     const derived = await stateOf(d, row.id);
     if (derived === null) continue;
@@ -340,42 +389,71 @@ export async function verify(ctx: Context, opts: { files?: string[] } = {}): Pro
     changed.push({ id: row.id, from, to });
     ctx.emit({ type: 'memory.state', id: row.id, worktree, from, to });
   }
-  return { changed, states };
+  return { changed, states, warnings };
 }
 
 /**
  * §7.6: pending/local records that are superseded or stale and older than 90 days, and notes
  * older than 180 days not recalled in 180 days, move to archive (no tombstone). Committed facts
  * that are due are reported only. `recorded` is the age; `recall:<id>` meta is the last recall.
+ *
+ * pending/ and local/ are shared by every worktree, but superseded and stale depend on the
+ * worktree (§6.3): such a record is archived only when it is superseded or stale in every
+ * worktree of the repository; otherwise it is reported in `staleHere` and left in place. A note
+ * with no recall stamp (e.g. after a cache rebuild) is never archived for disuse: `skipped`.
  */
 export async function gc(ctx: Context, opts: { dryRun?: boolean; now?: string } = {}): Promise<GcResult> {
   const dryRun = opts.dryRun ?? false;
   const nowMs = Date.parse(opts.now ?? ctx.now());
   if (Number.isNaN(nowMs)) throw new RangeError('gc: now must be an ISO timestamp');
-  await ctx.sync();
-  const d = await ctx.deriver();
-  const olderThan = (iso: string | null, days: number): boolean => {
-    const t = iso === null ? NaN : Date.parse(iso);
+  // gc acts on what it sees: an index that could not be brought up to date is an error here.
+  if ((await ctx.sync()).length > 0) throw new CacheBusyError();
+  const rows = ctx.cache.allRecords();
+  const d = await ctx.deriver(rows);
+  const olderThan = (iso: string, days: number): boolean => {
+    const t = Date.parse(iso);
     return Number.isNaN(t) || nowMs - t > days * DAY_MS;
   };
+  const replacedOrStale = (s: Derived | null): boolean => s !== null && (s.state === 'superseded' || s.state === 'stale');
 
   const due: string[] = [];
   const committed: string[] = [];
-  for (const row of ctx.cache.allRecords()) {
+  const staleHere: string[] = [];
+  const skipped: GcResult['skipped'] = [];
+  const checkElsewhere: string[] = [];
+  for (const row of rows) {
     if (Number.isNaN(Date.parse(row.recorded))) continue;
     const derived = await stateOf(d, row.id);
     if (derived === null) continue;
-    const replaced = (derived.state === 'superseded' || derived.state === 'stale') && olderThan(row.recorded, GC_SUPERSEDED_DAYS);
-    const unused =
-      row.type === 'memory/note' &&
-      olderThan(row.recorded, GC_NOTE_DAYS) &&
-      olderThan(ctx.cache.getMeta(`recall:${row.id}`), GC_NOTE_DAYS);
+    const replaced = replacedOrStale(derived) && olderThan(row.recorded, GC_SUPERSEDED_DAYS);
+    let unused = false;
+    if (row.type === 'memory/note' && olderThan(row.recorded, GC_NOTE_DAYS)) {
+      const stamp = ctx.cache.getMeta(`recall:${row.id}`);
+      if (stamp !== null) unused = olderThan(stamp, GC_NOTE_DAYS);
+      else if (!replaced) skipped.push({ id: row.id, reason: 'no recall history' });
+    }
     if (!replaced && !unused) continue;
-    (row.area === 'facts' ? committed : due).push(row.id);
+    if (row.area === 'facts') committed.push(row.id);
+    else if (unused) due.push(row.id);
+    else checkElsewhere.push(row.id);
+  }
+  if (checkElsewhere.length > 0) {
+    const peers = await ctx.peerDerivers();
+    for (const id of checkElsewhere) {
+      let everywhere = true;
+      for (const p of peers) {
+        if (!replacedOrStale(await stateOf(p.deriver, id))) {
+          everywhere = false;
+          break;
+        }
+      }
+      (everywhere ? due : staleHere).push(id);
+    }
   }
   due.sort();
   committed.sort();
-  if (dryRun) return { archived: due, committed, dryRun };
+  staleHere.sort();
+  if (dryRun) return { archived: due, committed, staleHere, skipped, dryRun };
 
   const archived = ctx.cache.withWriteLock(() => {
     const moved: string[] = [];
@@ -392,10 +470,10 @@ export async function gc(ctx: Context, opts: { dryRun?: boolean; now?: string } 
     }
     return moved;
   });
-  return { archived, committed, dryRun };
+  return { archived, committed, staleHere, skipped, dryRun };
 }
 
-/** Bring one archived record back into pending and index it. */
+/** Bring one archived record back into the area it was archived from (local stays local) and index it. */
 export async function gcRestore(ctx: Context, id: string): Promise<void> {
   ctx.cache.withWriteLock(() => ctx.store.restore(id));
   await ctx.sync();

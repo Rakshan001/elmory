@@ -1,8 +1,8 @@
 // The Context every flow receives (Phase 4 plan); src/api.ts imports these types from here.
-import type { Cache } from './cache.js';
+import type { Cache, RecordRow } from './cache.js';
 import type { Deriver, State } from './derive.js';
 import type { Evidence } from './evidence.js';
-import type { Git } from './git.js';
+import type { AddedBy, Git } from './git.js';
 import type { Layout, Store } from './store.js';
 
 export interface Context {
@@ -15,13 +15,28 @@ export interface Context {
   observer: string;
   /** ISO UTC, injectable for tests */
   now(): string;
-  /** incremental load: store ids vs cache.knownIds(); index new files with indexRecord; delete rows whose file is gone */
-  sync(): Promise<void>;
   /**
-   * Deriver over cache.allRecords(), store.readTombstones(), store.readTrust(),
-   * git.addedBy('.elmory') (facts and tombstones; empty map without git), evidence bound to this worktree
+   * Incremental load: a no-op without the lock when nothing changed; otherwise index new files
+   * with indexRecord and delete rows whose file is gone, under the write lock. Never throws
+   * CacheBusyError: when the lock is busy it returns a warning and the cache stays as it was.
+   * `full` re-reads every record file even when nothing seems to have changed.
    */
-  deriver(): Promise<Deriver>;
+  sync(opts?: { full?: boolean }): Promise<string[]>;
+  /**
+   * Deriver over `rows` (default cache.allRecords()), store.readTombstones(), store.readTrust(),
+   * the addedBy map (empty without git), evidence bound to this worktree
+   */
+  deriver(rows?: readonly RecordRow[]): Promise<Deriver>;
+  /**
+   * git.addedBy('.elmory'), fetched now (never memoised), minus paths whose working-tree bytes
+   * differ from HEAD; an empty map without git.
+   */
+  fetchAddedBy(): Promise<Map<string, AddedBy>>;
+  /**
+   * A Deriver for every other worktree of this repository that exists on disk, over that
+   * worktree's own records (built without touching the cache rows); [] without git.
+   */
+  peerDerivers(): Promise<{ worktree: string; deriver: Deriver }[]>;
   emit(event: ElmoryEvent): void;
 }
 

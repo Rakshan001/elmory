@@ -1,9 +1,12 @@
 import { afterEach, describe, expect, it } from 'vitest';
+import type { RecordRow } from '../src/cache.js';
 import { LABEL_NEWER_FAILS, LABEL_UNREVIEWED } from '../src/derive.js';
+import { RefusedError } from '../src/gate.js';
 import {
   type Abstain,
   about,
   estimateTokens,
+  factsFirstOnTies,
   gc,
   gcRestore,
   history,
@@ -80,12 +83,12 @@ describe('recall', () => {
     const r = served(await recall(ctx, { query: 'algorithm' }));
     expect(r.served.map((s) => s.id)).toEqual([c]);
 
-    const h = await history(ctx, 'auth.algo');
+    const h = (await history(ctx, 'auth.algo')).entries;
     expect(h.map((e) => e.id)).toEqual([a, b, c]);
     expect(h.map((e) => e.state)).toEqual(['superseded', 'superseded', 'active']);
     expect(h[1]).toMatchObject({ title: 'Session algorithm v2', observer: 'agent:test', supersedes: [a], forgotten: false });
-    expect(await history(ctx, b)).toEqual(h);
-    expect(await history(ctx, 'no.such.key')).toEqual([]);
+    expect((await history(ctx, b)).entries).toEqual(h);
+    expect(await history(ctx, 'no.such.key')).toEqual({ entries: [], warnings: [] });
   });
 
   it('history orders by supersedes, not by id or time', async () => {
@@ -102,7 +105,7 @@ describe('recall', () => {
         }),
       );
     }
-    expect((await history(ctx, 'k')).map((e) => e.id)).toEqual(ids);
+    expect((await history(ctx, 'k')).entries.map((e) => e.id)).toEqual(ids);
   });
 
   it('history shows a forgotten member whose file is gone', async () => {
@@ -112,7 +115,7 @@ describe('recall', () => {
     ctx.store.writeTombstone(b, [a], 'local');
     ctx.store.unlink(b);
     await ctx.sync();
-    const h = await history(ctx, a);
+    const h = (await history(ctx, a)).entries;
     expect(h.map((e) => e.id)).toEqual([a, b]);
     expect(h[1]).toMatchObject({ id: b, state: 'forgotten', forgotten: true, supersedes: [a] });
   });
@@ -143,25 +146,51 @@ describe('recall', () => {
     expect(a.hints.join('\n')).toContain(id);
   });
 
-  it('facts rank before notes on equal score', async () => {
+  it('facts rank before notes on equal score (the reorder itself)', () => {
+    const row = (id: string, type: RecordRow['type']) => ({ id, type }) as RecordRow;
+    const rows = new Map([
+      ['n1', row('n1', 'memory/note')],
+      ['f1', row('f1', 'memory/fact')],
+      ['n2', row('n2', 'memory/note')],
+      ['f2', row('f2', 'memory/fact')],
+    ]);
+    const hits = [
+      { id: 'n1', score: 3 },
+      { id: 'f1', score: 3 },
+      { id: 'n2', score: 2 },
+      { id: 'f2', score: 1 },
+    ];
+    expect(factsFirstOnTies(hits, rows)).toEqual(['f1', 'n1', 'n2', 'f2']);
+  });
+
+  it('facts rank before notes on equal score (through recall)', async () => {
     const ctx = await makeContext();
     // bm25 counts every column's length, so the note carries three extra body tokens to match the
-    // fact's path tokens (src, auth, ts). Ids depend on the commit, so pairs are seeded until the
-    // search itself ranks the note first, which makes the reorder observable.
-    for (let i = 0; i < 12; i++) {
-      const word = `webhook${i}x`;
-      const body = `Every ${word} retries five times with backoff.`;
-      const note = seed(ctx, { type: 'memory/note', title: 'Retry policy', body: `${body} alpha beta gamma` });
-      const fact = seed(ctx, { type: 'memory/fact', title: 'Retry policy', body });
-      const hits = ctx.cache.search(word, { limit: 10, offset: 0 });
-      expect(hits).toHaveLength(2);
-      expect(hits[0]?.score).toBeCloseTo(hits[1]?.score ?? NaN, 12);
-      if (hits[0]?.id !== note) continue;
-      const r = served(await recall(ctx, { query: word }));
-      expect(r.served.map((s) => s.id)).toEqual([fact, note]);
-      return;
-    }
-    throw new Error('no seeded pair ranked the note first');
+    // fact's path tokens (src, auth, ts): the scores tie whatever order the search returns.
+    const body = 'Every webhook retries five times with backoff.';
+    const note = seed(ctx, { type: 'memory/note', title: 'Retry policy', body: `${body} alpha beta gamma` });
+    const fact = seed(ctx, { type: 'memory/fact', title: 'Retry policy', body });
+    const hits = ctx.cache.search('webhook', { limit: 10, offset: 0 });
+    expect(hits[0]?.score).toBeCloseTo(hits[1]?.score ?? NaN, 12);
+    const r = served(await recall(ctx, { query: 'webhook' }));
+    expect(r.served.map((s) => s.id)).toEqual([fact, note]);
+  });
+
+  it('paging takes the ordered id list once: a row added mid-recall is never served twice (M4)', async () => {
+    const ctx = await makeContext();
+    for (let i = 0; i < 60; i++) seed(ctx, { type: 'memory/note', title: `Retry rule ${String(i).padStart(2, '0')}`, body: 'retry backoff' });
+    const orig = ctx.cache.search.bind(ctx.cache);
+    let calls = 0;
+    ctx.cache.search = (q, o) => {
+      const res = orig(q, o);
+      if (calls++ === 0) seed(ctx, { type: 'memory/note', title: 'retry retry retry', body: 'retry retry backoff' });
+      return res;
+    };
+    const r = served(await recall(ctx, { query: 'retry', budgetTokens: 100000 }));
+    const ids = r.served.map((s) => s.id);
+    expect(calls).toBe(1);
+    expect(ids).toHaveLength(60);
+    expect(new Set(ids).size).toBe(60);
   });
 
   it('conflict is served with the warning', async () => {
@@ -205,7 +234,7 @@ describe('recall', () => {
 
   it('abstain reasons', async () => {
     const ctx = await makeContext();
-    expect(abstained(await recall(ctx, { query: 'anything' }))).toEqual({ abstain: true, reason: 'no records match', hints: [] });
+    expect(abstained(await recall(ctx, { query: 'anything' }))).toEqual({ abstain: true, reason: 'no records match', hints: [], warnings: [] });
 
     const suspect = seed(ctx, { title: 'Revoke takes a reason', body: 'revocation needs a reason', quotes: [LINE_REVOKE] });
     ctx.writeFile(FILE_TEXT.replace(LINE_REVOKE, 'export function revokeEverything(): void {'));
@@ -229,6 +258,22 @@ describe('recall', () => {
     expect((await recall(ctx, { query: 'revocation' })).abstain).toBe(true);
     const r = served(await recall(ctx, { query: 'revocation', include: ['suspect'] }));
     expect(r.served.map((s) => [s.id, s.state])).toEqual([[id, 'suspect']]);
+  });
+
+  it('include may not name candidate or forgotten (I3)', async () => {
+    const ctx = await makeContext();
+    seed(ctx, { type: 'memory/note', title: 'Pulled poison', body: 'poison text', trusted: false });
+    for (const include of [['candidate'], ['forgotten'], ['suspect', 'candidate'], 'candidate']) {
+      const err = await recall(ctx, { query: 'poison', include: include as never }).then(
+        () => null,
+        (x: unknown) => x,
+      );
+      expect(err).toBeInstanceOf(RefusedError);
+      expect((err as RefusedError).reason).toBe('include');
+    }
+    expect(abstained(await recall(ctx, { query: 'poison', include: ['superseded', 'stale', 'suspect', 'unknown'] })).reason).toContain(
+      'candidate',
+    );
   });
 
   it('candidates are never served by default', async () => {
@@ -296,7 +341,7 @@ describe('verify', () => {
 });
 
 describe('gc', () => {
-  it('gc archives an old superseded record and a stale note, keeps a young one, dryRun moves nothing, restore brings it back', async () => {
+  it('gc archives an old superseded record and an unused note, keeps a young one, skips a never-recalled note, dryRun moves nothing, restore brings it back', async () => {
     const ctx = await makeContext();
     const now = '2026-10-22T00:00:00.000Z';
     const old = seed(ctx, { key: 'k', title: 'old value', recorded: '2026-01-01T00:00:00.000Z' });
@@ -318,24 +363,26 @@ describe('gc', () => {
     await ctx.sync();
     expect(ctx.cache.getRecord(committedOld)?.area).toBe('facts');
 
-    const expected = [old, staleNote, oldRecall].sort();
+    // A note with no recall stamp at all is not judged unused (I7): it is reported as skipped.
+    const expected = [old, oldRecall].sort();
+    const skipped = [{ id: staleNote, reason: 'no recall history' }];
     const dry = await gc(ctx, { dryRun: true, now });
-    expect(dry).toEqual({ archived: expected, committed: [committedOld], dryRun: true });
+    expect(dry).toEqual({ archived: expected, committed: [committedOld], staleHere: [], skipped, dryRun: true });
     for (const id of expected) expect(ctx.store.readRecord(id)).not.toBeNull();
 
     const real = await gc(ctx, { now });
-    expect(real).toEqual({ archived: expected, committed: [committedOld], dryRun: false });
+    expect(real).toEqual({ archived: expected, committed: [committedOld], staleHere: [], skipped, dryRun: false });
     for (const id of expected) {
       expect(ctx.store.readRecord(id)).toBeNull();
       expect(ctx.cache.getRecord(id)).toBeNull();
     }
-    for (const id of [newer, youngSup, youngNote, recalledNote, committedOld]) expect(ctx.store.readRecord(id)).not.toBeNull();
-    expect((await history(ctx, 'k')).map((e) => e.id)).toEqual([newer]);
+    for (const id of [newer, youngSup, youngNote, recalledNote, committedOld, staleNote]) expect(ctx.store.readRecord(id)).not.toBeNull();
+    expect((await history(ctx, 'k')).entries.map((e) => e.id)).toEqual([newer]);
 
     await gcRestore(ctx, old);
     expect(ctx.store.readRecord(old)?.area).toBe('pending');
     expect(ctx.cache.getRecord(old)).not.toBeNull();
-    const h = await history(ctx, 'k');
+    const h = (await history(ctx, 'k')).entries;
     expect(h.map((e) => [e.id, e.state])).toEqual([
       [old, 'superseded'],
       [newer, 'active'],
