@@ -12,6 +12,7 @@
   "scripts": {
     "build": "tsc",
     "lint": "tsc --noEmit",
+    "pretest": "tsc",
     "test": "vitest run"
   },
   "repository": { "type": "git", "url": "git+https://github.com/Rakshan001/elmory.git" },
