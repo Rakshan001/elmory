@@ -6,8 +6,8 @@ export interface RenameResult {
 }
 
 /**
- * The most recent commit that added or modified a path. `signer` is that commit's key
- * fingerprint, set only when git reports a good signature (`%G?` is `G`).
+ * The most recent commit that changed a path (other than deleting it). `signer` is that
+ * commit's key fingerprint, set only when git reports a good signature (`%G?` is `G`).
  */
 export interface AddedBy {
   commit: string;
@@ -108,9 +108,11 @@ export class Git {
   }
 
   /**
-   * For each file added or modified under `relDir` in HEAD's history: the most recent such
-   * commit and its signer. One `git log` call; the first entry in log order wins, so a later
-   * unsigned edit replaces an earlier signed add.
+   * For each file present-after-change under `relDir` in HEAD's history (added, modified,
+   * renamed in, type-changed, including changes a merge makes against its first parent): the
+   * most recent such commit and its signer. One `git log` call; the first entry in log order
+   * wins, so a later unsigned edit or merge replaces an earlier signed add. A signed file that
+   * arrives through an unsigned merge commit is attributed to that merge (no signer).
    *
    * The format prints only git-computed fields, never author-controlled text, so nothing a
    * committer writes can contain the separators. Paths are C-quoted by git when they hold
@@ -126,7 +128,11 @@ export class Git {
       // %G? verifies the signature itself. --show-signature (or log.showSignature) would print
       // the verification text to stdout between records, where it would parse as file paths.
       '--no-show-signature',
-      '--diff-filter=AM',
+      // Every non-delete change, each path on its own (no rename pairing), and merge commits
+      // diffed against their first parent, so an edit made inside a merge is attributed to it.
+      '--no-renames',
+      '--diff-filter=d',
+      '--diff-merges=first-parent',
       '--name-only',
       '--format=%x1e%H%x1f%G?%x1f%GF%x1f%GK',
       '--',

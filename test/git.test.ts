@@ -73,6 +73,21 @@ async function sshSigning(wt: string): Promise<Exec> {
   return (file, args, opts) => defaultExec(file, ['-c', `gpg.ssh.allowedSignersFile=${allowed}`, ...args], opts);
 }
 
+/**
+ * On the current branch: merge an unsigned side branch with --no-ff --no-commit, rewrite the
+ * tombstone inside the merge ("evil merge"), and commit the merge unsigned. Returns its sha.
+ */
+async function evilMerge(wt: string, tombstone: string): Promise<string> {
+  const main = (await git(wt, 'branch', '--show-current')).trim();
+  await git(wt, 'checkout', '-q', '-b', 'side');
+  write(wt, 'side.ts', 'export const side = 1;\n');
+  await commitAll(wt, 'unsigned side work');
+  await git(wt, 'checkout', '-q', main);
+  await git(wt, 'merge', '-q', '--no-ff', '--no-commit', 'side');
+  write(wt, tombstone, 'supersedes: [f_victim]\n');
+  return commitAll(wt, 'merge side');
+}
+
 describe('Git', () => {
   it('head is null before the first commit and a sha after it', async () => {
     const wt = await repo();
@@ -191,6 +206,15 @@ describe('Git', () => {
     );
   });
 
+  it('an edit made inside a merge commit is attributed to the merge', async () => {
+    const wt = await repo();
+    write(wt, '.elmory/tombstones/f_x', 'supersedes: []\n');
+    await commitAll(wt, 'add tombstone');
+    const merge = await evilMerge(wt, '.elmory/tombstones/f_x');
+    const added = await new Git(defaultExec, wt).addedBy('.elmory/');
+    expect(added.get('.elmory/tombstones/f_x')).toEqual({ commit: merge, signer: null });
+  });
+
   it('addedBy is empty before the first commit', async () => {
     const wt = await repo();
     const g = new Git(defaultExec, wt);
@@ -282,5 +306,17 @@ describe('Git', () => {
     const forged = await commitAll(wt, 'unsigned edit', '--author=Mallory <m@x>');
     expect((await g.addedBy('.elmory/')).get('.elmory/tombstones/f_x')).toEqual({ commit: forged, signer: null });
     expect(forged).not.toBe(signed);
+  });
+
+  it.skipIf(!hasSshKeygen())('an unsigned evil merge after a signed add drops the signer', async () => {
+    const wt = await repo();
+    const withSigners = await sshSigning(wt);
+    write(wt, '.elmory/tombstones/f_x', 'supersedes: []\n');
+    await commitAll(wt, 'signed tombstone', '-S');
+    const g = new Git(withSigners, wt);
+    expect((await g.addedBy('.elmory/')).get('.elmory/tombstones/f_x')?.signer).toMatch(/^SHA256:/);
+
+    const merge = await evilMerge(wt, '.elmory/tombstones/f_x');
+    expect((await g.addedBy('.elmory/')).get('.elmory/tombstones/f_x')).toEqual({ commit: merge, signer: null });
   });
 });
