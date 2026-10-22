@@ -95,6 +95,8 @@ const SECRET_PATTERNS: RegExp[] = [
   /xox[baprs]-[A-Za-z0-9-]{10,}/,
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
   /AIza[0-9A-Za-z_-]{35}/,
+  /eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}/,
+  /(Bearer|Basic) [A-Za-z0-9._~+/=-]{20,}/,
 ];
 
 // A literal between matching ' " or ` quotes; backslash escapes are skipped over.
@@ -114,16 +116,15 @@ function entropy(s: string): number {
 }
 
 /**
- * A known key format anywhere in the text, or a string literal of ≥ 20 chars with no
- * whitespace and entropy > 4.0 bits/char.
+ * A known key format anywhere in the text, or a string literal containing a whitespace-free
+ * word of ≥ 20 chars with entropy > 4.0 bits/char.
  */
 export function containsSecret(text: string): boolean {
   if (SECRET_PATTERNS.some((re) => re.test(text))) return true;
   for (const m of text.matchAll(LITERAL_RE)) {
     const content = m[1] ?? m[2] ?? m[3] ?? '';
-    // A literal with whitespace is prose, not a key: exempt from the entropy rule only.
-    if (/\s/.test(content)) continue;
-    if ([...content].length >= 20 && entropy(content) > 4.0) return true;
+    // Checked per word: prose has no qualifying word, but a key embedded in a sentence does.
+    if (content.split(/\s+/).some((w) => [...w].length >= 20 && entropy(w) > 4.0)) return true;
   }
   return false;
 }

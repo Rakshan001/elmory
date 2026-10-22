@@ -130,10 +130,25 @@ describe('containsSecret', () => {
     expect(containsSecret('const k = "q8Zr2Lx9";')).toBe(false);
   });
 
-  it('exempts literals containing whitespace from the entropy rule only', () => {
+  it('applies the entropy rule per whitespace-separated word, so prose is exempt', () => {
     expect(containsSecret('const s = "The quick brown fox jumps over the lazy dog";')).toBe(false);
     expect(containsSecret('const k = "aZ3kQ9xL2mW7pR4tV8bN1cF6hJ0dG5sY";')).toBe(true);
     expect(containsSecret('const k = "token ghp_' + 'a'.repeat(36) + '";')).toBe(true);
+  });
+
+  it('flags a prose literal with an embedded 32-char high-entropy word', () => {
+    expect(containsSecret('log("token is aZ3kQ9xL2mW7pR4tV8bN1cF6hJ0dG5sY for now");')).toBe(true);
+  });
+
+  it('flags a JWT', () => {
+    const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U';
+    expect(containsSecret(`headers.set(auth, ${jwt});`)).toBe(true);
+  });
+
+  it('flags a Bearer or Basic credential', () => {
+    expect(containsSecret('Authorization: Bearer abcdefghijklmnopqrstuvwx')).toBe(true);
+    expect(containsSecret('Authorization: Basic dXNlcm5hbWU6cGFzc3dvcmQxMjM=')).toBe(true);
+    expect(containsSecret('const scheme = Bearer;')).toBe(false);
   });
 
   it('does not flag apiKey: process.env.STRIPE_API_KEY,', () => {
