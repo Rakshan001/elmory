@@ -136,9 +136,10 @@ function encodedPathSegment(paths: readonly string[]): string | null {
     for (const whole of p.split(/[/\\.]/)) {
       if (whole.length < ENCODED_SEGMENT_MIN) continue;
       if (/=$/.test(whole) || whole.includes('+')) return whole;
-      // A timestamped migration name (`20240101123045_AddUserTable2FA_Columns`) is not base64.
-      const seg = whole;
-      if (/^[0-9]+_/.test(seg)) continue;
+      // A migration timestamp (`20240101123045_AddUserTable2FA_Columns`) is not part of a payload:
+      // the mix is judged on the rest of the segment.
+      const seg = whole.replace(/^\d{8,14}_/, '');
+      if (seg.length < ENCODED_SEGMENT_MIN) continue;
       const cls = (c: string): number => (/[0-9]/.test(c) ? 0 : /[A-Z]/.test(c) ? 1 : /[a-z]/.test(c) ? 2 : 3);
       const counts = [0, 0, 0, 0];
       let changes = 0;
