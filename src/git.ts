@@ -140,13 +140,16 @@ export class Git {
    * clean merge just carries over from one side is not a touch, so it keeps the branch commit
    * that made the change, and its signer.
    *
-   * Replay: the signer is kept only while the signed write is still the last word on the path in
-   * HEAD's history. If any commit descending from it in that history touched the path again
-   * (changed it, or deleted it), HEAD can hold those bytes only because some later merge or
-   * commit brought them back, and nobody signed that: `signer` is null. This covers a merge that
-   * resolves to stale signed bytes, `merge -s ours` over a deletion, and a reverted forget
-   * re-added on an old branch. A concurrent change on a branch that does not descend from the
-   * signed commit (the merge chose the signed side) does not drop it.
+   * Replay: the signer is kept only while the signed bytes are the path's bytes in every commit
+   * of HEAD's history that descends from the signed commit. If any such commit left the path with
+   * other bytes or none (an edit, a delete, or a merge that adopted another side's version: a
+   * merge whose result differs from at least one parent), HEAD can hold the signed bytes only
+   * because some later merge or commit brought them back, and nobody signed that: `signer` is
+   * null. This covers a merge that resolves to stale signed bytes, `merge -s ours` over a
+   * deletion, a reverted forget re-added on an old branch, and a merge that adopts another
+   * version followed by one that adopts the signed bytes again. A change on a branch that does
+   * not descend from the signed commit, discarded by a merge that kept the signed bytes, does not
+   * drop it.
    *
    * The log walks the full history (`--full-history`: no side of a merge is pruned, so a deletion
    * on the side a merge discarded is still seen) with parents rewritten to the nearest listed
@@ -199,9 +202,8 @@ export class Git {
     let ancestryComplete = true;
     // Listed commit → its listed parents (rewritten by --parents).
     const parentsOf = new Map<string, string[]>();
-    // Per path still unattributed: the commits that touched it so far without producing HEAD's
-    // bytes. Topological order lists them before (as descendants of, or concurrently with) the
-    // commit that is credited later.
+    // Per path still unattributed: the commits seen so far that left it with other bytes than
+    // HEAD's. Topological order lists every descendant of the commit credited later among them.
     const newer = new Map<string, string[]>();
     // Per (merge, path): how many of the merge's per-parent diffs list the path.
     const mergeSeen = new Map<string, number>();
@@ -226,22 +228,26 @@ export class Git {
       if (file === undefined) break;
       const headBlob = headBlobs.get(file);
       if (headBlob === undefined || result.has(file)) continue;
+      const change = RAW_CHANGE.exec(token);
+      if (change === null || change[2] === 'D' || change[1] !== headBlob) {
+        // The commit left the path with other bytes than HEAD's (or none). A merge counts as soon
+        // as it differs from ONE parent: adopting another side's version replaces the bytes on
+        // this line of history just as an edit does. (All of a merge's lines carry its own blob.)
+        const list = newer.get(file) ?? [];
+        if (list[list.length - 1] !== commit) list.push(commit);
+        newer.set(file, list);
+        continue;
+      }
       if (parentCount > 1) {
-        // Merge records for one commit are consecutive and come before its parents, so
-        // recording the touch when the last parent's diff lists the path keeps log order.
+        // Credit needs the merge to differ from EVERY parent. Merge records for one commit are
+        // consecutive and come before its parents, so crediting when the last parent's diff lists
+        // the path keeps log order.
         const key = `${commit}\0${file}`;
         const seen = (mergeSeen.get(key) ?? 0) + 1;
         mergeSeen.set(key, seen);
         if (seen < parentCount) continue;
       }
-      const change = RAW_CHANGE.exec(token);
-      if (change !== null && change[2] !== 'D' && change[1] === headBlob) {
-        result.set(file, { commit, signer });
-      } else {
-        const list = newer.get(file) ?? [];
-        list.push(commit);
-        newer.set(file, list);
-      }
+      result.set(file, { commit, signer });
     }
 
     for (const [file, entry] of result) {

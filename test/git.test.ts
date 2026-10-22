@@ -600,6 +600,39 @@ describe('Git', () => {
     expect(onMain?.signer).toBeNull();
   });
 
+  it.skipIf(!hasSshKeygen())('a merge that adopts the other side, then one that adopts the signed bytes again, has no signer', async () => {
+    const wt = await repo();
+    const withSigners = await sshSigning(wt);
+    const tomb = '.elmory/tombstones/f_x';
+    write(wt, 'base.txt', 'base\n');
+    await commitAll(wt, 'base');
+    const main = (await git(wt, 'branch', '--show-current')).trim();
+    // B forks before S and writes other bytes at the path
+    await git(wt, 'checkout', '-q', '-b', 'b');
+    write(wt, tomb, 'supersedes: []\n');
+    await commitAll(wt, 'other bytes', '--author=Bob <b@x>');
+    await git(wt, 'checkout', '-q', main);
+    write(wt, tomb, 'supersedes: [f_victim]\n');
+    const s = await commitAll(wt, 'signed tombstone', '-S');
+    // C forks at S and still carries S's bytes
+    await git(wt, 'checkout', '-q', '-b', 'c');
+    write(wt, 'c.txt', 'c work\n');
+    await commitAll(wt, 'unrelated work on c');
+    await git(wt, 'checkout', '-q', main);
+    const g = new Git(withSigners, wt);
+    // main adopts B's version: S's bytes are gone from main's line
+    expect((await defaultExec('git', ['merge', '-q', '--no-ff', '--no-commit', 'b'], { cwd: wt })).code).not.toBe(0);
+    await git(wt, 'checkout', '--theirs', '--', tomb);
+    await commitAll(wt, 'merge b, take its tombstone');
+    expect((await g.addedBy('.elmory/')).get(tomb)?.signer).toBeNull();
+    // a later merge adopts C's copy of S's bytes, without itself editing the path
+    await git(wt, 'merge', '-q', '--no-ff', '--no-commit', 'c');
+    await git(wt, 'checkout', 'c', '--', tomb);
+    await commitAll(wt, 'merge c, take its tombstone');
+    expect(fs.readFileSync(path.join(wt, tomb), 'utf8')).toBe('supersedes: [f_victim]\n');
+    expect((await g.addedBy('.elmory/')).get(tomb)).toEqual({ commit: s, signer: null });
+  });
+
   it.skipIf(!hasSshKeygen())('a signed tombstone carried by clean merges on both sides keeps its signer', async () => {
     const wt = await repo();
     const withSigners = await sshSigning(wt);
