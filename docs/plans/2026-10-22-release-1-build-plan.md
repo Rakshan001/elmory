@@ -48,7 +48,7 @@ Out of this plan, by ruling (see below): Phase 0 (A/B harness and 90-day replay)
 
 ## Review focus (whole release)
 
-1. A record file edited by hand (any byte change) must become `candidate: edited`, never served.
+1. A record file edited by hand (any change to its canonical form, §4.1) must become `candidate: edited`, never served.
 2. A quote that appears twice in a file must be refused at write, and a quote that appears
    twice after a later edit must be `suspect`, not `active`.
 3. A pulled record from an unsigned commit must never be served until approved, even when it
