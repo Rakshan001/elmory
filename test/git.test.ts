@@ -109,6 +109,76 @@ async function cleanMerge(
   return { sideAdd, mainAdd, merge };
 }
 
+/** Commit everything with both author and committer date set to `date` (committer controls both). */
+async function commitAt(wt: string, date: string, message: string, ...extra: string[]): Promise<string> {
+  await git(wt, 'add', '-A');
+  execFileSync('git', ['commit', '-q', '--no-verify', '-m', message, ...extra], {
+    cwd: wt,
+    stdio: 'ignore',
+    env: { ...process.env, GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date },
+  });
+  return (await git(wt, 'rev-parse', 'HEAD')).trim();
+}
+
+/**
+ * The reviewer's C1 reproduction. Branch `evil` gets an unsigned commit A, backdated to 2020,
+ * that adds the tombstone with `supersedes: [f_victim]`. `main` gets commit S (signed when asked)
+ * that adds the same path with `supersedes: []`, plus another file so the merge differs from
+ * both parents under .elmory/ and both sides are walked. `evil` then merges `main`, resolves the
+ * conflict to `keep`'s version, and commits the merge unsigned. Log order is merge, S, A.
+ */
+async function sidedMerge(
+  wt: string,
+  keep: 'ours' | 'theirs',
+  signMain: boolean,
+): Promise<{ a: string; s: string; merge: string; path: string }> {
+  const tomb = '.elmory/tombstones/f_x';
+  await commitAt(wt, '2019-01-01T00:00:00Z', 'base', '--allow-empty');
+  const main = (await git(wt, 'branch', '--show-current')).trim();
+  await git(wt, 'checkout', '-q', '-b', 'evil');
+  write(wt, tomb, 'supersedes: [f_victim]\n');
+  const a = await commitAt(wt, '2020-01-01T00:00:00Z', 'mallory tombstone', '--author=Mallory <m@x>');
+  await git(wt, 'checkout', '-q', main);
+  write(wt, tomb, 'supersedes: []\n');
+  write(wt, '.elmory/facts/f_main.md', 'main\n');
+  const s = await commitAt(wt, '2025-01-01T00:00:00Z', 'signed tombstone', ...(signMain ? ['-S'] : []));
+  await git(wt, 'checkout', '-q', 'evil');
+  const merging = await defaultExec('git', ['merge', '-q', '--no-ff', '--no-commit', main], { cwd: wt });
+  expect(merging.code).not.toBe(0); // add/add conflict on the tombstone
+  await git(wt, 'checkout', `--${keep}`, '--', tomb);
+  const merge = await commitAt(wt, '2025-02-01T00:00:00Z', 'merge main');
+  // The order the old code trusted: S is listed before A.
+  const order = (await git(wt, 'log', '--format=%H')).trim().split('\n');
+  expect(order.indexOf(s)).toBeLessThan(order.indexOf(a));
+  return { a, s, merge, path: tomb };
+}
+
+/**
+ * Rollback along one line of history: signed S0 writes the tombstone, U replaces it, and on a
+ * branch off U, Mallory restores S0's exact bytes in an unsigned commit backdated before S0.
+ * `main` adds another file and is merged in cleanly. By committer date S0 is listed before
+ * Mallory's commit even though Mallory's commit is S0's descendant.
+ */
+async function rollbackMerge(wt: string, signS0: boolean): Promise<{ s0: string; restore: string }> {
+  const tomb = '.elmory/tombstones/f_x';
+  write(wt, tomb, 'supersedes: [f_victim]\n');
+  const s0 = await commitAt(wt, '2025-01-01T00:00:00Z', 'signed tombstone', ...(signS0 ? ['-S'] : []));
+  write(wt, tomb, 'supersedes: []\n');
+  await commitAt(wt, '2025-06-01T00:00:00Z', 'lift tombstone');
+  const main = (await git(wt, 'branch', '--show-current')).trim();
+  await git(wt, 'checkout', '-q', '-b', 'evil');
+  write(wt, tomb, 'supersedes: [f_victim]\n');
+  const restore = await commitAt(wt, '2020-01-01T00:00:00Z', 'restore', '--author=Mallory <m@x>');
+  await git(wt, 'checkout', '-q', main);
+  write(wt, '.elmory/facts/f_main.md', 'main\n');
+  await commitAt(wt, '2025-07-01T00:00:00Z', 'main adds fact');
+  await git(wt, 'checkout', '-q', 'evil');
+  await git(wt, 'merge', '-q', '--no-ff', '--no-verify', '-m', 'merge main', main);
+  const order = (await git(wt, 'log', '--format=%H', '--', '.elmory/')).trim().split('\n');
+  expect(order.indexOf(s0)).toBeLessThan(order.indexOf(restore));
+  return { s0, restore };
+}
+
 describe('Git', () => {
   it('head is null before the first commit and a sha after it', async () => {
     const wt = await repo();
@@ -249,6 +319,40 @@ describe('Git', () => {
     expect([sideAdd, mainAdd]).not.toContain(merge);
   });
 
+  it("merge that keeps one side's version attributes to that side, not to log order", async () => {
+    const wt = await repo();
+    const { a, s, merge, path: tomb } = await sidedMerge(wt, 'ours', false);
+    const added = await new Git(defaultExec, wt).addedBy('.elmory/');
+    expect(added.get(tomb)).toEqual({ commit: a, signer: null });
+    expect([s, merge]).not.toContain(added.get(tomb)?.commit);
+    expect(added.get('.elmory/facts/f_main.md')).toEqual({ commit: s, signer: null });
+  });
+
+  it('merge that keeps the other side attributes to that side', async () => {
+    const wt = await repo();
+    const { s, path: tomb } = await sidedMerge(wt, 'theirs', false);
+    const added = await new Git(defaultExec, wt).addedBy('.elmory/');
+    expect(added.get(tomb)).toEqual({ commit: s, signer: null });
+  });
+
+  it("restoring an older version is attributed to the restore, not the older version's commit", async () => {
+    const wt = await repo();
+    const { restore } = await rollbackMerge(wt, false);
+    const added = await new Git(defaultExec, wt).addedBy('.elmory/');
+    expect(added.get('.elmory/tombstones/f_x')).toEqual({ commit: restore, signer: null });
+  });
+
+  it('a path no longer in HEAD is absent', async () => {
+    const wt = await repo();
+    write(wt, '.elmory/facts/f_gone.md', 'g\n');
+    write(wt, '.elmory/facts/f_kept.md', 'k\n');
+    const add = await commitAll(wt, 'add');
+    await git(wt, 'rm', '-q', '.elmory/facts/f_gone.md');
+    await commitAll(wt, 'delete');
+    const added = await new Git(defaultExec, wt).addedBy('.elmory/');
+    expect(added).toEqual(new Map([['.elmory/facts/f_kept.md', { commit: add, signer: null }]]));
+  });
+
   it('addedBy is empty before the first commit', async () => {
     const wt = await repo();
     const g = new Git(defaultExec, wt);
@@ -363,5 +467,31 @@ describe('Git', () => {
 
     const merge = await evilMerge(wt, '.elmory/tombstones/f_x');
     expect((await g.addedBy('.elmory/')).get('.elmory/tombstones/f_x')).toEqual({ commit: merge, signer: null });
+  });
+
+  it.skipIf(!hasSshKeygen())("an unsigned merge that keeps the unsigned side's version has no signer", async () => {
+    const wt = await repo();
+    const withSigners = await sshSigning(wt);
+    const { a, path: tomb } = await sidedMerge(wt, 'ours', true);
+    const added = await new Git(withSigners, wt).addedBy('.elmory/');
+    expect(added.get(tomb)).toEqual({ commit: a, signer: null });
+    expect(added.get('.elmory/facts/f_main.md')?.signer).toMatch(/^SHA256:/);
+  });
+
+  it.skipIf(!hasSshKeygen())("an unsigned merge that keeps the signed side's version keeps its signer", async () => {
+    const wt = await repo();
+    const withSigners = await sshSigning(wt);
+    const { s, path: tomb } = await sidedMerge(wt, 'theirs', true);
+    const t = (await new Git(withSigners, wt).addedBy('.elmory/')).get(tomb);
+    expect(t?.commit).toBe(s);
+    expect(t?.signer).toMatch(/^SHA256:/);
+  });
+
+  it.skipIf(!hasSshKeygen())('an unsigned rollback to signed bytes has no signer', async () => {
+    const wt = await repo();
+    const withSigners = await sshSigning(wt);
+    const { restore } = await rollbackMerge(wt, true);
+    const added = await new Git(withSigners, wt).addedBy('.elmory/');
+    expect(added.get('.elmory/tombstones/f_x')).toEqual({ commit: restore, signer: null });
   });
 });
