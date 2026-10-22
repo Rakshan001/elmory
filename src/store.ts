@@ -87,10 +87,35 @@ const TOMBSTONE_BODY = /^supersedes: \[([^\]\r\n]*)\]\s*$/;
 const errno = (e: unknown): string | undefined => (e as NodeJS.ErrnoException | null)?.code;
 
 function isMissing(e: unknown): boolean {
-  return errno(e) === 'ENOENT';
+  const code = errno(e);
+  return code === 'ENOENT' || code === 'ENOTDIR';
 }
 
+type EntryKind = 'missing' | 'file' | 'dir' | 'symlink' | 'other';
+
+/** What is at `p`, without following a symlink. */
+function kindOf(p: string): EntryKind {
+  let st: fs.Stats;
+  try {
+    st = fs.lstatSync(p);
+  } catch (e) {
+    if (isMissing(e)) return 'missing';
+    throw e;
+  }
+  if (st.isSymbolicLink()) return 'symlink';
+  if (st.isFile()) return 'file';
+  if (st.isDirectory()) return 'dir';
+  return 'other';
+}
+
+/** Throw when an area directory is a symlink: nothing is read or written through one. */
+function refuseSymlinkDir(dir: string): void {
+  if (kindOf(dir) === 'symlink') throw new RecordError(`refusing symlinked directory: ${dir}`, 'symlink');
+}
+
+/** Names in `dir`; empty when it is missing or is not a real directory (e.g. a symlink). */
 function readdirOrEmpty(dir: string): string[] {
+  if (kindOf(dir) !== 'dir') return [];
   try {
     return fs.readdirSync(dir);
   } catch (e) {
@@ -99,12 +124,25 @@ function readdirOrEmpty(dir: string): string[] {
   }
 }
 
-function readOrNull(file: string): string | null {
+// O_NOFOLLOW closes the gap between the lstat check and the open where the platform has it.
+const O_NOFOLLOW = fs.constants.O_NOFOLLOW ?? 0;
+
+/** Text of a regular file; null when missing, a symlink, or not a regular file. */
+function readRegular(file: string): string | null {
+  if (kindOf(file) !== 'file') return null;
+  let fd: number;
   try {
-    return fs.readFileSync(file, 'utf8');
+    fd = fs.openSync(file, fs.constants.O_RDONLY | O_NOFOLLOW);
   } catch (e) {
-    if (isMissing(e)) return null;
+    const code = errno(e);
+    if (isMissing(e) || code === 'ELOOP' || code === 'EMLINK') return null;
     throw e;
+  }
+  try {
+    if (!fs.fstatSync(fd).isFile()) return null;
+    return fs.readFileSync(fd, 'utf8');
+  } finally {
+    fs.closeSync(fd);
   }
 }
 
@@ -129,6 +167,7 @@ function fsyncDir(dir: string): void {
 
 /** temp → fsync → rename → fsync dir. The temp file is removed on any failure. */
 function atomicWrite(dir: string, id: string, name: string, data: string | Uint8Array): void {
+  refuseSymlinkDir(dir);
   fs.mkdirSync(dir, { recursive: true });
   const tmp = path.join(dir, `.tmp-${id}-${process.pid}-${randomBytes(6).toString('hex')}`);
   let fd: number | undefined;
@@ -159,12 +198,15 @@ function atomicWrite(dir: string, id: string, name: string, data: string | Uint8
 
 /** Rename, falling back to copy + fsync + unlink across filesystems (EXDEV). */
 function moveFile(from: string, toDir: string, id: string, name: string): void {
+  refuseSymlinkDir(toDir);
   fs.mkdirSync(toDir, { recursive: true });
   try {
     fs.renameSync(from, path.join(toDir, name));
   } catch (e) {
     if (errno(e) !== 'EXDEV') throw e;
-    atomicWrite(toDir, id, name, fs.readFileSync(from));
+    const data = readRegular(from);
+    if (data === null) throw new RecordError(`not a regular record file: ${from}`, 'symlink');
+    atomicWrite(toDir, id, name, data);
     fs.unlinkSync(from);
   }
   fsyncDir(toDir);
@@ -175,12 +217,23 @@ function assertId(id: string): void {
   if (!isRecordId(id)) throw new RecordError(`not a record id: ${id}`, 'id');
 }
 
-/** Owns every file write under the areas of spec §5. Records are immutable once written. */
+/**
+ * Owns every file write under the areas of spec §5. Records are immutable once written.
+ * Symlinks are never followed: a symlinked area directory, record file or tombstone file is
+ * skipped on read and refused on write or move.
+ */
 export class Store {
   constructor(readonly layout: Layout) {}
 
   private fileOf(area: Area, id: string): string {
     return path.join(this.layout[area], `${id}.md`);
+  }
+
+  /** The record file of `id` in `area` when it is a regular file in a real directory. */
+  private regularRecord(area: Area, id: string): string | null {
+    if (kindOf(this.layout[area]) !== 'dir') return null;
+    const file = this.fileOf(area, id);
+    return kindOf(file) === 'file' ? file : null;
   }
 
   /** mkdir -p every area (idempotent). */
@@ -197,7 +250,10 @@ export class Store {
     if (problems.length > 0) throw new RecordError(`record fails lint: ${problems.join('; ')}`, 'lint');
     const text = serialize(r);
     const id = recordId(r);
-    if (fs.existsSync(this.fileOf(area, id))) return id;
+    refuseSymlinkDir(this.layout[area]);
+    const existing = kindOf(this.fileOf(area, id));
+    if (existing === 'file') return id;
+    if (existing !== 'missing') throw new RecordError(`refusing non-regular entry for ${id} in ${area}`, 'symlink');
     atomicWrite(this.layout[area], id, `${id}.md`, text);
     return id;
   }
@@ -206,14 +262,15 @@ export class Store {
   readRecord(id: string): StoredRecord | null {
     if (!isRecordId(id)) return null;
     for (const area of VISIBLE) {
-      const file = this.fileOf(area, id);
-      const text = readOrNull(file);
+      const file = this.regularRecord(area, id);
+      if (file === null) continue;
+      const text = readRegular(file);
       if (text !== null) return { id, area, path: file, text };
     }
     return null;
   }
 
-  /** Every record file in facts, pending and local; text exactly as on disk. */
+  /** Every regular record file in facts, pending and local; text exactly as on disk. */
   listRecords(): StoredRecord[] {
     const out: StoredRecord[] = [];
     for (const area of VISIBLE) {
@@ -221,7 +278,7 @@ export class Store {
         const m = RECORD_FILE.exec(name);
         if (!m?.[1]) continue;
         const file = path.join(this.layout[area], name);
-        const text = readOrNull(file);
+        const text = readRegular(file);
         if (text !== null) out.push({ id: m[1], area, path: file, text });
       }
     }
@@ -245,7 +302,12 @@ export class Store {
 
   readTrust(): Trust {
     const trust: Trust = { written: new Set(), approved: new Set(), rejected: new Set(), signers: new Set() };
-    const text = readOrNull(this.layout.trust) ?? '';
+    let text = '';
+    try {
+      text = fs.readFileSync(this.layout.trust, 'utf8');
+    } catch (e) {
+      if (!isMissing(e)) throw e;
+    }
     for (const raw of text.split('\n')) {
       const line = raw.replace(/\r$/, '');
       const sp = line.indexOf(' ');
@@ -286,7 +348,7 @@ export class Store {
     for (const { dir, committed } of dirs) {
       for (const name of readdirOrEmpty(dir).sort()) {
         if (!isRecordId(name)) continue;
-        const text = readOrNull(path.join(dir, name));
+        const text = readRegular(path.join(dir, name));
         if (text === null) continue;
         const m = TOMBSTONE_BODY.exec(text);
         const supersedes = (m?.[1] ?? '')
@@ -310,8 +372,8 @@ export class Store {
     const moved: string[] = [];
     for (const id of wanted) {
       if (!isRecordId(id)) continue;
-      const from = this.fileOf('pending', id);
-      if (!fs.existsSync(from)) continue;
+      const from = this.regularRecord('pending', id);
+      if (from === null) continue;
       this.moveRecord(from, 'facts', id);
       moved.push(id);
     }
@@ -323,8 +385,8 @@ export class Store {
     assertId(id);
     let found = false;
     for (const area of ['pending', 'local'] as const) {
-      const from = this.fileOf(area, id);
-      if (!fs.existsSync(from)) continue;
+      const from = this.regularRecord(area, id);
+      if (from === null) continue;
       this.moveRecord(from, 'archive', id);
       found = true;
     }
@@ -334,18 +396,20 @@ export class Store {
   /** archive → pending. Throws when the id is not archived. */
   restore(id: string): void {
     assertId(id);
-    const from = this.fileOf('archive', id);
-    if (!fs.existsSync(from)) throw new RecordError(`no archived record ${id}`, 'not-found');
+    const from = this.regularRecord('archive', id);
+    if (from === null) throw new RecordError(`no archived record ${id}`, 'not-found');
     this.moveRecord(from, 'pending', id);
   }
 
-  /** Delete `id` from every area it is found in; returns those areas. */
+  /** Delete `id` from every area it is found in as a regular file; returns those areas. */
   unlink(id: string): Area[] {
     if (!isRecordId(id)) return [];
     const removed: Area[] = [];
     for (const area of ALL_AREAS) {
+      const file = this.regularRecord(area, id);
+      if (file === null) continue;
       try {
-        fs.unlinkSync(this.fileOf(area, id));
+        fs.unlinkSync(file);
         removed.push(area);
       } catch (e) {
         if (!isMissing(e)) throw e;
@@ -355,14 +419,18 @@ export class Store {
   }
 
   /**
-   * Records are immutable and named by content, so a copy already at the destination is never
-   * overwritten (it may be a hand-edited committed file); the source copy is just dropped.
+   * Records are immutable and named by content, so a regular copy already at the destination is
+   * never overwritten (it may be a hand-edited committed file); the source copy is just dropped.
+   * A symlinked destination directory or entry is refused.
    */
   private moveRecord(from: string, to: Area, id: string): void {
-    if (fs.existsSync(this.fileOf(to, id))) {
+    refuseSymlinkDir(this.layout[to]);
+    const dest = kindOf(this.fileOf(to, id));
+    if (dest === 'file') {
       fs.unlinkSync(from);
       return;
     }
+    if (dest !== 'missing') throw new RecordError(`refusing non-regular entry for ${id} in ${to}`, 'symlink');
     moveFile(from, this.layout[to], id, `${id}.md`);
   }
 }

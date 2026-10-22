@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { defaultExec, gitCommonDir } from '../src/exec.js';
+import { type Exec, defaultExec, gitCommonDir } from '../src/exec.js';
 import { FORMAT_VERSION, RecordError, type ElmoryRecord, recordId, serialize } from '../src/record.js';
 import { Store, resolveLayout } from '../src/store.js';
 
@@ -60,6 +60,24 @@ describe('exec', () => {
     expect(common).toBe(path.join(wt, '.git'));
     fs.mkdirSync(path.join(wt, 'sub'));
     expect(await gitCommonDir(defaultExec, path.join(wt, 'sub'))).toBe(path.join(wt, '.git'));
+  });
+
+  it('gitCommonDir throws when git fails inside a repo and returns null outside one', async () => {
+    const failing: Exec = async () => ({ stdout: '', stderr: 'fatal: boom', code: 128 });
+    const { wt } = await gitWorktree();
+    fs.mkdirSync(path.join(wt, 'deep', 'er'), { recursive: true });
+    await expect(gitCommonDir(failing, wt)).rejects.toThrow('git failed inside a repository: fatal: boom');
+    await expect(gitCommonDir(failing, path.join(wt, 'deep', 'er'))).rejects.toThrow(/inside a repository/);
+    // a .git file (linked worktree) counts too
+    const linked = tmp();
+    fs.writeFileSync(path.join(linked, '.git'), 'gitdir: /nowhere\n');
+    await expect(gitCommonDir(failing, linked)).rejects.toThrow(/inside a repository/);
+    expect(await gitCommonDir(failing, tmp())).toBeNull();
+    const missingGit: Exec = async () => {
+      throw Object.assign(new Error('spawn git ENOENT'), { code: 'ENOENT' });
+    };
+    await expect(gitCommonDir(missingGit, wt)).rejects.toThrow(/inside a repository/);
+    expect(await gitCommonDir(missingGit, tmp())).toBeNull();
   });
 
   it('defaultExec resolves non-zero exits and rejects a missing binary', async () => {
@@ -249,6 +267,66 @@ describe('Store records', () => {
     expect(store.readRecord(id)).toBeNull();
     expect(fs.existsSync(path.join(store.layout.archive, `${id}.md`))).toBe(false);
     expect(store.unlink(id)).toEqual([]);
+  });
+});
+
+describe('Store symlinks', () => {
+  const posixOnly = it.skipIf(process.platform === 'win32');
+
+  posixOnly('a symlinked facts/<id>.md pointing outside the area is ignored', () => {
+    const store = plainStore();
+    const outside = path.join(tmp(), 'outside.md');
+    fs.writeFileSync(outside, serialize(note(1)));
+    const id = recordId(note(1));
+    fs.symlinkSync(outside, path.join(store.layout.facts, `${id}.md`));
+    expect(store.listRecords()).toEqual([]);
+    expect(store.readRecord(id)).toBeNull();
+    expect(store.unlink(id)).toEqual([]);
+    expect(fs.existsSync(outside)).toBe(true);
+  });
+
+  posixOnly('symlinked area directories are skipped on read and refused on write', () => {
+    const store = plainStore();
+    const elsewhere = tmp();
+    const id = recordId(note(1));
+    fs.writeFileSync(path.join(elsewhere, `${id}.md`), serialize(note(1)));
+    fs.rmSync(store.layout.pending, { recursive: true });
+    fs.symlinkSync(elsewhere, store.layout.pending);
+    expect(store.listRecords()).toEqual([]);
+    expect(store.readRecord(id)).toBeNull();
+    expect(store.publish()).toEqual([]);
+    expect(store.publish([id])).toEqual([]);
+    expect(() => store.archive(id)).toThrow(RecordError);
+    expect(store.unlink(id)).toEqual([]);
+    expect(() => store.writeRecord('pending', note(2))).toThrow(RecordError);
+    expect(fs.readdirSync(elsewhere)).toEqual([`${id}.md`]);
+  });
+
+  posixOnly('symlinked pending, archive and tombstone entries are not moved or read', () => {
+    const store = plainStore();
+    const outside = path.join(tmp(), 'x.md');
+    fs.writeFileSync(outside, serialize(note(1)));
+    const id = recordId(note(1));
+    fs.symlinkSync(outside, path.join(store.layout.pending, `${id}.md`));
+    fs.symlinkSync(outside, path.join(store.layout.archive, `${id}.md`));
+    fs.symlinkSync(outside, path.join(store.layout.localTombstones, id));
+    expect(store.publish()).toEqual([]);
+    expect(() => store.archive(id)).toThrow(RecordError);
+    expect(() => store.restore(id)).toThrow(RecordError);
+    expect(store.readTombstones()).toEqual([]);
+    expect(() => store.writeRecord('pending', note(1))).toThrow(RecordError);
+    expect(fs.existsSync(path.join(store.layout.facts, `${id}.md`))).toBe(false);
+  });
+
+  posixOnly('publish refuses a symlinked facts directory', () => {
+    const store = plainStore();
+    const id = store.writeRecord('pending', note(1));
+    const elsewhere = tmp();
+    fs.rmSync(store.layout.facts, { recursive: true });
+    fs.symlinkSync(elsewhere, store.layout.facts);
+    expect(() => store.publish()).toThrow(RecordError);
+    expect(fs.readdirSync(elsewhere)).toEqual([]);
+    expect(store.readRecord(id)?.area).toBe('pending');
   });
 });
 
