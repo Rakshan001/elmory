@@ -273,7 +273,7 @@ export async function forget(ctx: Context, scope: ForgetScope): Promise<ForgetRe
 
   const { deleted, cascaded, unknown, remote } = ctx.cache.withWriteLock(() => {
     // Rows as they are now, inside the lock, so a record written meanwhile is cascaded too.
-    syncStore(ctx.store, ctx.cache);
+    syncStore(ctx.store, ctx.cache, false, ctx.lifted());
     // 2 cascade: every record (indexed or archived) citing a forgotten id, transitively
     const p = plan(ctx, asked, inHead);
     const ids = [...p.seeds, ...p.cascaded];

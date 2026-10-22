@@ -45,6 +45,15 @@ interface Base {
 type Problem = { state: 'stale' | 'suspect' | 'unknown'; reason: string };
 const SEVERITY: readonly Problem['state'][] = ['stale', 'suspect', 'unknown'];
 
+/**
+ * Whether a committed tombstone for `id` is trusted on its own: `addedBy` reports a signer for
+ * its path that the trust ledger names. The one rule for the Deriver and the index (I3).
+ */
+export function committedTombstoneTrusted(id: string, addedBy: ReadonlyMap<string, AddedBy>, trust: Trust): boolean {
+  const signer = addedBy.get(`.elmory/tombstones/${id}`)?.signer;
+  return !!signer && trust.signers.has(signer);
+}
+
 /** The ledger's latest word on `id` is `approved` (a later `rejected` drops it, see Store.readTrust). */
 export function approvedHere(trust: Trust, id: string): boolean {
   return trust.approved.has(id) && !trust.rejected.has(id);
@@ -146,8 +155,7 @@ export class Deriver {
    */
   tombstoneTrusted(t: Tombstone): boolean {
     if (!t.committed) return true;
-    const signer = this.input.addedBy.get(`.elmory/tombstones/${t.id}`)?.signer;
-    return !!signer && this.input.trust.signers.has(signer);
+    return committedTombstoneTrusted(t.id, this.input.addedBy, this.input.trust);
   }
 
   /**

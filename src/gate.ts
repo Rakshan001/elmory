@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { Context } from './context.js';
 import type { Cache, RecordRow } from './cache.js';
-import { Deriver, type State, approvedHere } from './derive.js';
+import { Deriver, type State, approvedHere, committedTombstoneTrusted } from './derive.js';
 import type { AddedBy } from './git.js';
 import { checkQuoteAtWrite, containsSecret } from './quote.js';
 import {
@@ -272,20 +272,41 @@ function withoutText(row: RecordRow, tomb: 'local' | 'committed'): RecordRow {
   return { ...row, title: '', body: '', observer: '', key, tag: null, sources: [], paths: [], text: '' };
 }
 
+const NONE: ReadonlySet<string> = new Set();
+
 /**
- * `Store.tombstoneIds` minus the ids under a committed tombstone alone that the trust ledger
- * approves: the user reviewed that forget and refused it (I3), so the record is indexed with its
- * text again. A local tombstone is never lifted. The ledger is read only when a committed-only
- * tombstone exists.
+ * Ids whose forget the user refused (I3): a committed tombstone alone (no local one), that is not
+ * trusted (`committedTombstoneTrusted`, the Deriver's own rule over the same `addedBy`), for a
+ * record the trust ledger approves. The Deriver withholds none of these; the index keeps their
+ * text. A trusted forget (local, or signed by a trusted key) is never lifted by an approval. The
+ * ledger is read only when a committed-only tombstone exists.
  */
-function textlessIds(store: Store): Map<string, 'local' | 'committed'> {
-  const ids = store.tombstoneIds();
+export function liftedForgets(store: Store, addedBy: ReadonlyMap<string, AddedBy>): Set<string> {
+  const out = new Set<string>();
   let trust: Trust | null = null;
-  for (const [id, where] of [...ids]) {
+  for (const [id, where] of store.tombstoneIds()) {
     if (where !== 'committed') continue;
     trust ??= store.readTrust();
-    if (approvedHere(trust, id)) ids.delete(id);
+    if (approvedHere(trust, id) && !committedTombstoneTrusted(id, addedBy, trust)) out.add(id);
   }
+  return out;
+}
+
+/** Whether any committed-only tombstone names an approved record, i.e. whether `liftedForgets` needs `addedBy`. */
+export function liftMayApply(store: Store): boolean {
+  let trust: Trust | null = null;
+  for (const [id, where] of store.tombstoneIds()) {
+    if (where !== 'committed') continue;
+    trust ??= store.readTrust();
+    if (approvedHere(trust, id)) return true;
+  }
+  return false;
+}
+
+/** `Store.tombstoneIds` minus the `lifted` ids (see liftedForgets): the ids indexed without text. */
+function textlessIds(store: Store, lifted: ReadonlySet<string>): Map<string, 'local' | 'committed'> {
+  const ids = store.tombstoneIds();
+  for (const [id, where] of [...ids]) if (where === 'committed' && lifted.has(id)) ids.delete(id);
   return ids;
 }
 
@@ -376,10 +397,10 @@ export function rowsAndStamps(cache: Cache): { rows: RecordRow[]; stamps: Stamps
  * inode) as the one its row now stands for, so viewOf can tell when a worktree's file is not
  * that one. The caller holds the write lock (or owns a fresh rebuild cache).
  */
-export function syncStore(store: Store, cache: Cache, force = false): void {
+export function syncStore(store: Store, cache: Cache, force = false, lifted: ReadonlySet<string> = NONE): void {
   const files = new Map<string, StoredRecord>();
   for (const sr of store.listRecords()) if (!files.has(sr.id)) files.set(sr.id, sr);
-  const tombstoned = textlessIds(store);
+  const tombstoned = textlessIds(store, lifted);
   const rows = new Map(cache.allRecords().map((r) => [r.id, r]));
   const old = readStamps(cache);
   const stamps: Stamps = new Map();
@@ -415,12 +436,12 @@ export function syncStore(store: Store, cache: Cache, force = false): void {
  * in two worktrees is judged per worktree, and a file rewritten in place whose size or mtime
  * moved is caught without a full sync. Sorted by id, like `Cache.allRecords`.
  */
-export function viewOf(store: Store, rows: readonly RecordRow[], stamps: Stamps = new Map()): RecordRow[] {
+export function viewOf(store: Store, rows: readonly RecordRow[], stamps: Stamps = new Map(), lifted: ReadonlySet<string> = NONE): RecordRow[] {
   const want = new Map<string, 'facts' | 'pending' | 'local'>();
   for (const area of ['facts', 'pending', 'local'] as const) {
     for (const id of store.ids(area)) if (!want.has(id)) want.set(id, area);
   }
-  const tombstoned = textlessIds(store);
+  const tombstoned = textlessIds(store, lifted);
   const byId = new Map(rows.map((r) => [r.id, r]));
   const out: RecordRow[] = [];
   for (const [id, area] of want) {
@@ -441,9 +462,9 @@ export function viewOf(store: Store, rows: readonly RecordRow[], stamps: Stamps 
 }
 
 /** viewOf over the cache as it is now (rows and stamps from one generation). */
-export function viewOfCache(store: Store, cache: Cache): RecordRow[] {
+export function viewOfCache(store: Store, cache: Cache, lifted: ReadonlySet<string> = NONE): RecordRow[] {
   const { rows, stamps } = rowsAndStamps(cache);
-  return viewOf(store, rows, stamps);
+  return viewOf(store, rows, stamps, lifted);
 }
 
 // ---------------------------------------------------------------------------
@@ -529,11 +550,11 @@ export function syncNeeded(store: Store, cache: Cache): boolean {
  * Under the write lock: syncStore only when the fingerprint moved (always when `full`); then
  * remember the stamp.
  */
-export function syncIfChanged(store: Store, cache: Cache, full = false): void {
+export function syncIfChanged(store: Store, cache: Cache, full = false, lifted: ReadonlySet<string> = NONE): void {
   const fp = fingerprint(store.layout);
   const force = cache.getMeta(INDEX_RULES_KEY) !== INDEX_RULES;
   if (!full && !force && cache.getMeta(FINGERPRINT_KEY) === fp.value) return;
-  syncStore(store, cache, force);
+  syncStore(store, cache, force, lifted);
   // Taken before the scan: a change during the scan leaves the stored stamp behind, so the next
   // load scans again. A racy stamp is not stored at all.
   cache.setMeta(FINGERPRINT_KEY, fp.racy ? '' : fp.value);
@@ -821,10 +842,11 @@ async function write(ctx: Context, type: RecordType, input: RememberInput): Prom
     try {
       id = ctx.cache.withWriteLock(() => {
         // 5 load
-        syncIfChanged(ctx.store, ctx.cache);
+        const lifted = liftedForgets(ctx.store, addedBy);
+        syncIfChanged(ctx.store, ctx.cache, false, lifted);
         const tombstones = ctx.store.readTombstones();
         if (attempt === 0 && committedSignature(ctx.layout, tombstones) !== before) throw new StaleAddedBy();
-        const records = new Map(viewOfCache(ctx.store, ctx.cache).map((r) => [r.id, r]));
+        const records = new Map(viewOfCache(ctx.store, ctx.cache, lifted).map((r) => [r.id, r]));
         const trust = ctx.store.readTrust();
         const d = new Deriver({
           records,
@@ -879,7 +901,7 @@ async function write(ctx: Context, type: RecordType, input: RememberInput): Prom
           path: path.join(ctx.layout[area], `${newId}.md`),
           text: serialize(record),
         };
-        const row = indexFile(stored, tombstones.length === 0 ? new Map() : textlessIds(ctx.store));
+        const row = indexFile(stored, tombstones.length === 0 ? new Map() : textlessIds(ctx.store, lifted));
         ctx.cache.upsertRecord(row);
         const stamps = readStamps(ctx.cache);
         stampInto(stamps, stored, Date.now());

@@ -1052,6 +1052,60 @@ describe('review of an untrusted forget (I3)', () => {
   });
 });
 
+describe('a trusted forget wins over an approval (I3)', () => {
+  it.skipIf(!hasSshKeygen())('signed tombstone: approve is refused, and an earlier approval lifts nothing; the record stays forgotten and textless', async () => {
+    const wt = await repo();
+    const keys = tmp();
+    const key = path.join(keys, 'k');
+    execFileSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-C', 'tester', '-f', key]);
+    const [keyType, keyBody] = fs.readFileSync(`${key}.pub`, 'utf8').trim().split(' ');
+    const allowed = path.join(keys, 'allowed');
+    fs.writeFileSync(allowed, `tester@example.com namespaces="git" ${keyType} ${keyBody}\n`);
+    await git(wt, 'config', 'gpg.format', 'ssh');
+    await git(wt, 'config', 'user.signingkey', `${key}.pub`);
+    const exec: Exec = (file, args, opts) => defaultExec(file, ['-c', `gpg.ssh.allowedSignersFile=${allowed}`, ...args], opts);
+    const e = await Elmory.open({ worktree: wt, cacheDir: tmp(), now: () => NOW, observer: 'agent:test', exec });
+    opened.push(e);
+    const hits = (q: string) => e.cache.search(q, { limit: 10, offset: 0 }).map((h) => h.id);
+
+    // (b1) approved first, then a signed forget arrives.
+    const early = await e.note({ title: 'Early approved', text: 'The kudu7marker plan.' });
+    const late = await e.note({ title: 'Approved after', text: 'The impala7marker plan.' });
+    e.publish();
+    await e.approve(early.id);
+    fs.mkdirSync(e.layout.tombstones, { recursive: true });
+    for (const id of [early.id, late.id]) fs.writeFileSync(path.join(e.layout.tombstones, id), 'supersedes: []\n');
+    await git(wt, 'add', '-A');
+    await git(wt, 'commit', '-q', '--no-verify', '-S', '-m', 'signed forget');
+    const signer = (await e.fetchAddedBy()).get(`.elmory/tombstones/${early.id}`)?.signer;
+    expect(signer).toMatch(/^SHA256:/);
+    e.store.appendTrust(`signer ${signer as string}`);
+    await e.sync();
+    for (const id of [early.id, late.id]) {
+      expect((await (await e.deriver()).state(id)).state).toBe('forgotten');
+      expect(e.cache.getRecord(id)).toMatchObject({ title: '', body: '', text: '' });
+    }
+    expect(hits('kudu7marker')).toEqual([]);
+    expect(e.view().find((r) => r.id === early.id)).toMatchObject({ title: '', text: '' });
+
+    // (b2) approve after the signed forget: refused, nothing written, still forgotten.
+    await expect(e.approve(late.id)).rejects.toMatchObject({ reason: 'forgotten' });
+    expect(e.store.readTrust().approved.has(late.id)).toBe(false);
+    await e.sync();
+    expect((await (await e.deriver()).state(late.id)).state).toBe('forgotten');
+    expect(hits('impala7marker')).toEqual([]);
+
+    // (a) the key leaves the allowed signers: the forget is now untrusted, so the earlier
+    // approval refuses it and the record comes back with its text.
+    fs.writeFileSync(allowed, '');
+    await e.sync();
+    expect((await (await e.deriver()).state(early.id)).state).toBe('active');
+    expect(hits('kudu7marker')).toEqual([early.id]);
+    expect((await (await e.deriver()).state(late.id))).toMatchObject({ state: 'candidate', reason: FORGET_UNTRUSTED });
+    expect(hits('impala7marker')).toEqual([]);
+  }, 30000);
+});
+
 describe('injection flag over paths (R5)', () => {
   it('a source path carrying an instruction is flagged, at index time and at write', async () => {
     const r: ElmoryRecord = {

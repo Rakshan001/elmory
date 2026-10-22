@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { Cache, type RecordRow } from './cache.js';
 import type { Context, ElmoryEvent } from './context.js';
-import { Deriver, FORGET_UNTRUSTED } from './derive.js';
+import { Deriver, FORGET_UNTRUSTED, committedTombstoneTrusted } from './derive.js';
 import { Evidence } from './evidence.js';
 import { type Exec, defaultExec, gitCommonDir } from './exec.js';
 import * as gate from './gate.js';
@@ -137,6 +137,10 @@ async function signedAddedBy(
   return addedBy;
 }
 
+function sameSet(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
+  return a.size === b.size && [...a].every((x) => b.has(x));
+}
+
 /** Every worktree `git worktree list` names that exists on disk (bare entries skipped), realpath'd. */
 async function listWorktrees(exec: Exec, worktree: string): Promise<string[]> {
   const res = await exec('git', ['worktree', 'list', '--porcelain', '-z'], { cwd: worktree });
@@ -174,6 +178,8 @@ export class Elmory implements Context {
   readonly #committed: CommittedAddedBy;
   /** Set by a full sync (verify): the next fetch walks the history again whatever HEAD is. */
   #freshWalk = false;
+  /** gate.liftedForgets as of the last sync: approved records whose untrusted forget is refused (I3). */
+  #lifted: ReadonlySet<string> = new Set();
 
   private constructor(
     readonly layout: Layout,
@@ -262,13 +268,29 @@ export class Elmory implements Context {
   async sync(opts: { full?: boolean } = {}): Promise<string[]> {
     this.#addedBy = null;
     if (opts.full === true) this.#freshWalk = true;
-    if (opts.full !== true && !gate.syncNeeded(this.store, this.cache)) return [];
+    // Which untrusted forgets an approval refuses can change without the fingerprint moving (a
+    // key leaves the allowed signers): a change re-reads every file.
+    const lifted = await this.#liftedNow();
+    const liftMoved = !sameSet(lifted, this.#lifted);
+    this.#lifted = lifted;
+    const full = opts.full === true || liftMoved;
+    if (!full && !gate.syncNeeded(this.store, this.cache)) return [];
     // tryWithWriteLock never waits: a held lock is null at once, not the 5 s busy timeout.
     const ran = this.cache.tryWithWriteLock(() => {
-      gate.syncIfChanged(this.store, this.cache, opts.full === true);
+      gate.syncIfChanged(this.store, this.cache, full, lifted);
       return true;
     });
     return ran === null ? [INDEX_BUSY] : [];
+  }
+
+  /** gate.liftedForgets now; git's addedBy is fetched (and memoised) only when an approval may apply. */
+  async #liftedNow(): Promise<ReadonlySet<string>> {
+    if (!gate.liftMayApply(this.store)) return new Set();
+    return gate.liftedForgets(this.store, await this.#memoAddedBy());
+  }
+
+  lifted(): ReadonlySet<string> {
+    return this.#lifted;
   }
 
   /**
@@ -284,7 +306,7 @@ export class Elmory implements Context {
   }
 
   view(): RecordRow[] {
-    return gate.viewOfCache(this.store, this.cache);
+    return gate.viewOfCache(this.store, this.cache, this.#lifted);
   }
 
   async fetchAddedBy(): Promise<Map<string, AddedBy>> {
@@ -321,11 +343,12 @@ export class Elmory implements Context {
       const store = new Store(layout);
       const git = new Git(this.#exec, layout.worktree);
       const evidence = new Evidence({ worktree: layout.worktree, cache: this.cache, git });
+      const addedBy = await signedAddedBy(this.#exec, git, layout.worktree, this.#committed);
       const deriver = new Deriver({
-        records: new Map(gate.viewOfCache(store, this.cache).map((r) => [r.id, r])),
+        records: new Map(gate.viewOfCache(store, this.cache, gate.liftedForgets(store, addedBy)).map((r) => [r.id, r])),
         tombstones: store.readTombstones(),
         trust: store.readTrust(),
-        addedBy: await signedAddedBy(this.#exec, git, layout.worktree, this.#committed),
+        addedBy,
         evidence: (row) => evidence.checkAll(row.sources),
       });
       out.push({ worktree: layout.worktree, deriver });
@@ -388,7 +411,7 @@ export class Elmory implements Context {
         throw new gate.RefusedError(`no pending record ${id} to publish`, 'unknown-id');
       }
       const moved = this.store.publish(ids);
-      gate.syncIfChanged(this.store, this.cache);
+      gate.syncIfChanged(this.store, this.cache, false, this.#lifted);
       return moved;
     });
   }
@@ -424,6 +447,17 @@ export class Elmory implements Context {
    * text again and derived from its evidence, keeping its slot (`reject` accepts the forget).
    */
   async approve(id: string): Promise<void> {
+    if (!isRecordId(id)) throw new RecordError(`not a record id: ${id}`, 'id');
+    // A trusted forget (a local tombstone, or a committed one signed by a trusted key) always
+    // wins: an approval refuses only an untrusted forget (I3).
+    const trust = this.store.readTrust();
+    const addedBy = await this.fetchAddedBy();
+    for (const t of this.store.readTombstones()) {
+      if (t.id !== id) continue;
+      if (!t.committed || committedTombstoneTrusted(id, addedBy, trust)) {
+        throw new gate.RefusedError(`${id} was forgotten by a trusted tombstone; an approval cannot bring it back`, 'forgotten');
+      }
+    }
     this.#trustLine('approved', id);
   }
 
@@ -481,8 +515,10 @@ export class Elmory implements Context {
 
   /** A fresh cache generation indexed from every record file. */
   async rebuild(): Promise<void> {
+    const lifted = await this.#liftedNow();
+    this.#lifted = lifted;
     this.cache.rebuild((fresh) => {
-      gate.syncStore(this.store, fresh);
+      gate.syncStore(this.store, fresh, false, lifted);
       // Last-recall stamps are not in any file; carry them over so gc's answer does not change.
       for (const row of fresh.allRecords()) {
         const stamp = this.cache.getMeta(`recall:${row.id}`);

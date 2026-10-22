@@ -26,6 +26,11 @@ export interface Context {
   /** The records this worktree sees (§5): gate.viewOf over the shared cache rows and their file stamps. */
   view(): RecordRow[];
   /**
+   * gate.liftedForgets as of the last sync(): approved records whose forget is untrusted, so
+   * refused (I3). Their files are indexed with text; pass this to every syncStore / viewOf.
+   */
+  lifted(): ReadonlySet<string>;
+  /**
    * Deriver over `rows` (default view()), store.readTombstones(), store.readTrust(),
    * the addedBy map (empty without git), evidence bound to this worktree
    */
