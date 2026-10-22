@@ -211,6 +211,7 @@ describe('injectionFlag', () => {
     expect(flagged('src/components/ThisIsAVeryLongCamelCaseComponentName.tsx')).toBe(false);
     expect(flagged('test/a-very-long-kebab-case-file-name-for-the-tests.spec.ts')).toBe(false);
     expect(flagged('migrations/20261023120000_add_user_session_table.sql')).toBe(false);
+    expect(flagged('db/migrations/20240101123045_AddUserTable2FA_Columns.ts')).toBe(false); // N3
     // The body keeps the plain heuristic.
     expect(injectionFlag(`blob ${'QUJD'.repeat(12)}==`, { encoded: false })).toBeNull();
     expect(injectionFlag(`blob ${'QUJD'.repeat(12)}==`)).not.toBeNull();

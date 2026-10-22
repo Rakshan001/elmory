@@ -136,6 +136,8 @@ function encodedPathSegment(paths: readonly string[]): string | null {
     for (const seg of p.split(/[/\\.]/)) {
       if (seg.length < ENCODED_SEGMENT_MIN) continue;
       if (/=$/.test(seg) || seg.includes('+')) return seg;
+      // A timestamped migration name (`20240101123045_AddUserTable2FA_Columns`) is not base64.
+      if (/^[0-9]+_/.test(seg)) continue;
       const cls = (c: string): number => (/[0-9]/.test(c) ? 0 : /[A-Z]/.test(c) ? 1 : /[a-z]/.test(c) ? 2 : 3);
       const counts = [0, 0, 0, 0];
       let changes = 0;
