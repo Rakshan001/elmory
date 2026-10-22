@@ -265,21 +265,42 @@ export function factsFirstOnTies(hits: { id: string; score: number }[], rows: Ma
 }
 
 /**
+ * This worktree's view (§5), its Deriver, and the search hits among it, taken once and on one
+ * cache generation. The search runs over the table every worktree shares, so a hit is kept only
+ * when it is one of this worktree's records, and served as that record. The ordered id list is
+ * taken once (M4): a row another process indexes mid-request cannot shift a page boundary and
+ * serve a record twice.
+ *
+ * A rebuild in another worktree publishes a generation indexed from that worktree's files, where
+ * this worktree's facts may have no rows. When the generation changes under the read (R6), this
+ * worktree is synced into the new one and the read runs again, once; a second change is served
+ * as it is.
+ */
+async function searchedView(
+  ctx: Context,
+  query: string,
+  synced: string[],
+): Promise<{ byId: Map<string, RecordRow>; d: Deriver; hits: { id: string; score: number }[]; warnings: string[] }> {
+  let warnings = synced;
+  for (let attempt = 0; ; attempt++) {
+    const generation = ctx.cache.generation;
+    const view = ctx.view();
+    const byId = new Map(view.map((r) => [r.id, r]));
+    const d = await ctx.deriver(view);
+    const hits = ctx.cache.search(query, { limit: Number.MAX_SAFE_INTEGER, offset: 0 }).filter((h) => byId.has(h.id));
+    if (ctx.cache.generation === generation || attempt > 0) return { byId, d, hits, warnings };
+    warnings = await ctx.sync();
+  }
+}
+
+/**
  * §7.2. The search is not pre-filtered by `supersedes`: whether a record is superseded depends on
  * whether its successor holds in this worktree (§6.3), so an older value can still be the one to
  * serve, and an abstain must be able to say the matches were superseded.
  */
 export async function recall(ctx: Context, opts: RecallOptions): Promise<RecallResult | Abstain> {
   const include = checkInclude(opts.include);
-  const warnings = await ctx.sync();
-  // This worktree's view (§5), taken once: the search runs over the table every worktree shares,
-  // so a hit is kept only when it is one of this worktree's records, and served as that record.
-  const view = ctx.view();
-  const byId = new Map(view.map((r) => [r.id, r]));
-  const d = await ctx.deriver(view);
-  // The ordered id list is taken once (M4): a row another process indexes mid-request cannot
-  // shift a page boundary and serve a record twice.
-  const hits = ctx.cache.search(opts.query, { limit: Number.MAX_SAFE_INTEGER, offset: 0 }).filter((h) => byId.has(h.id));
+  const { byId, d, hits, warnings } = await searchedView(ctx, opts.query, await ctx.sync());
   function* pages(): Generator<RecordRow[]> {
     for (let i = 0; i < hits.length; ) {
       // A page never splits a run of equal scores, so facts-first holds across page boundaries.

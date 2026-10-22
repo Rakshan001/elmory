@@ -913,4 +913,23 @@ describe('two worktrees over one cache (R6, R7)', () => {
     expect(e.view().find((r) => r.id === res.id)?.candidate).toBe('edited');
     expect(reads).toBe(1);
   });
+
+  it('a rebuild in another worktree between the view and the search does not blank a recall (R6)', async () => {
+    const { a, wt, wt2, cacheDir } = await twoWorktrees();
+    const res = await a.remember(fact('Branch only fact'));
+    a.publish([res.id]); // in A's facts only: B's checkout does not have it
+    await git(wt, 'worktree', 'add', '-q', '-b', 'other', wt2);
+    const b = await open(wt2, cacheDir);
+    await a.sync();
+    // B publishes a fresh generation indexed from B's files only, while A's recall is mid-read.
+    const deriver = a.deriver.bind(a);
+    let calls = 0;
+    a.deriver = async (rows) => {
+      if (calls++ === 0) await b.rebuild();
+      return deriver(rows);
+    };
+    const r = await a.recall({ query: 'Branch only fact' });
+    expect(calls).toBe(2);
+    expect(r.abstain === false && r.served.map((s) => s.id)).toEqual([res.id]);
+  });
 });
