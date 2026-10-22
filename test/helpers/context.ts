@@ -128,6 +128,7 @@ export async function makeContext(opts: { now?: string } = {}): Promise<TestCont
       return [];
     },
     view: () => viewOf(store, cache.allRecords()),
+    lifted: () => new Set<string>(),
     async deriver(rows) {
       evidence.resetMemo();
       return new Deriver({

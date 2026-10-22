@@ -7,25 +7,67 @@ export interface RenameResult {
 
 /**
  * The most recent commit that changed a path (other than deleting it). `signer` is that
- * commit's key fingerprint, set only when git reports a good signature (`%G?` is `G`).
+ * commit's key fingerprint, set only when git reports a good signature (`%G?` is `G`) and no
+ * later commit in HEAD's history touched the path again (see `Git.addedBy`).
  */
 export interface AddedBy {
   commit: string;
   signer: string | null;
+  /**
+   * git's `%G?` for `commit`, set only when its signature was asked about (the replay check let
+   * the credit count): `G` good; `N` the commit object carries no signature at all (git also
+   * says `N` for a signature it cannot check, e.g. ssh without an allowed signers file, so `N` is
+   * kept only after the raw commit shows no `gpgsig` header, and becomes `?` otherwise);
+   * anything else (`B`, `E`, `U`, `X`, `Y`, `R`, `?`, or '' when git gave no answer) means the
+   * signature could not be judged here.
+   */
+  status?: string;
 }
 
+/** git's word on one commit's signature: `%G?` and, when good, the key. */
+export interface Verdict {
+  status: string;
+  signer: string | null;
+}
+
+/**
+ * The history walk's answer for one path (see `Git.credited`): the credited commit, and whether
+ * its signature may count (`verify`: the header was well formed and the replay check kept it).
+ * It holds no signature: whether a key is good is asked of git each time (`Git.signed`).
+ */
+export interface Credit {
+  commit: string;
+  verify: boolean;
+}
+
+/** Commits per signature lookup: keeps the argument list far below any ARG_MAX. */
+const SIGNATURE_BATCH = 500;
 const RS = '\x1e';
 const US = '\x1f';
 /** A full or abbreviated object name. Anything else (refs, options) is refused before git sees it. */
 const SHA = /^[0-9a-f]{4,64}$/i;
 /** A full object name as `%H` prints it (SHA-1 or SHA-256). */
 const FULL_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
-/** One `--raw` change line for one parent (`separate`); captures the post-image blob. */
-const RAW_CHANGE = /^:[0-7]{6} [0-7]{6} (?:[0-9a-f]{40}|[0-9a-f]{64}) ([0-9a-f]{40}|[0-9a-f]{64}) [ACMTUXB][0-9]*$/;
+/** One `--raw` change line for one parent (`separate`); captures the post-image blob and the status. */
+const RAW_CHANGE = /^:[0-7]{6} [0-7]{6} (?:[0-9a-f]{40}|[0-9a-f]{64}) ([0-9a-f]{40}|[0-9a-f]{64}) ([ACDMTUXB])[0-9]*$/;
 
 /** Pathspec that matches `p` byte for byte: no globs, no magic. */
 function literal(p: string): string {
   return `:(literal)${p}`;
+}
+
+/** Whether `ancestor` is reachable from any commit in `from` through `parentsOf`. */
+function descendsFrom(parentsOf: Map<string, string[]>, from: string[], ancestor: string): boolean {
+  const seen = new Set<string>();
+  const stack = [...from];
+  while (stack.length > 0) {
+    const c = stack.pop() as string;
+    if (c === ancestor) return true;
+    if (seen.has(c)) continue;
+    seen.add(c);
+    for (const p of parentsOf.get(c) ?? []) stack.push(p);
+  }
+  return false;
 }
 
 function splitZ(out: string): string[] {
@@ -36,7 +78,7 @@ function splitZ(out: string): string[] {
 
 /**
  * Thin wrapper over `git` through an injectable `Exec`. Every method is one git invocation
- * (`addedBy` is two) and nothing is cached here. Paths are repo-relative with forward slashes (git's own form), and
+ * (`addedBy` is up to three) and nothing is cached here. Paths are repo-relative with forward slashes (git's own form), and
  * `worktree` is the work tree's top level.
  */
 export class Git {
@@ -111,8 +153,8 @@ export class Git {
 
   /**
    * For each file under `relDir` at HEAD: the most recent commit whose change left the file with
-   * exactly HEAD's bytes (added, modified, type-changed; deletes are ignored), and that commit's
-   * signer. A file not at HEAD, or one whose HEAD bytes no commit in the log produced, is absent.
+   * exactly HEAD's bytes (added, modified, type-changed), and that commit's signer. A file not at
+   * HEAD, or one whose HEAD bytes no commit in the log produced, is absent.
    *
    * Attribution is by content, not by order. Each change record carries its post-image blob, and
    * a record counts only when that blob is the one HEAD has for the path. So when a merge keeps
@@ -125,84 +167,257 @@ export class Git {
    * clean merge just carries over from one side is not a touch, so it keeps the branch commit
    * that made the change, and its signer.
    *
-   * Two git calls: one `ls-tree` for HEAD's blobs, then one `log`. Output is NUL-separated, so
-   * paths are taken verbatim and are only ever read from the slot after a change line; nothing a
-   * committer writes can be read as a header. The header prints only git-computed fields. As
-   * defence in depth, a header that is not exactly five fields with full shas gets
-   * `signer: null` (and an empty `commit` when its sha is not valid) and is treated as a
-   * single-parent commit; a change line that does not parse is skipped; and any token out of
-   * place stops the parse, leaving the remaining paths unattributed.
+   * Replay: the signer is kept only while the signed bytes are the path's bytes in every commit
+   * of HEAD's history that descends from the signed commit. If any such commit left the path with
+   * other bytes or none (an edit, a delete, or a merge that adopted another side's version: a
+   * merge whose result differs from at least one parent), HEAD can hold the signed bytes only
+   * because some later merge or commit brought them back, and nobody signed that: `signer` is
+   * null. This covers a merge that resolves to stale signed bytes, `merge -s ours` over a
+   * deletion, a reverted forget re-added on an old branch, and a merge that adopts another
+   * version followed by one that adopts the signed bytes again. A change on a branch that does
+   * not descend from the signed commit, discarded by a merge that kept the signed bytes, does not
+   * drop it.
+   *
+   * The log walks the full history (`--full-history`: no side of a merge is pruned, so a deletion
+   * on the side a merge discarded is still seen) with parents rewritten to the nearest listed
+   * commits (`--parents`), which keeps ancestry among the listed commits exact. Deletes are read
+   * as touches but never credited.
+   *
+   * Signatures are not read during the walk: `--full-history` lists every merge in history, and
+   * asking for `%G?` there would run gpg or ssh-keygen once per signed merge. The walk decides
+   * which commit each path is credited to and which credits survive the replay check; only those
+   * commits are then verified, in one `git log --no-walk` (see `signers`).
+   *
+   * `credited` is the walk (it depends on HEAD's history only, so a caller may reuse it while
+   * HEAD stays put); `signed` adds the signatures. Never reuse a signer: a key removed from the
+   * keyring or the allowed signers file must stop counting at once.
+   *
+   * Three git calls at most: one `ls-tree` for HEAD's blobs, one `log` for the walk, and one
+   * `log --no-walk` for the signatures (none when no credit survives). Output is NUL-separated,
+   * so paths are taken verbatim and are only ever read from the slot after a change line;
+   * nothing a committer writes can be read as a header. Headers print only git-computed fields.
+   * As defence in depth, a walk header that is not exactly two fields with full shas gets
+   * `signer: null` (and an empty `commit` when its sha is not valid), is treated as a
+   * single-parent commit, and leaves the ancestry incomplete, so every signer that needs the
+   * replay check is dropped; a change line that does not parse counts as a touch that did not
+   * produce HEAD's bytes; and any token out of place stops the parse, leaving the remaining paths
+   * unattributed.
    */
   async addedBy(relDir: string): Promise<Map<string, AddedBy>> {
-    const result = new Map<string, AddedBy>();
+    return this.signed(await this.credited(relDir));
+  }
+
+  /** The walk half of `addedBy`: per path, the credited commit and whether its signature may count. */
+  async credited(relDir: string): Promise<Map<string, Credit>> {
+    const result = new Map<string, Credit>();
     // HEAD's blobs first: if HEAD moves before the log runs, the log only gains commits, and a
     // record still counts only when it produced the exact bytes read here.
     const headBlobs = await this.headBlobs(relDir);
     if (headBlobs === null) return result;
     const res = await this.run([
       'log',
-      // %G? verifies the signature itself. --show-signature (or log.showSignature) would print
-      // the verification text to stdout between records.
+      // No signature is read here (see above); this also keeps log.showSignature from printing
+      // verification text to stdout between records.
       '--no-show-signature',
       // Children before parents, whatever the commit dates say.
       '--topo-order',
-      // Every non-delete change, each path on its own (no rename pairing), and one record per
-      // parent for a merge, so a merge's own edits can be told apart from carried-over changes.
+      // Every side of every merge, and %P as the nearest listed ancestors (see above).
+      '--full-history',
+      '--parents',
+      // Every change, each path on its own (no rename pairing), and one record per parent for a
+      // merge, so a merge's own edits can be told apart from carried-over changes.
       '--no-renames',
-      '--diff-filter=d',
       '--diff-merges=separate',
       // One `:<mode> <mode> <old blob> <new blob> <status>` line per path, full object names.
       '--raw',
       '--no-abbrev',
       '-z',
-      '--format=%x1e%H%x1f%P%x1f%G?%x1f%GF%x1f%GK',
+      '--format=%x1e%H%x1f%P',
       '--',
       literal(relDir),
     ]);
     if (res.code !== 0) throw new Error(`git log failed: ${res.stderr.trim() || `exit ${res.code}`}`);
 
     let commit = '';
-    let signer: string | null = null;
+    let wellFormed = false;
     let parentCount = 1;
-    // Per (merge, path): how many of the merge's per-parent diffs left the path at HEAD's blob.
+    let ancestryComplete = true;
+    // Listed commit → its listed parents (rewritten by --parents).
+    const parentsOf = new Map<string, string[]>();
+    // Per path still unattributed: the commits seen so far that left it with other bytes than
+    // HEAD's. Topological order lists every descendant of the commit credited later among them.
+    const newer = new Map<string, string[]>();
+    // Per (merge, path): how many of the merge's per-parent diffs list the path.
     const mergeSeen = new Map<string, number>();
+    // Credited paths whose header was well formed: only these may get a signer.
+    const eligible = new Set<string>();
     const tokens = splitZ(res.stdout);
     for (let i = 0; i < tokens.length; i++) {
       // The first change line after a header starts on a new line.
       const token = (tokens[i] ?? '').replace(/^\n/, '');
       if (token.startsWith(RS)) {
         const fields = token.slice(1).split(US);
-        const [hash = '', parentList = '', good = '', fingerprint = '', keyId = ''] = fields;
+        const [hash = '', parentList = ''] = fields;
         const parents = parentList === '' ? [] : parentList.split(' ');
-        const wellFormed = fields.length === 5 && FULL_SHA.test(hash) && parents.every((p) => FULL_SHA.test(p));
+        wellFormed = fields.length === 2 && FULL_SHA.test(hash) && parents.every((p) => FULL_SHA.test(p));
         commit = FULL_SHA.test(hash) ? hash : '';
-        signer = wellFormed && good === 'G' ? fingerprint || keyId || null : null;
         parentCount = wellFormed ? parents.length : 1;
+        if (wellFormed) parentsOf.set(hash, parents);
+        else ancestryComplete = false;
         continue;
       }
       if (!token.startsWith(':')) break;
       const file = tokens[++i];
       if (file === undefined) break;
-      const blob = RAW_CHANGE.exec(token)?.[1];
-      if (blob === undefined || result.has(file) || headBlobs.get(file) !== blob) continue;
+      const headBlob = headBlobs.get(file);
+      if (headBlob === undefined || result.has(file)) continue;
+      const change = RAW_CHANGE.exec(token);
+      if (change === null || change[2] === 'D' || change[1] !== headBlob) {
+        // The commit left the path with other bytes than HEAD's (or none). A merge counts as soon
+        // as it differs from ONE parent: adopting another side's version replaces the bytes on
+        // this line of history just as an edit does. (All of a merge's lines carry its own blob.)
+        const list = newer.get(file) ?? [];
+        if (list[list.length - 1] !== commit) list.push(commit);
+        newer.set(file, list);
+        continue;
+      }
       if (parentCount > 1) {
-        // Merge records for one commit are consecutive and come before its parents, so
-        // recording the touch when the last parent's diff lists the path keeps log order.
+        // Credit needs the merge to differ from EVERY parent. Merge records for one commit are
+        // consecutive and come before its parents, so crediting when the last parent's diff lists
+        // the path keeps log order.
         const key = `${commit}\0${file}`;
         const seen = (mergeSeen.get(key) ?? 0) + 1;
         mergeSeen.set(key, seen);
         if (seen < parentCount) continue;
       }
-      result.set(file, { commit, signer });
+      result.set(file, { commit, verify: false });
+      if (wellFormed) eligible.add(file);
+    }
+
+    // Replay check: only the credits that survive it are worth a signature check.
+    for (const [file, entry] of result) {
+      if (!eligible.has(file)) continue;
+      const touches = newer.get(file);
+      if (touches !== undefined && (!ancestryComplete || descendsFrom(parentsOf, touches, entry.commit))) continue;
+      entry.verify = true;
     }
     return result;
   }
 
   /**
-   * Blob id of every file under `relDir` in HEAD's tree (submodules are not files). Null for an
-   * unborn HEAD, which has no history to report; any other failure is an error.
+   * The signature half of `addedBy`: every credit with its signer, asked of git now for the
+   * commits whose `verify` is set (one batched `signers` lookup; none when no credit may count).
    */
-  private async headBlobs(relDir: string): Promise<Map<string, string> | null> {
+  async signed(credits: ReadonlyMap<string, Credit>): Promise<Map<string, AddedBy>> {
+    const commits = new Set<string>();
+    for (const c of credits.values()) if (c.verify) commits.add(c.commit);
+    const verdicts = commits.size === 0 ? new Map<string, Verdict>() : await this.signers([...commits]);
+    // git's `N` covers "cannot check" too: confirm it on the raw commit (one more call, only when
+    // some credited commit got an `N`).
+    const saidN = [...verdicts].filter(([, v]) => v.status === 'N').map(([c]) => c);
+    if (saidN.length > 0) {
+      const bare = await this.unsignedCommits(saidN);
+      for (const c of saidN) if (!bare.has(c)) (verdicts.get(c) as Verdict).status = '?';
+    }
+    const out = new Map<string, AddedBy>();
+    for (const [file, c] of credits) {
+      if (!c.verify) {
+        out.set(file, { commit: c.commit, signer: null });
+        continue;
+      }
+      const v = verdicts.get(c.commit);
+      out.set(file, { commit: c.commit, signer: v?.signer ?? null, status: v?.status ?? '' });
+    }
+    return out;
+  }
+
+  /**
+   * git's verdict on each commit in `commits` (full shas): `%G?`, and for a good signature (`G`)
+   * its key fingerprint, else its key id. One `git log --no-walk` per 500 commits, so gpg or
+   * ssh-keygen runs once per commit asked about and never for the rest of history. A record whose
+   * header is not exactly four fields, or names a commit not asked about, is skipped (no verdict).
+   */
+  async signers(commits: readonly string[]): Promise<Map<string, Verdict>> {
+    const out = new Map<string, Verdict>();
+    const asked = commits.filter((c) => FULL_SHA.test(c));
+    for (let i = 0; i < asked.length; i += SIGNATURE_BATCH) {
+      const batch = asked.slice(i, i + SIGNATURE_BATCH);
+      const wanted = new Set(batch);
+      const res = await this.run([
+        'log',
+        '--no-show-signature',
+        '--no-walk=unsorted',
+        '-z',
+        '--format=%x1e%H%x1f%G?%x1f%GF%x1f%GK',
+        ...batch,
+        '--',
+      ]);
+      if (res.code !== 0) throw new Error(`git log failed: ${res.stderr.trim() || `exit ${res.code}`}`);
+      for (const raw of splitZ(res.stdout)) {
+        const token = raw.replace(/^\n/, '').replace(/\n$/, '');
+        if (!token.startsWith(RS)) continue;
+        const fields = token.slice(1).split(US);
+        if (fields.length !== 4) continue;
+        const [hash = '', good = '', fingerprint = '', keyId = ''] = fields;
+        if (!wanted.has(hash)) continue;
+        const signer = good === 'G' ? fingerprint || keyId : '';
+        out.set(hash, { status: good, signer: signer === '' ? null : signer });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * The commits in `commits` (full shas) whose raw object has no signature header (`gpgsig`,
+   * `gpgsig-sha256`), from `git log --no-walk --pretty=raw`, one call per 500. Headers are read
+   * only up to the blank line that ends them (the message after it is indented and never read),
+   * and a block is attributed only to a commit asked about; anything unparsed counts as signed.
+   */
+  async unsignedCommits(commits: readonly string[]): Promise<Set<string>> {
+    const out = new Set<string>();
+    const asked = commits.filter((c) => FULL_SHA.test(c));
+    for (let i = 0; i < asked.length; i += SIGNATURE_BATCH) {
+      const batch = asked.slice(i, i + SIGNATURE_BATCH);
+      const wanted = new Set(batch);
+      const res = await this.run(['log', '--no-show-signature', '--no-walk=unsorted', '--pretty=raw', '-z', ...batch, '--']);
+      if (res.code !== 0) throw new Error(`git log failed: ${res.stderr.trim() || `exit ${res.code}`}`);
+      for (const block of splitZ(res.stdout)) {
+        const lines = block.replace(/^\n/, '').split('\n');
+        const hash = /^commit ([0-9a-f]{40}|[0-9a-f]{64})$/.exec(lines[0] ?? '')?.[1];
+        if (hash === undefined || !wanted.has(hash)) continue;
+        let signed = false;
+        let ended = false;
+        for (const line of lines.slice(1)) {
+          if (line === '') {
+            ended = true;
+            break;
+          }
+          if (/^gpgsig(?:-sha256)? /.test(line)) signed = true;
+        }
+        if (ended && !signed) out.add(hash);
+      }
+    }
+    return out;
+  }
+
+  /**
+   * HEAD's commit and the tree id of `relDir` in it (`-` when HEAD has no such path), in one
+   * `rev-parse`; null for an unborn HEAD or outside a repository. A key for results that are a
+   * function of HEAD's history, such as `addedBy`.
+   */
+  async headKey(relDir: string): Promise<{ head: string; tree: string } | null> {
+    const res = await this.run(['rev-parse', 'HEAD', `HEAD:${relDir}`]);
+    const [head = '', tree = ''] = res.stdout.split('\n');
+    if (!FULL_SHA.test(head)) return null;
+    return { head, tree: res.code === 0 && FULL_SHA.test(tree) ? tree : '-' };
+  }
+
+  /**
+   * Blob id of every file under `relDir` in HEAD's tree (submodules are not files), keyed by its
+   * repo-relative path. Null for an unborn HEAD, which has no history to report; any other
+   * failure is an error.
+   */
+  async headBlobs(relDir: string): Promise<Map<string, string> | null> {
     const res = await this.run(['ls-tree', '-r', '-z', '--full-name', 'HEAD', '--', literal(relDir)]);
     if (res.code !== 0) {
       if ((await this.head()) === null) return null;

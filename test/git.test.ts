@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { type Exec, defaultExec } from '../src/exec.js';
-import { Git } from '../src/git.js';
+import { type AddedBy, Git } from '../src/git.js';
 
 const dirs: string[] = [];
 
@@ -33,6 +33,11 @@ async function repo(): Promise<string> {
   await git(wt, 'config', 'user.email', 'tester@example.com');
   await git(wt, 'config', 'commit.gpgsign', 'false');
   return wt;
+}
+
+/** addedBy's entries without `status` (the %G? letter), for whole-map comparisons. */
+function plain(m: Map<string, AddedBy>): Map<string, { commit: string; signer: string | null }> {
+  return new Map([...m].map(([k, v]) => [k, { commit: v.commit, signer: v.signer }]));
 }
 
 function write(wt: string, rel: string, body: string): void {
@@ -179,6 +184,33 @@ async function rollbackMerge(wt: string, signS0: boolean): Promise<{ s0: string;
   return { s0, restore };
 }
 
+/**
+ * Signed S writes the tombstone on the current branch, then `retract` runs on that branch (it
+ * changes or deletes the tombstone). Branch `old` forks at S, adds an unrelated file, and merges
+ * the retracting branch back with `merge` (which leaves the merge uncommitted or commits it).
+ * Returns S and the branch names; HEAD is `old`'s tip afterwards.
+ */
+async function staleReplay(
+  wt: string,
+  retract: () => Promise<void>,
+  merge: (main: string) => Promise<void>,
+): Promise<{ s: string; main: string }> {
+  const tomb = '.elmory/tombstones/f_x';
+  write(wt, 'base.txt', 'base\n');
+  await commitAll(wt, 'base');
+  write(wt, tomb, 'supersedes: [f_victim]\n');
+  const s = await commitAll(wt, 'signed tombstone', '-S');
+  const main = (await git(wt, 'branch', '--show-current')).trim();
+  await git(wt, 'checkout', '-q', '-b', 'old');
+  write(wt, 'old.txt', 'old work\n');
+  await commitAll(wt, 'unrelated work on old');
+  await git(wt, 'checkout', '-q', main);
+  await retract();
+  await git(wt, 'checkout', '-q', 'old');
+  await merge(main);
+  return { s, main };
+}
+
 describe('Git', () => {
   it('head is null before the first commit and a sha after it', async () => {
     const wt = await repo();
@@ -289,7 +321,7 @@ describe('Git', () => {
     await commitAll(wt, 'outside');
     const g = new Git(defaultExec, wt);
     const added = await g.addedBy('.elmory/');
-    expect(added).toEqual(
+    expect(plain(added)).toEqual(
       new Map([
         ['.elmory/facts/f_a.md', { commit: third, signer: null }],
         ['.elmory/facts/f_b.md', { commit: second, signer: null }],
@@ -303,14 +335,14 @@ describe('Git', () => {
     await commitAll(wt, 'add tombstone');
     const merge = await evilMerge(wt, '.elmory/tombstones/f_x');
     const added = await new Git(defaultExec, wt).addedBy('.elmory/');
-    expect(added.get('.elmory/tombstones/f_x')).toEqual({ commit: merge, signer: null });
+    expect(added.get('.elmory/tombstones/f_x')).toMatchObject({ commit: merge, signer: null });
   });
 
   it('a clean merge is not a touch: each path keeps the branch commit that added it', async () => {
     const wt = await repo();
     const { sideAdd, mainAdd, merge } = await cleanMerge(wt, false);
     const added = await new Git(defaultExec, wt).addedBy('.elmory/');
-    expect(added).toEqual(
+    expect(plain(added)).toEqual(
       new Map([
         ['.elmory/tombstones/f_x', { commit: sideAdd, signer: null }],
         ['.elmory/facts/f_main.md', { commit: mainAdd, signer: null }],
@@ -323,23 +355,23 @@ describe('Git', () => {
     const wt = await repo();
     const { a, s, merge, path: tomb } = await sidedMerge(wt, 'ours', false);
     const added = await new Git(defaultExec, wt).addedBy('.elmory/');
-    expect(added.get(tomb)).toEqual({ commit: a, signer: null });
+    expect(added.get(tomb)).toMatchObject({ commit: a, signer: null });
     expect([s, merge]).not.toContain(added.get(tomb)?.commit);
-    expect(added.get('.elmory/facts/f_main.md')).toEqual({ commit: s, signer: null });
+    expect(added.get('.elmory/facts/f_main.md')).toMatchObject({ commit: s, signer: null });
   });
 
   it('merge that keeps the other side attributes to that side', async () => {
     const wt = await repo();
     const { s, path: tomb } = await sidedMerge(wt, 'theirs', false);
     const added = await new Git(defaultExec, wt).addedBy('.elmory/');
-    expect(added.get(tomb)).toEqual({ commit: s, signer: null });
+    expect(added.get(tomb)).toMatchObject({ commit: s, signer: null });
   });
 
   it("restoring an older version is attributed to the restore, not the older version's commit", async () => {
     const wt = await repo();
     const { restore } = await rollbackMerge(wt, false);
     const added = await new Git(defaultExec, wt).addedBy('.elmory/');
-    expect(added.get('.elmory/tombstones/f_x')).toEqual({ commit: restore, signer: null });
+    expect(added.get('.elmory/tombstones/f_x')).toMatchObject({ commit: restore, signer: null });
   });
 
   it('a path no longer in HEAD is absent', async () => {
@@ -350,7 +382,7 @@ describe('Git', () => {
     await git(wt, 'rm', '-q', '.elmory/facts/f_gone.md');
     await commitAll(wt, 'delete');
     const added = await new Git(defaultExec, wt).addedBy('.elmory/');
-    expect(added).toEqual(new Map([['.elmory/facts/f_kept.md', { commit: add, signer: null }]]));
+    expect(plain(added)).toEqual(new Map([['.elmory/facts/f_kept.md', { commit: add, signer: null }]]));
   });
 
   it('addedBy is empty before the first commit', async () => {
@@ -369,6 +401,7 @@ describe('Git', () => {
     expect((await g.addedBy('.elmory/')).get('.elmory/facts/f_m.md')).toEqual({
       commit: sha,
       signer: null,
+      status: 'N',
     });
   });
 
@@ -399,6 +432,70 @@ describe('Git', () => {
     }
   });
 
+  it.skipIf(!hasSshKeygen())('signatures are verified only for credited commits, in one lookup, never during the walk (C2)', async () => {
+    const wt = await repo();
+    const withSigners = await sshSigning(wt);
+    write(wt, '.elmory/facts/f_a.md', 'a\n');
+    const signed = await commitAll(wt, 'signed record', '-S');
+    const main = (await git(wt, 'branch', '--show-current')).trim();
+    // GitHub-style history: many signed merges, none touching .elmory.
+    for (let i = 0; i < 12; i++) {
+      await git(wt, 'checkout', '-q', '-b', `b${i}`);
+      write(wt, `src/f${i}.txt`, `${i}\n`);
+      await commitAll(wt, `c${i}`);
+      await git(wt, 'checkout', '-q', main);
+      await git(wt, 'merge', '-q', '--no-ff', '--no-verify', '-S', '-m', `merge ${i}`, `b${i}`);
+    }
+    const calls: string[][] = [];
+    const spy: Exec = (file, args, opts) => {
+      calls.push(args);
+      return withSigners(file, args, opts);
+    };
+    const added = await new Git(spy, wt).addedBy('.elmory/');
+    expect(added.get('.elmory/facts/f_a.md')).toMatchObject({ commit: signed, signer: expect.stringMatching(/^SHA256:/) });
+    const logs = calls.filter((c) => c.includes('log'));
+    expect(logs).toHaveLength(2);
+    const [walk, lookup] = logs as [string[], string[]];
+    expect(walk.some((a) => a.includes('%G'))).toBe(false);
+    expect(lookup).toContain('--no-walk=unsorted');
+    expect(lookup.filter((a) => /^[0-9a-f]{40,64}$/.test(a))).toEqual([signed]);
+  }, 30000);
+
+  it('no signature lookup runs when no credit survives', async () => {
+    const wt = await repo();
+    write(wt, '.elmory/facts/f_a.md', 'a\n');
+    await commitAll(wt, 'unsigned record');
+    write(wt, '.elmory/facts/f_a.md', 'b\n');
+    const calls: string[][] = [];
+    const spy: Exec = (file, args, opts) => {
+      calls.push(args);
+      return defaultExec(file, args, opts);
+    };
+    const g = new Git(spy, wt);
+    expect((await g.addedBy('.elmory/')).get('.elmory/facts/f_a.md')?.signer).toBeNull();
+    expect(calls.filter((c) => c.some((a) => a.includes('%G?')))).toHaveLength(1); // one credited commit, unsigned
+    expect(calls.filter((c) => c.includes('--pretty=raw'))).toHaveLength(1); // its N confirmed on the raw object
+    calls.length = 0;
+    const empty = await repo();
+    write(empty, 'src/x.ts', 'x\n');
+    await commitAll(empty, 'no records');
+    expect((await new Git(spy, empty).addedBy('.elmory/')).size).toBe(0);
+    expect(calls.filter((c) => c.includes('--no-walk=unsorted'))).toHaveLength(0);
+  });
+
+  it('headKey names HEAD and the tree of the path, or - when HEAD has no such path', async () => {
+    const wt = await repo();
+    const g = new Git(defaultExec, wt);
+    expect(await g.headKey('.elmory')).toBeNull();
+    write(wt, 'src/x.ts', 'x\n');
+    const first = await commitAll(wt, 'first');
+    expect(await g.headKey('.elmory')).toEqual({ head: first, tree: '-' });
+    write(wt, '.elmory/facts/f_a.md', 'a\n');
+    const second = await commitAll(wt, 'second');
+    const tree = (await git(wt, 'rev-parse', 'HEAD:.elmory')).trim();
+    expect(await g.headKey('.elmory')).toEqual({ head: second, tree });
+  });
+
   it.skipIf(!hasSshKeygen())('signed commit reports a signer', async () => {
     const wt = await repo();
     const withSigners = await sshSigning(wt);
@@ -421,7 +518,9 @@ describe('Git', () => {
     expect(added.get('.elmory/facts/f_u.md')).toEqual({
       commit: unsigned,
       signer: null,
+      status: 'N', // positively unsigned
     });
+    expect(s?.status).toBe('G');
     // The signer is the key, whatever the author line claims.
     const t = added.get('.elmory/facts/f_t.md');
     expect(t?.commit).toBe(signedForged);
@@ -430,6 +529,8 @@ describe('Git', () => {
     // Without the allowed-signers file the signature is not good, so there is no signer.
     const unverified = await new Git(defaultExec, wt).addedBy('.elmory/');
     expect(unverified.get('.elmory/facts/f_s.md')?.signer).toBeNull();
+    // ...and git cannot judge it: neither good nor unsigned (N2).
+    expect(unverified.get('.elmory/facts/f_s.md')?.status).not.toMatch(/^[GN]$/);
   });
 
   it.skipIf(!hasSshKeygen())('an unsigned edit after a signed add drops the signer', async () => {
@@ -442,7 +543,7 @@ describe('Git', () => {
 
     write(wt, '.elmory/tombstones/f_x', 'supersedes: [f_victim]\n');
     const forged = await commitAll(wt, 'unsigned edit', '--author=Mallory <m@x>');
-    expect((await g.addedBy('.elmory/')).get('.elmory/tombstones/f_x')).toEqual({ commit: forged, signer: null });
+    expect((await g.addedBy('.elmory/')).get('.elmory/tombstones/f_x')).toMatchObject({ commit: forged, signer: null });
     expect(forged).not.toBe(signed);
   });
 
@@ -454,7 +555,7 @@ describe('Git', () => {
     const t = added.get('.elmory/tombstones/f_x');
     expect(t?.commit).toBe(sideAdd);
     expect(t?.signer).toMatch(/^SHA256:/);
-    expect(added.get('.elmory/facts/f_main.md')).toEqual({ commit: mainAdd, signer: null });
+    expect(added.get('.elmory/facts/f_main.md')).toMatchObject({ commit: mainAdd, signer: null });
   });
 
   it.skipIf(!hasSshKeygen())('an unsigned evil merge after a signed add drops the signer', async () => {
@@ -466,7 +567,7 @@ describe('Git', () => {
     expect((await g.addedBy('.elmory/')).get('.elmory/tombstones/f_x')?.signer).toMatch(/^SHA256:/);
 
     const merge = await evilMerge(wt, '.elmory/tombstones/f_x');
-    expect((await g.addedBy('.elmory/')).get('.elmory/tombstones/f_x')).toEqual({ commit: merge, signer: null });
+    expect((await g.addedBy('.elmory/')).get('.elmory/tombstones/f_x')).toMatchObject({ commit: merge, signer: null });
   });
 
   it.skipIf(!hasSshKeygen())("an unsigned merge that keeps the unsigned side's version has no signer", async () => {
@@ -474,7 +575,7 @@ describe('Git', () => {
     const withSigners = await sshSigning(wt);
     const { a, path: tomb } = await sidedMerge(wt, 'ours', true);
     const added = await new Git(withSigners, wt).addedBy('.elmory/');
-    expect(added.get(tomb)).toEqual({ commit: a, signer: null });
+    expect(added.get(tomb)).toMatchObject({ commit: a, signer: null });
     expect(added.get('.elmory/facts/f_main.md')?.signer).toMatch(/^SHA256:/);
   });
 
@@ -492,6 +593,138 @@ describe('Git', () => {
     const withSigners = await sshSigning(wt);
     const { restore } = await rollbackMerge(wt, true);
     const added = await new Git(withSigners, wt).addedBy('.elmory/');
-    expect(added.get('.elmory/tombstones/f_x')).toEqual({ commit: restore, signer: null });
+    expect(added.get('.elmory/tombstones/f_x')).toMatchObject({ commit: restore, signer: null });
+  });
+
+  it.skipIf(!hasSshKeygen())('a merge that resolves to stale signed bytes has no signer', async () => {
+    const wt = await repo();
+    const withSigners = await sshSigning(wt);
+    const tomb = '.elmory/tombstones/f_x';
+    const { s } = await staleReplay(
+      wt,
+      async () => {
+        // a later signed commit replaces the signed statement
+        write(wt, tomb, 'supersedes: []\n');
+        await commitAll(wt, 'signed retraction', '-S');
+      },
+      async (main) => {
+        await git(wt, 'merge', '-q', '--no-ff', '--no-commit', main);
+        await git(wt, 'checkout', 'HEAD', '--', tomb); // resolve to the old, stale bytes
+        await commitAll(wt, 'merge main, keep old tombstone');
+      },
+    );
+    expect(fs.readFileSync(path.join(wt, tomb), 'utf8')).toBe('supersedes: [f_victim]\n');
+    const t = (await new Git(withSigners, wt).addedBy('.elmory/')).get(tomb);
+    expect(t).toMatchObject({ commit: s, signer: null });
+  });
+
+  it.skipIf(!hasSshKeygen())('merge -s ours over a deleted signed tombstone has no signer', async () => {
+    const wt = await repo();
+    const withSigners = await sshSigning(wt);
+    const tomb = '.elmory/tombstones/f_x';
+    const g = new Git(withSigners, wt);
+    let before: AddedBy | undefined;
+    const { s } = await staleReplay(
+      wt,
+      async () => {
+        await git(wt, 'rm', '-q', tomb);
+        await commitAll(wt, 'lift the forget', '-S');
+      },
+      async (main) => {
+        // an old branch that never saw the deletion still carries the signed statement
+        before = (await g.addedBy('.elmory/')).get(tomb);
+        await git(wt, 'merge', '-q', '-s', 'ours', '--no-verify', '-m', 'merge main, ours', main);
+      },
+    );
+    expect(before?.commit).toBe(s);
+    expect(before?.signer).toMatch(/^SHA256:/);
+    expect(fs.existsSync(path.join(wt, tomb))).toBe(true);
+    expect((await g.addedBy('.elmory/')).get(tomb)?.signer).toBeNull();
+  });
+
+  it.skipIf(!hasSshKeygen())('a reverted forget re-added on an old branch is untrusted', async () => {
+    const wt = await repo();
+    const withSigners = await sshSigning(wt);
+    const tomb = '.elmory/tombstones/f_x';
+    write(wt, 'base.txt', 'base\n');
+    await commitAll(wt, 'base');
+    const main = (await git(wt, 'branch', '--show-current')).trim();
+    await git(wt, 'checkout', '-q', '-b', 'old');
+    write(wt, 'old.txt', 'old work\n');
+    await commitAll(wt, 'old work');
+    await git(wt, 'checkout', '-q', main);
+    write(wt, tomb, 'supersedes: [f_victim]\n');
+    const s = await commitAll(wt, 'signed forget', '-S');
+    await git(wt, 'revert', '--no-edit', '-S', s);
+    // Mallory replays the signed bytes on the old branch, then brings main in cleanly.
+    await git(wt, 'checkout', '-q', 'old');
+    write(wt, tomb, 'supersedes: [f_victim]\n');
+    const replay = await commitAll(wt, 'replay', '--author=Mallory <m@x>');
+    await git(wt, 'merge', '-q', '--no-ff', '--no-verify', '-m', 'merge main', main);
+    const g = new Git(withSigners, wt);
+    const onOld = (await g.addedBy('.elmory/')).get(tomb);
+    expect([s, replay]).toContain(onOld?.commit);
+    expect(onOld?.signer).toBeNull();
+
+    // the same history merged the other way round
+    await git(wt, 'checkout', '-q', main);
+    await git(wt, 'merge', '-q', '--no-ff', '--no-verify', '-m', 'merge old', 'old');
+    const onMain = (await g.addedBy('.elmory/')).get(tomb);
+    expect([s, replay]).toContain(onMain?.commit);
+    expect(onMain?.signer).toBeNull();
+  });
+
+  it.skipIf(!hasSshKeygen())('a merge that adopts the other side, then one that adopts the signed bytes again, has no signer', async () => {
+    const wt = await repo();
+    const withSigners = await sshSigning(wt);
+    const tomb = '.elmory/tombstones/f_x';
+    write(wt, 'base.txt', 'base\n');
+    await commitAll(wt, 'base');
+    const main = (await git(wt, 'branch', '--show-current')).trim();
+    // B forks before S and writes other bytes at the path
+    await git(wt, 'checkout', '-q', '-b', 'b');
+    write(wt, tomb, 'supersedes: []\n');
+    await commitAll(wt, 'other bytes', '--author=Bob <b@x>');
+    await git(wt, 'checkout', '-q', main);
+    write(wt, tomb, 'supersedes: [f_victim]\n');
+    const s = await commitAll(wt, 'signed tombstone', '-S');
+    // C forks at S and still carries S's bytes
+    await git(wt, 'checkout', '-q', '-b', 'c');
+    write(wt, 'c.txt', 'c work\n');
+    await commitAll(wt, 'unrelated work on c');
+    await git(wt, 'checkout', '-q', main);
+    const g = new Git(withSigners, wt);
+    // main adopts B's version: S's bytes are gone from main's line
+    expect((await defaultExec('git', ['merge', '-q', '--no-ff', '--no-commit', 'b'], { cwd: wt })).code).not.toBe(0);
+    await git(wt, 'checkout', '--theirs', '--', tomb);
+    await commitAll(wt, 'merge b, take its tombstone');
+    expect((await g.addedBy('.elmory/')).get(tomb)?.signer).toBeNull();
+    // a later merge adopts C's copy of S's bytes, without itself editing the path
+    await git(wt, 'merge', '-q', '--no-ff', '--no-commit', 'c');
+    await git(wt, 'checkout', 'c', '--', tomb);
+    await commitAll(wt, 'merge c, take its tombstone');
+    expect(fs.readFileSync(path.join(wt, tomb), 'utf8')).toBe('supersedes: [f_victim]\n');
+    expect((await g.addedBy('.elmory/')).get(tomb)).toMatchObject({ commit: s, signer: null });
+  });
+
+  it.skipIf(!hasSshKeygen())('a signed tombstone carried by clean merges on both sides keeps its signer', async () => {
+    const wt = await repo();
+    const withSigners = await sshSigning(wt);
+    const tomb = '.elmory/tombstones/f_x';
+    write(wt, tomb, 'supersedes: [f_old]\n');
+    const s = await commitAll(wt, 'signed tombstone', '-S');
+    const main = (await git(wt, 'branch', '--show-current')).trim();
+    await git(wt, 'checkout', '-q', '-b', 'feat');
+    write(wt, '.elmory/facts/f_feat.md', 'feat\n');
+    await commitAll(wt, 'feat adds a fact');
+    await git(wt, 'checkout', '-q', main);
+    write(wt, '.elmory/facts/f_main.md', 'main\n');
+    await commitAll(wt, 'main adds a fact');
+    await git(wt, 'merge', '-q', '--no-ff', '--no-verify', '-m', 'merge feat', 'feat');
+    await git(wt, 'checkout', '-q', 'feat');
+    await git(wt, 'merge', '-q', '--no-ff', '--no-verify', '-m', 'merge main', main);
+    const t = (await new Git(withSigners, wt).addedBy('.elmory/')).get(tomb);
+    expect(t?.commit).toBe(s);
+    expect(t?.signer).toMatch(/^SHA256:/);
   });
 });

@@ -9,7 +9,7 @@ export type TrustSource = 'written' | 'approved' | 'signed';
 export interface Derived {
   id: string;
   state: State;
-  /** e.g. 'edited', 'untrusted', 'rejected', 'forget requested by an untrusted commit', 'basis replaced', 'cycle', 'not-found' */
+  /** e.g. 'edited', 'untrusted', 'rejected', FORGET_UNTRUSTED, FORGET_UNVERIFIABLE, 'basis replaced', 'cycle', 'not-found' */
   reason: string | null;
   trusted: boolean;
   trustSource: TrustSource | null;
@@ -32,6 +32,7 @@ export interface DeriveInput {
 }
 
 export const FORGET_UNTRUSTED = 'forget requested by an untrusted commit';
+export const FORGET_UNVERIFIABLE = 'forget requested by a commit whose signature cannot be verified here';
 export const LABEL_NEWER_FAILS = 'a newer value exists but does not hold on this branch';
 export const LABEL_UNREVIEWED = 'an unreviewed newer value exists';
 
@@ -44,6 +45,65 @@ interface Base {
 }
 type Problem = { state: 'stale' | 'suspect' | 'unknown'; reason: string };
 const SEVERITY: readonly Problem['state'][] = ['stale', 'suspect', 'unknown'];
+
+/**
+ * Whether a committed tombstone for `id` is trusted on its own: `addedBy` reports a signer for
+ * its path that the trust ledger names. The one rule for the Deriver and the index (I3).
+ */
+export function committedTombstoneTrusted(id: string, addedBy: ReadonlyMap<string, AddedBy>, trust: Trust): boolean {
+  const signer = addedBy.get(`.elmory/tombstones/${id}`)?.signer;
+  return !!signer && trust.signers.has(signer);
+}
+
+/**
+ * How a committed tombstone of `id` (no local twin) stands, from git's verdict on the commit its
+ * bytes are credited to (I3, N2):
+ * - `binding`: positively signed (`%G?` = `G`) by a key the trust ledger lists. Nothing lifts it.
+ * - `untrusted`: positively not a trusted signature: no credit (no commit left these bytes, or
+ *   they are uncommitted), a credit the replay check voided, unsigned (`N`, confirmed on the raw
+ *   commit), a bad signature (`B`), or a good one by a key the ledger does not list. An approval
+ *   of the record refuses it.
+ * - `unverifiable`: git cannot judge the signature here (`E`, `U`, `X`, `Y`, `R`, `?` for a
+ *   signed commit git called `N`, or no answer). Only an approval naming that commit refuses it
+ *   (`approved <id> <commit>`); a plain approval made before never does (fail closed).
+ * The one rule for the Deriver, the index and `approve`.
+ */
+export type ForgetStanding = 'binding' | 'untrusted' | 'unverifiable';
+
+export function committedForgetStanding(id: string, addedBy: ReadonlyMap<string, AddedBy>, trust: Trust): ForgetStanding {
+  if (committedTombstoneTrusted(id, addedBy, trust)) return 'binding';
+  const credit = addedBy.get(`.elmory/tombstones/${id}`);
+  if (credit === undefined || credit.status === undefined) return 'untrusted';
+  if (credit.status === 'G') {
+    if (credit.signer === null) return 'unverifiable';
+    return trust.signers.has(credit.signer) ? 'binding' : 'untrusted';
+  }
+  if (credit.status === 'N' || credit.status === 'B') return 'untrusted';
+  return 'unverifiable';
+}
+
+/** The commit a committed tombstone of `id` is credited to, if any. */
+export function forgetCommit(id: string, addedBy: ReadonlyMap<string, AddedBy>): string | null {
+  return addedBy.get(`.elmory/tombstones/${id}`)?.commit ?? null;
+}
+
+/**
+ * Whether the user's approval refuses the committed tombstone of `id`: an `untrusted` one under
+ * any approval, an `unverifiable` one only under an approval that names its credited commit.
+ */
+export function forgetLifted(id: string, addedBy: ReadonlyMap<string, AddedBy>, trust: Trust): boolean {
+  if (!approvedHere(trust, id)) return false;
+  const standing = committedForgetStanding(id, addedBy, trust);
+  if (standing === 'untrusted') return true;
+  if (standing === 'binding') return false;
+  const commit = forgetCommit(id, addedBy);
+  return commit !== null && commit !== '' && (trust.approvedCommits?.get(id)?.has(commit) ?? false);
+}
+
+/** The ledger's latest word on `id` is `approved` (a later `rejected` drops it, see Store.readTrust). */
+export function approvedHere(trust: Trust, id: string): boolean {
+  return trust.approved.has(id) && !trust.rejected.has(id);
+}
 
 function push(map: Map<string, string[]>, key: string, value: string): void {
   const list = map.get(key);
@@ -60,8 +120,11 @@ export class Deriver {
   private readonly input: DeriveInput;
   /** ids named by a trusted tombstone */
   private readonly forgotten = new Set<string>();
-  /** ids named only by an untrusted tombstone */
-  private readonly forgetUntrusted = new Set<string>();
+  /**
+   * ids named only by a tombstone that is not trusted and not lifted by an approval (see
+   * forgetLifted), with the candidate reason: FORGET_UNTRUSTED or FORGET_UNVERIFIABLE
+   */
+  private readonly forgetUntrusted = new Map<string, string>();
   /** One tombstone per id: the local copy when there is one, else the committed copy. */
   private readonly tombs: Tombstone[];
   /** Chain nodes: every record and every trusted tombstone id. */
@@ -91,7 +154,16 @@ export class Deriver {
       if (prev === undefined || (prev.committed && !t.committed)) byId.set(t.id, t);
     }
     this.tombs = [...byId.values()];
-    for (const t of this.tombs) (this.tombstoneTrusted(t) ? this.forgotten : this.forgetUntrusted).add(t.id);
+    for (const t of this.tombs) {
+      if (this.tombstoneTrusted(t)) this.forgotten.add(t.id);
+      // An untrusted forget of a record the user approved here is refused (I3): the approval is
+      // the review §8 asks for, and the record keeps its evidence-based state. One git cannot
+      // judge is refused only by an approval naming its commit (forgetLifted, N2).
+      else if (!forgetLifted(t.id, input.addedBy, input.trust)) {
+        const standing = committedForgetStanding(t.id, input.addedBy, input.trust);
+        this.forgetUntrusted.set(t.id, standing === 'unverifiable' ? FORGET_UNVERIFIABLE : FORGET_UNTRUSTED);
+      }
+    }
 
     for (const id of input.records.keys()) this.nodes.add(id);
     for (const id of this.forgotten) this.nodes.add(id);
@@ -136,8 +208,7 @@ export class Deriver {
    */
   tombstoneTrusted(t: Tombstone): boolean {
     if (!t.committed) return true;
-    const signer = this.input.addedBy.get(`.elmory/tombstones/${t.id}`)?.signer;
-    return !!signer && this.input.trust.signers.has(signer);
+    return committedTombstoneTrusted(t.id, this.input.addedBy, this.input.trust);
   }
 
   /**
@@ -233,7 +304,7 @@ export class Deriver {
 
   /** Steps 1–2: the candidate reason, or null when the record may be served. */
   private staticCandidate(id: string): string | null {
-    return this.slotCandidate(id) ?? (this.forgetUntrusted.has(id) ? FORGET_UNTRUSTED : null);
+    return this.slotCandidate(id) ?? this.forgetUntrusted.get(id) ?? null;
   }
 
   /**
@@ -370,7 +441,7 @@ export class Deriver {
     // An untrusted forget withholds the record itself; its slot is still judged by baseOf for others.
     const base: Base =
       this.slotCandidate(id) === null && this.forgetUntrusted.has(id)
-        ? { state: 'candidate', reason: FORGET_UNTRUSTED, evidence: [] }
+        ? { state: 'candidate', reason: this.forgetUntrusted.get(id) as string, evidence: [] }
         : await this.baseOf(id);
     let state: State;
     if (base.state !== 'holds') state = base.state;

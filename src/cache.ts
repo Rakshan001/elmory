@@ -91,6 +91,8 @@ CREATE TABLE IF NOT EXISTS old(path TEXT PRIMARY KEY, retired_at REAL NOT NULL);
 `;
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+/** `#locked`'s answer when the lock is held and the caller would not wait. */
+const BUSY: unique symbol = Symbol('busy');
 /** A stat entry written within this many ms of the file's mtime is not trusted (§4.3 read step 1). */
 const RACY_MS = 2000;
 const GEN_FILE = /^cache-(\d+)\.db(?:-wal|-shm)?$/;
@@ -136,9 +138,11 @@ function removeDbFiles(file: string): void {
 }
 
 /**
- * Whether another connection is inside a transaction on `file`. BEGIN EXCLUSIVE is busy while
- * any writer holds it (and, in rollback-journal mode, any reader); a TRUNCATE checkpoint reports
- * busy while a WAL reader pins it. Never waits.
+ * Whether another connection visibly holds `file`: a writer (BEGIN EXCLUSIVE is busy), or a
+ * reader that pins WAL frames (a TRUNCATE checkpoint reports busy). Cache files are in WAL mode,
+ * where readers never block BEGIN EXCLUSIVE, so a reader of a file whose WAL holds no frames is
+ * NOT detected. sweepOld probes only generations newer than the current one, which lock.db never
+ * pointed a reader at. Never waits.
  */
 function inUse(file: string): boolean {
   let db: DatabaseSync;
@@ -192,6 +196,49 @@ function tx<T>(db: DatabaseSync, fn: () => T): T {
   } catch (e) {
     if (db.isTransaction) db.exec('ROLLBACK');
     throw e;
+  }
+}
+
+/**
+ * The FTS5 MATCH expression for a user query: every term (split on whitespace and NUL) becomes a
+ * quoted phrase, OR-joined, so FTS syntax in the query is never interpreted. Null without terms.
+ */
+function ftsQuery(query: string): string | null {
+  const terms = query
+    .replaceAll('\0', ' ') // FTS5 ends a quoted string at a NUL ("unterminated string")
+    .split(/\s+/)
+    .filter((t) => t.length > 0)
+    .map((t) => `"${t.replaceAll('"', '""')}"`);
+  return terms.length === 0 ? null : terms.join(' OR ');
+}
+
+/** The searchable fields of a record that is not in the index (an archived file). */
+export interface SearchDoc {
+  id: string;
+  title: string;
+  body: string;
+  key: string | null;
+  paths: string[];
+}
+
+/**
+ * The ids among `docs` that `Cache.search` would match for `query`: the same columns, tokenizer
+ * and query escaping, in a private in-memory database that never touches disk. Sorted by id.
+ */
+export function matchDocs(query: string, docs: readonly SearchDoc[]): string[] {
+  const match = ftsQuery(query);
+  if (match === null || docs.length === 0) return [];
+  const db = new sqlite.DatabaseSync(':memory:');
+  try {
+    db.exec('PRAGMA temp_store=MEMORY; CREATE VIRTUAL TABLE docs USING fts5(id UNINDEXED, title, body, key, paths)');
+    const insert = db.prepare('INSERT INTO docs(id, title, body, key, paths) VALUES(?, ?, ?, ?, ?)');
+    for (const d of docs) insert.run(d.id, d.title, d.body, d.key, JSON.stringify(d.paths));
+    return db
+      .prepare('SELECT DISTINCT id FROM docs WHERE docs MATCH ? ORDER BY id')
+      .all(match)
+      .map((r) => str(r.id));
+  } finally {
+    db.close();
   }
 }
 
@@ -335,13 +382,33 @@ export class Cache {
    * fn must be synchronous. Throws CacheBusyError after the busy timeout. Re-entrant.
    */
   withWriteLock<T>(fn: () => T): T {
+    return this.#locked(fn, true) as T; // waiting never answers BUSY
+  }
+
+  /**
+   * Like `withWriteLock`, but never waits: when another connection holds the write lock it
+   * returns null at once, without running fn (so fn should not itself return null). Re-entrant:
+   * inside a held lock fn just runs.
+   */
+  tryWithWriteLock<T>(fn: () => T): T | null {
+    const out = this.#locked(fn, false);
+    return out === BUSY ? null : (out as T);
+  }
+
+  #locked<T>(fn: () => T, wait: boolean): T | typeof BUSY {
     const lock = this.#lock;
     if (lock === null || this.#lockDepth > 0) return fn();
     try {
-      lock.exec('BEGIN IMMEDIATE');
+      if (!wait) lock.exec('PRAGMA busy_timeout=0');
+      try {
+        lock.exec('BEGIN IMMEDIATE');
+      } finally {
+        if (!wait) lock.exec(`PRAGMA busy_timeout=${this.#busy}`);
+      }
     } catch (e) {
-      if (isBusy(e)) throw new CacheBusyError();
-      throw e;
+      if (!isBusy(e)) throw e;
+      if (wait) throw new CacheBusyError();
+      return BUSY;
     }
     this.#lockDepth++;
     try {
@@ -525,27 +592,23 @@ export class Cache {
   }
 
   /**
-   * Full-text search (spec §7.2 step 1). The query is escaped: every term (split on whitespace and NUL)
-   * becomes a quoted phrase, OR-joined, so FTS syntax in the query is never interpreted.
+   * Full-text search (spec §7.2 step 1). The query is escaped (`ftsQuery`): every term becomes a
+   * quoted phrase, OR-joined, so FTS syntax in the query is never interpreted.
    * score = -bm25(title 4, body 1, key 2, paths 1): higher is better; results are best first.
    */
   search(query: string, opts: { limit: number; offset: number; excludeIds?: Set<string> }): { id: string; score: number }[] {
     for (const [k, v] of [['limit', opts.limit], ['offset', opts.offset]] as const) {
       if (!Number.isSafeInteger(v) || v < 0) throw new RangeError(`search: ${k} must be a non-negative integer`);
     }
-    const terms = query
-      .replaceAll('\0', ' ') // FTS5 ends a quoted string at a NUL ("unterminated string")
-      .split(/\s+/)
-      .filter((t) => t.length > 0)
-      .map((t) => `"${t.replaceAll('"', '""')}"`);
-    if (terms.length === 0) return [];
+    const match = ftsQuery(query);
+    if (match === null) return [];
     this.ensureCurrent();
     const rows = this.#stmt(
       `SELECT r.id AS id, bm25(records_fts, 4.0, 1.0, 2.0, 1.0) AS rank
          FROM records_fts JOIN records r ON r.rowid = records_fts.rowid
         WHERE records_fts MATCH ? AND r.id NOT IN (SELECT value FROM json_each(?))
         ORDER BY rank, r.id LIMIT ? OFFSET ?`,
-    ).all(terms.join(' OR '), JSON.stringify([...(opts.excludeIds ?? [])]), opts.limit, opts.offset);
+    ).all(match, JSON.stringify([...(opts.excludeIds ?? [])]), opts.limit, opts.offset);
     return rows.map((r) => ({ id: str(r.id), score: -Number(r.rank) }));
   }
 
@@ -617,6 +680,13 @@ export class Cache {
   setMeta(k: string, v: string): void {
     this.ensureCurrent();
     this.#stmt('INSERT OR REPLACE INTO meta(k, v) VALUES(?, ?)').run(k, v);
+  }
+
+  /** Delete every meta row whose key starts with `prefix`; returns how many went. */
+  deleteMetaPrefix(prefix: string): number {
+    this.ensureCurrent();
+    const r = this.#stmt('DELETE FROM meta WHERE substr(k, 1, ?) = ?').run(prefix.length, prefix);
+    return Number(r.changes);
   }
 
   /**

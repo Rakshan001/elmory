@@ -14,10 +14,11 @@ small immutable Markdown records.
   could not reach.
 
 Release 1 covers coding agents only. The core is TypeScript on Node ≥ 24 with no runtime
-dependencies (`node:sqlite`, `node:crypto`); the MCP server adds the MCP SDK.
+dependencies (`node:sqlite`, `node:crypto`); the MCP server adds the MCP SDK. It needs git ≥ 2.31
+(signature attribution uses `git log --diff-merges=separate`).
 
-**Status:** release 1 is being built. It is not on npm yet; until it is, install from source
-(below).
+**Status:** release 1 core complete, unpublished. It is not on npm yet; until it is, install
+from source (below).
 
 ## Install
 
@@ -93,10 +94,13 @@ working directory, so a global entry serves whatever repo Codex was launched in.
 project, use a project-scoped `.codex/config.toml` (trusted projects only) that sets `cwd` or
 `ELMORY_WORKTREE`.
 
-Tools: `elmory_remember`, `elmory_note`, `elmory_recall`, `elmory_about`, `elmory_history`,
-`elmory_verify`, `elmory_review`, `elmory_approve`, `elmory_publish`, `elmory_forget` (by id
-only; ids that never existed come back in `unknown`). Results are JSON text; a refused write or
-a conflict comes back as an error result with `{ error, reason | heads }`.
+Tools (nine): `elmory_remember`, `elmory_note`, `elmory_recall`, `elmory_about`,
+`elmory_history`, `elmory_verify`, `elmory_review`, `elmory_publish`, `elmory_forget` (by id
+only; ids that never existed come back in `unknown`). There is no approve tool: approving is a
+human act, done with `elmory approve <id>` (or `elmory reject <id>`) from the CLI. Review results
+are `{ candidates, note }`, and the note says the titles are untrusted data. Results are JSON
+text, with bidi marks and C1 controls written as `\uXXXX` escapes. A refused write or a conflict
+comes back as an error result with `{ error, reason | heads }`.
 
 ## The three rules for agents
 
@@ -112,32 +116,43 @@ The same rules are in the `elmory_recall` tool description and in [AGENTS.md](AG
 
 Every verb takes `--json`, `--worktree <path>` (the git toplevel of that path; default: the
 current directory) and `--observer <s>` (default: `cli:$USER`; one printable line). These global
-flags go before or after the verb. Human output shows control characters in record text as
-visible escapes (`\x1b`), so a record cannot drive your terminal; `--json` output is unchanged.
+flags go before or after the verb. Human output shows control characters, bidi controls and the
+Unicode line/paragraph separators (U+2028/2029) in record text as visible escapes (`\x1b`,
+`\u202e`), so a record cannot drive your terminal or reorder what it shows; `--json` output is
+unchanged.
 
 | Command | What it does |
 |---|---|
 | `elmory remember <text> --title <t> --quote <file>:<text> … [--tag t] [--key k] [--supersedes id,…] [--cites id,…] [--local]` | save a fact that quotes the code it relies on |
 | `elmory note <text> --title <t> [--tag t] [--key k] [--supersedes id,…] [--cites id,…] [--local]` | save a decision or preference (not code-checked) |
-| `elmory recall <query> [--budget n] [--include state,…]` | the records that hold here, within a token budget, or "I don't know" |
+| `elmory recall <query> [--budget n] [--include state,…]` | the records that hold here, within a token budget, or "I don't know"; `--include` may add `superseded`, `stale`, `suspect`, `unknown` (`candidate` and `forgotten` are refused, exit `2`: candidates are seen through `review`) |
 | `elmory about <path\|key>` | the records quoting a path, or in a key's chain |
-| `elmory history <id\|key>` | a record's supersedes chain, oldest first, with each state here |
+| `elmory history <id\|key>` | a record's supersedes chain, oldest first, with each state here; `--json` gives `{ entries, warnings }` |
 | `elmory verify [--files a,b]` | re-check records against this worktree; report what changed |
 | `elmory forget <id…> \| --query <q> [--confirm] \| --all [--confirm]` | delete, cascade to citing records (archived ones too), report what could not be reached |
 | `elmory publish [id…]` | move pending records into `.elmory/facts/` to commit with the work |
 | `elmory review` | list records not yet trusted here, with the reason |
-| `elmory approve <id>` / `elmory reject <id>` | trust a record / hide it here |
+| `elmory approve <id>` / `elmory reject <id>` | trust a record / hide it here. For a record withheld by a forget, reject accepts the forget. Approve refuses a forget that is untrusted (`forget requested by an untrusted commit`: unsigned, badly signed, or signed by a key the ledger does not list). For one whose signature cannot be verified here (`…cannot be verified here`, e.g. gpg or the allowed signers file missing), `review` shows the forgetting commit and approve records it (`approved <id> <commit>`), refusing that forget only. A local forget, or one signed by a listed key, cannot be approved away (refused, exit `2`) |
 | `elmory gc [--dry-run] [--restore id]` | archive old superseded/stale records and unused notes |
 | `elmory rebuild` | rebuild the cache from the record files |
 | `elmory help` | list every verb (`--json` for a machine-readable list) |
+| `elmory --version` | the installed version |
 
-Exit codes: `0` ok, `1` error, `2` refused, `3` conflict, `4` abstain.
+Exit codes: `0` ok, `1` error, `2` refused, `3` conflict, `4` abstain. A `forget` whose ids all
+never existed here exits `1` (nothing was written). Outside a git repository, in a directory
+with no `.elmory`, the read-only verbs (`recall`, `about`, `history`, `verify`, `review`) answer
+"no Elmory store here" and create nothing (`recall` and `about` exit `4`); a write creates the
+store there.
 
 `forget --query` matches every record containing **any** of the words (they are OR-joined, as in
-`recall`), in every state, plus every record citing a match. So `forget --query` and
+`recall`), in every state (candidates included, so they appear in the preview), plus archived
+record files whose text matches, plus every record citing a match. So `forget --query` and
 `forget --all` without `--confirm` only list the matches and the cascade, then exit `2`; check
 the list, then run the same command with `--confirm`. Ids that never existed are reported as
-`unknown` and nothing is written for them.
+`unknown` and nothing is written for them. An id whose file is in another worktree's
+`.elmory/facts` (or only in HEAD) is forgotten too: both tombstones are written, its cache row is
+deleted, every worktree stops serving it at its next sync, and a `note:` line says its file stays
+there until it is deleted in that worktree.
 
 ## Storage layout
 
@@ -150,12 +165,14 @@ the list, then run the same command with `--confirm`. Ids that never existed are
   local/<id>.md                           private; never published
   trust                                   ledger, approvals, trusted signers (append-only)
   tombstones/<id>                         local forgets, effective at once in every worktree
-  archive/<id>.md                         gc'd, recoverable
+  archive/<id>.md                         gc'd pending records, recoverable
+  archive/local/<id>.md                   gc'd local records, restored as local
 ~/Library/Caches/elmory/<project-id>/     $XDG_CACHE_HOME/elmory/… when set; ~/.cache/elmory/… off macOS
   lock.db  cache-<n>.db
 ```
 
-- A worktree sees its own `.elmory/facts`, plus `pending`, plus `local`.
+- A worktree sees its own `.elmory/facts`, plus `pending`, plus `local`. After a branch switch
+  or checkout, the next call re-reads that worktree's records.
 - `remember` writes to `pending` (or `local`); `publish` moves pending records into the
   worktree's `.elmory/facts/`, ready to commit. Records are immutable and named by id, so there
   is no merge conflict.
@@ -173,12 +190,40 @@ the list, then run the same command with `--confirm`. Ids that never existed are
 - **Comment insertions and real syntax changes inside a quote** make it suspect; only
   whitespace, quote-style and trailing-comma changes are tolerated.
 - **Trust by commit signature** stops forged authors, but not a trusted signer acting
-  maliciously.
+  maliciously. A signed record or tombstone file stays trusted only while every later commit in
+  the branch's history keeps its bytes: if one changed, deleted or replaced it (a merge adopting
+  another version counts), bytes brought back later by a merge or an unsigned commit are
+  untrusted.
+- **Sync notices record files by stat, not by reading them.** A record file edited in place
+  within the 2 s racy window can be missed by sync and served from the cache; `elmory verify`
+  re-reads the files and catches it. Tools that restore mtimes (`rsync -t`, `tar -p`,
+  `touch -r`) can hide an edit, and an added or removed record file, the same way. Both need
+  local write access.
 - **Forget cannot reach copies outside Elmory.** The report names them.
 - **The cache directory is not pinned per project.** Processes with different `XDG_CACHE_HOME`
   values keep separate caches; a forget drops the text from another cache only when a process
   using it next syncs, and does not compact it.
 - **Notes are not code-checked.** They are labelled so, ranked lower, and collected by `gc`.
+- **Switching worktrees re-reads record files.** The cache is shared by every worktree of a clone
+  and remembers one sync stamp, so the first read after another worktree synced re-reads this
+  worktree's record files (about 0.15 s at 5 000 records) instead of trusting the stamp.
+
+## Differences from the spec
+
+Release 1 differs from [the spec](docs/specs/2026-10-21-elmory-memory-design.md) here:
+
+- **No `resolve` verb (§6.3).** Resolve a conflict with `remember` or `note` passing every head
+  in `--supersedes a,b`; the write gate's compare-and-set is the same.
+- **The short-quote rule is "one line", not "one whole line" (§4.3).** A quote under 16 tokens
+  must sit on one line with at least 3 word tokens and 24 non-space characters, and may be part
+  of that line; longer quotes may span lines. Either way it must be unique in the file.
+- **Superseded records are filtered after derivation, not in the search (§7.2).** Whether a
+  record is superseded depends on whether its successor holds in this worktree, so the search
+  is not pre-filtered; recall pages through the ranked hits instead.
+- **A tombstoned record file that comes back is indexed without its text (§4.6)** rather than
+  deleted again, so forgotten bytes never re-enter the cache and the record stays forgotten.
+- **No approve tool over MCP.** Approval is a human act, so `approve` and `reject` are CLI-only,
+  and `elmory_review` results carry a note that their titles are untrusted data.
 
 ## Docs
 

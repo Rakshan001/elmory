@@ -70,8 +70,10 @@ describe('sync (I5)', () => {
     let locks = 0;
     const listRecords = e.store.listRecords.bind(e.store);
     const withWriteLock = e.cache.withWriteLock.bind(e.cache);
+    const tryWithWriteLock = e.cache.tryWithWriteLock.bind(e.cache);
     e.store.listRecords = () => (reads++, listRecords());
     e.cache.withWriteLock = <T>(fn: () => T): T => (locks++, withWriteLock(fn));
+    e.cache.tryWithWriteLock = <T>(fn: () => T): T | null => (locks++, tryWithWriteLock(fn));
     expect(await e.sync()).toEqual([]);
     expect(await e.recall({ query: 'checkToken' })).toMatchObject({ abstain: false, warnings: [] });
     expect([reads, locks]).toEqual([0, 0]);
@@ -111,6 +113,20 @@ describe('sync (I5)', () => {
     expect(Date.now() - t0).toBeLessThan(4000); // all of it while the lock was held
     await released;
     expect((await reader.recall({ query: 'checkToken' })).warnings).toEqual([]);
+  }, 30000);
+
+  it('a held lock never makes a reader wait the busy timeout: sync uses tryWithWriteLock (N1)', async () => {
+    const { wt, cacheDir } = await repo();
+    const e = await open(wt, cacheDir); // the default 5 s busy timeout
+    await e.remember(factInput('Token check'));
+    const { released } = await holdLock(cacheDir, 3000);
+    pulled(e, 'Arrived while busy');
+    const t0 = Date.now();
+    expect(await e.sync()).toEqual([INDEX_BUSY]);
+    expect(await e.recall({ query: 'checkToken' })).toMatchObject({ abstain: false, warnings: [INDEX_BUSY] });
+    expect(Date.now() - t0).toBeLessThan(1000);
+    await released;
+    expect(await e.sync()).toEqual([]);
   }, 30000);
 
   it('verify re-reads every file: a record edited in place is caught', async () => {

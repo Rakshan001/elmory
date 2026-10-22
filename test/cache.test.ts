@@ -352,6 +352,34 @@ describe('Cache', () => {
     expect((await holder.done).out).toBe('OK');
   });
 
+  it('tryWithWriteLock returns null at once while the lock is held, and runs fn once it is free', () => {
+    const dir = tmp();
+    const holder = open(dir);
+    const saved = process.env.ELMORY_TEST_BUSY_MS;
+    process.env.ELMORY_TEST_BUSY_MS = '300';
+    let other: Cache;
+    try {
+      other = open(dir);
+    } finally {
+      if (saved === undefined) delete process.env.ELMORY_TEST_BUSY_MS;
+      else process.env.ELMORY_TEST_BUSY_MS = saved;
+    }
+    let ran = false;
+    holder.withWriteLock(() => {
+      const t0 = performance.now();
+      expect(other.tryWithWriteLock(() => (ran = true))).toBeNull();
+      expect(performance.now() - t0).toBeLessThan(100); // no busy wait
+      // the busy timeout is restored afterwards: a waiting lock still waits before giving up
+      const t1 = performance.now();
+      expect(() => other.withWriteLock(() => (ran = true))).toThrow(CacheBusyError);
+      expect(performance.now() - t1).toBeGreaterThanOrEqual(250);
+    });
+    expect(ran).toBe(false);
+    expect(other.tryWithWriteLock(() => other.tryWithWriteLock(() => 7))).toBe(7); // free, and nests
+    other.tryWithWriteLock(() => other.setMeta('k', 'v'));
+    expect(holder.getMeta('k')).toBe('v');
+  });
+
   it('withWriteLock rolls back the lock and rethrows on error, and nests', () => {
     const c = open(tmp());
     expect(() =>

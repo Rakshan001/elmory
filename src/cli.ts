@@ -3,9 +3,12 @@
 // handler. Exit codes: 0 ok, 1 other error, 2 refused, 3 conflict, 4 abstain. Errors go to stderr
 // as one line; `--json` prints the result (or the error) as JSON on stdout.
 
+import fs from 'node:fs';
 import os from 'node:os';
+import path from 'node:path';
 import { type ParseArgsConfig, parseArgs } from 'node:util';
 import { ConflictError, Elmory, RefusedError } from './api.js';
+import { defaultExec, gitCommonDir } from './exec.js';
 import type { Abstain, RecallResult, Served } from './api.js';
 import type { State } from './derive.js';
 import { type ForgetPreviewScope, type ForgetScope, previewForget } from './forget.js';
@@ -53,6 +56,18 @@ interface Verb {
   summary: string;
   options: Options;
   run(e: Elmory, a: Args): Promise<Outcome>;
+  /**
+   * Read-only verbs only: the answer outside git where no `.elmory` exists, given without opening
+   * (and so without creating) a store (M3).
+   */
+  noStore?: (a: Args) => Outcome;
+}
+
+const NO_STORE = 'no Elmory store here';
+
+/** recall and about outside any store: an abstain, exit 4. */
+function noStoreAbstain(): Outcome {
+  return { data: { abstain: true, reason: NO_STORE, hints: [], warnings: [] }, text: `I don't know: ${NO_STORE}`, code: EXIT_ABSTAIN };
 }
 
 interface Args {
@@ -139,16 +154,25 @@ function writeInput(a: Args, quotes: { file: string; text: string }[] | undefine
 //
 // Record text comes from other people's commits. Before it reaches a terminal every C0/C1
 // control character (ESC, CSI, OSC, CR, BEL…) is shown as a visible `\x..` escape, so a record
-// cannot move the cursor, rewrite lines, set the title or reach the clipboard. One-line fields
-// (title, observer, key, reason…) escape newlines and tabs too, so they cannot forge a line.
+// cannot move the cursor, rewrite lines, set the title or reach the clipboard. Bidi controls
+// (embeddings, overrides, isolates, marks) and the Unicode line and paragraph separators are shown
+// as `\u....`, so a record cannot reorder what is displayed ("Trojan Source") or break a line
+// where the terminal or a log viewer does. One-line fields (title, observer, key, reason…) escape
+// newlines and tabs too, so they cannot forge a line.
 // `--json` output is left exactly as the api returned it.
 
 /** Any C0 or C1 control character, DEL included. */
 const CONTROL = /[\u0000-\u001f\u007f-\u009f]/;
-const CONTROLS = new RegExp(CONTROL.source, 'g');
+/** Bidi controls (U+061C, U+200E/F, U+202A–202E, U+2066–2069) and U+2028/2029. */
+const INVISIBLE = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069\u2028\u2029]/;
+const ESCAPED = new RegExp(`${CONTROL.source}|${INVISIBLE.source}`, 'g');
 
 function escapeControls(s: string, keep: string): string {
-  return s.replace(CONTROLS, (c) => (keep.includes(c) ? c : `\\x${c.charCodeAt(0).toString(16).padStart(2, '0')}`));
+  return s.replace(ESCAPED, (c) => {
+    if (keep.includes(c)) return c;
+    const code = c.charCodeAt(0);
+    return code <= 0xff ? `\\x${code.toString(16).padStart(2, '0')}` : `\\u${code.toString(16).padStart(4, '0')}`;
+  });
 }
 
 /** A one-line field: every control character escaped, newlines and tabs included. */
@@ -233,6 +257,7 @@ const VERBS: Record<string, Verb> = {
       }
       return served(await e.recall(opts));
     },
+    noStore: noStoreAbstain,
   },
   about: {
     usage: 'about <path|key>',
@@ -241,6 +266,7 @@ const VERBS: Record<string, Verb> = {
     async run(e, a) {
       return served(await e.about(one(a, 'path or key')));
     },
+    noStore: noStoreAbstain,
   },
   history: {
     usage: 'history <id|key>',
@@ -256,6 +282,7 @@ const VERBS: Record<string, Verb> = {
       );
       return { data: h, text: lines(rows, `no history for ${inline(target)}`), warnings: h.warnings };
     },
+    noStore: () => ({ data: { entries: [], warnings: [NO_STORE] }, text: NO_STORE }),
   },
   verify: {
     usage: 'verify [--files a,b]',
@@ -272,6 +299,10 @@ const VERBS: Record<string, Verb> = {
       const changed = r.changed.map((c) => `${c.id} ${c.from ?? 'new'} → ${c.to}`);
       return { data: r, text: [...changed, counts === '' ? 'no records' : counts].join('\n'), warnings: r.warnings };
     },
+    noStore: () => ({
+      data: { changed: [], states: Object.fromEntries(Object.keys(STATES).map((s) => [s, 0])), warnings: [NO_STORE] },
+      text: NO_STORE,
+    }),
   },
   forget: {
     usage: 'forget <id…> | --query <q> [--confirm] | --all [--confirm]',
@@ -294,8 +325,13 @@ const VERBS: Record<string, Verb> = {
         `cascaded: ${r.cascaded.length === 0 ? 'none' : r.cascaded.join(', ')}`,
       ];
       if (r.unknown.length > 0) out.push(`unknown (no such record here; nothing written): ${r.unknown.join(', ')}`);
+      out.push(...r.notes.map((n) => `note: ${n}`));
       out.push(`compaction: ${r.compaction}`);
       if (r.unreachable.length > 0) out.push('not reachable from here:', ...r.unreachable.map((u) => `  ${u}`));
+      // Every id asked for was unknown: nothing happened, which a script must be able to see.
+      if ('ids' in scope && r.deleted.length === 0) {
+        return { data: r, text: out.join('\n'), code: EXIT_ERROR, stderr: `no such record here: ${r.unknown.join(', ')}; nothing written` };
+      }
       return { data: r, text: out.join('\n') };
     },
   },
@@ -315,8 +351,11 @@ const VERBS: Record<string, Verb> = {
     async run(e, a) {
       none(a);
       const r = await e.review();
-      return { data: r, text: lines(r.map((c) => `${c.id} ${inline(c.reason)} ${inline(c.title)}`), 'nothing to review') };
+      const row = (c: (typeof r)[number]): string =>
+        `${c.id} ${inline(c.reason)}${c.commit === undefined ? '' : ` (commit ${c.commit})`} ${inline(c.title)}`;
+      return { data: r, text: lines(r.map(row), 'nothing to review') };
     },
+    noStore: () => ({ data: [], text: NO_STORE }),
   },
   approve: {
     usage: 'approve <id>',
@@ -397,6 +436,7 @@ function helpText(): string {
     'elmory: evidence-checked memory for coding agents',
     '',
     'usage: elmory [--json] [--worktree <path>] [--observer <s>] <verb> [args]',
+    '       elmory --version',
     '       (--worktree: the git toplevel of that path, default the current directory)',
     '',
     ...Object.entries(VERBS).map(([name, v]) => `  ${name.padEnd(width)}  ${v.summary}\n  ${' '.repeat(width)}  elmory ${v.usage}`),
@@ -405,6 +445,22 @@ function helpText(): string {
     'forget --query matches records containing ANY of its words (OR); run it without --confirm first to see them.',
     'exit codes: 0 ok, 1 error, 2 refused, 3 conflict, 4 abstain (I don\'t know)',
   ].join('\n');
+}
+
+/** The package version, from the package.json next to dist/. */
+function version(): string {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version?: unknown };
+    return typeof pkg.version === 'string' ? pkg.version : 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
+/** Outside any git repository, with no `.elmory` in the directory: opening would create a store. */
+async function noStoreAt(worktree: string): Promise<boolean> {
+  if (fs.existsSync(path.join(worktree, '.elmory'))) return false;
+  return (await gitCommonDir(defaultExec, worktree)) === null;
 }
 
 function helpJson(): unknown {
@@ -467,6 +523,10 @@ function checkObserver(observer: string): string {
 async function main(argv: string[]): Promise<number> {
   const { name, rest } = splitVerb(argv);
   let json = rest.includes('--json');
+  if (name === '--version' || name === '-V') {
+    process.stdout.write(`${json ? JSON.stringify({ version: version() }) : `elmory ${version()}`}\n`);
+    return EXIT_OK;
+  }
   if (name === undefined || name === 'help' || name === '--help' || name === '-h') {
     process.stdout.write(`${json ? JSON.stringify(helpJson()) : helpText()}\n`);
     return EXIT_OK;
@@ -492,8 +552,10 @@ async function main(argv: string[]): Promise<number> {
   try {
     const observer = checkObserver(str(args, 'observer') ?? defaultObserver());
     const worktree = await resolveWorktree(str(args, 'worktree') ?? process.cwd());
-    e = await Elmory.open({ worktree, observer });
-    const out = await verb.run(e, args);
+    const out =
+      verb.noStore !== undefined && (await noStoreAt(worktree))
+        ? verb.noStore(args)
+        : await verb.run((e = await Elmory.open({ worktree, observer })), args);
     process.stdout.write(`${json ? JSON.stringify(out.data) : multiline(out.text)}\n`);
     if (!json) for (const w of out.warnings ?? []) process.stderr.write(`elmory ${name}: warning: ${inline(w)}\n`);
     if (out.stderr !== undefined) process.stderr.write(`elmory ${name}: ${out.stderr}\n`);

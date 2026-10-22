@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -57,6 +58,34 @@ const RAW_CONTROL = /[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/;
 const quoteArg = `${FILE}:${LINE}`;
 
 describe('elmory cli', () => {
+  it('--version prints the package version (M3)', async () => {
+    const { run } = await setup();
+    const pkg = JSON.parse(fs.readFileSync(path.join(path.dirname(CLI), '..', 'package.json'), 'utf8')) as { version: string };
+    expect(await run('--version')).toMatchObject({ code: 0, out: `elmory ${pkg.version}` });
+    expect(JSON.parse((await run('--json', '--version')).out)).toEqual({ version: pkg.version });
+  });
+
+  it('read-only verbs outside git with no .elmory create nothing and say so (M3)', async () => {
+    const { cacheDir } = await setup();
+    const plain = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'elmory-plain-')));
+    try {
+      const recall = await cli(plain, cacheDir, 'recall', 'anything');
+      expect(recall).toMatchObject({ code: 4, out: "I don't know: no Elmory store here" });
+      expect(JSON.parse((await cli(plain, cacheDir, '--json', 'about', 'src/x.ts')).out)).toMatchObject({ abstain: true, reason: 'no Elmory store here' });
+      for (const verb of [['history', 'k'], ['verify'], ['review']]) {
+        expect(await cli(plain, cacheDir, ...(verb as string[]))).toMatchObject({ code: 0, out: 'no Elmory store here' });
+      }
+      expect(JSON.parse((await cli(plain, cacheDir, '--json', 'review')).out)).toEqual([]);
+      expect(fs.existsSync(path.join(plain, '.elmory'))).toBe(false);
+      // A write still works without git (spec: the store lives in .elmory then).
+      expect((await cli(plain, cacheDir, 'note', 'No git here.', '--title', 'Plain dir')).code).toBe(0);
+      expect(fs.existsSync(path.join(plain, '.elmory'))).toBe(true);
+      expect((await cli(plain, cacheDir, 'recall', 'git')).code).toBe(0);
+    } finally {
+      fs.rmSync(plain, { recursive: true, force: true });
+    }
+  });
+
   it('dist/cli.js starts with a shebang', () => {
     expect(fs.readFileSync(CLI, 'utf8').startsWith('#!/usr/bin/env node\n')).toBe(true);
   });
@@ -172,12 +201,11 @@ describe('elmory cli', () => {
       body: 'line one \u001b]0;pwned\u0007 tail\r\nline two \u009b31m',
     });
 
-    const r = await run('recall', 'evil');
+    // The index makes such a record candidate: shape (never served), so it shows in review.
+    const r = await run('review');
     expect(r, r.err).toMatchObject({ code: 0 });
     expect(r.out).not.toMatch(RAW_CONTROL);
-    expect(r.out).toContain('## evil \\x1b[2Jclear title');
-    expect(r.out).toContain('line one \\x1b]0;pwned\\x07 tail');
-    expect(r.out).toContain('\\x9b31m');
+    expect(r.out).toBe(`${id} shape evil \\x1b[2Jclear title`);
 
     const h = await run('history', id);
     expect(h, h.err).toMatchObject({ code: 0 });
@@ -185,9 +213,27 @@ describe('elmory cli', () => {
     expect(h.out.split('\n')).toHaveLength(1); // the observer's newline cannot forge a second line
     expect(h.out).toContain('x\\x0ainjected: y');
 
-    const json = await run('recall', 'evil', '--json');
-    const got = JSON.parse(json.out) as { served: { title: string }[] };
-    expect(got.served[0]?.title).toBe('evil \u001b[2Jclear title');
+    const json = await run('review', '--json');
+    const got = JSON.parse(json.out) as { title: string }[];
+    expect(got[0]?.title).toBe('evil \u001b[2Jclear title');
+  }, 30000);
+
+  it('bidi controls and U+2028/2029 in record text are escaped in human output; --json keeps them', async () => {
+    const { wt, cacheDir, run } = await setup();
+    const title = 'admin \u202eexe.txt\u202c \u2066iso\u2069';
+    const observer = 'x\u2028injected: y\u2029z \u200f';
+    const id = await plant(wt, cacheDir, { type: 'memory/note', title, observer, body: 'plain body' });
+
+    const h = await run('history', id);
+    expect(h, h.err).toMatchObject({ code: 0 });
+    expect(h.out).not.toMatch(/[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069\u2028\u2029]/);
+    expect(h.out.split('\n')).toHaveLength(1);
+    expect(h.out).toContain('admin \\u202eexe.txt\\u202c \\u2066iso\\u2069');
+    expect(h.out).toContain('x\\u2028injected: y\\u2029z \\u200f');
+
+    const json = await run('history', id, '--json');
+    const got = JSON.parse(json.out) as { entries: { title: string; observer: string }[] };
+    expect(got.entries[0]).toMatchObject({ title, observer });
   }, 30000);
 
   it('--title and --observer with control characters are refused', async () => {
@@ -229,14 +275,22 @@ describe('elmory cli', () => {
     expect((await run('recall', 'freeze')).code).toBe(4);
   }, 30000);
 
-  it('forget of an id that never existed reports it as unknown', async () => {
+  it('forget of only ids that never existed reports them as unknown and exits 1', async () => {
     const { run } = await setup();
     const typo = `f_${'a'.repeat(26)}`;
     const r = await run('forget', typo, '--json');
-    expect(r, r.err).toMatchObject({ code: 0 });
+    expect(r.code).toBe(1);
     expect(JSON.parse(r.out)).toMatchObject({ deleted: [], unknown: [typo] });
+    expect(r.err).toBe(`elmory forget: no such record here: ${typo}; nothing written`);
     const human = await run('forget', typo);
+    expect(human.code).toBe(1);
     expect(human.out).toContain(`unknown (no such record here; nothing written): ${typo}`);
+
+    // one real id among them: the forget happened, exit 0
+    const real = JSON.parse((await run('note', 'Real one', '--title', 'real', '--json')).out) as { id: string };
+    const mixed = await run('forget', real.id, typo, '--json');
+    expect(mixed, mixed.err).toMatchObject({ code: 0 });
+    expect(JSON.parse(mixed.out)).toMatchObject({ deleted: [real.id], unknown: [typo] });
   }, 30000);
 
   it('global flags work before the verb; help --json lists the verbs', async () => {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { RecordRow } from '../src/cache.js';
-import { Deriver, type DeriveInput, FORGET_UNTRUSTED } from '../src/derive.js';
+import { Deriver, type DeriveInput, FORGET_UNTRUSTED, FORGET_UNVERIFIABLE } from '../src/derive.js';
 import type { EvidenceDetail, EvidenceReport, Outcome } from '../src/evidence.js';
 import type { AddedBy } from '../src/git.js';
 import type { RecordType, Source } from '../src/record.js';
@@ -314,6 +314,36 @@ describe('derive', () => {
     const twin = setup([rec('A', { area: 'facts' })], { tombstones: [t, { id: 'A', supersedes: [], committed: false }] });
     expect(twin.d.tombstoneTrusted(t)).toBe(false);
     expect((await twin.d.state('A')).state).toBe('forgotten');
+  });
+
+  it('an approval and a committed forget: binding, untrusted or unverifiable by git status (N2)', async () => {
+    const t: Tombstone = { id: 'A', supersedes: [], committed: true };
+    const sha = 'c'.repeat(40);
+    const credit = (status: string, signer: string | null = null): Map<string, AddedBy> =>
+      new Map([['.elmory/tombstones/A', { commit: sha, signer, status }]]);
+    const judge = async (addedBy: Map<string, AddedBy>, approval: 'none' | 'plain' | 'commit') => {
+      const trust: Partial<Trust> = {
+        signers: new Set(['FP1']),
+        approved: new Set(approval === 'none' ? [] : ['A']),
+        approvedCommits: new Map(approval === 'commit' ? [['A', new Set([sha])]] : []),
+      };
+      const { d } = setup([rec('A', { area: 'facts' })], { tombstones: [t], trust, addedBy });
+      const s = await d.state('A');
+      return s.state === 'candidate' ? s.reason : s.state;
+    };
+    // binding: a good signature by a listed key; nothing lifts it
+    for (const a of ['none', 'plain', 'commit'] as const) expect(await judge(credit('G', 'FP1'), a)).toBe('forgotten');
+    // untrusted (positively): unsigned, bad, a key the ledger does not list, no credit; a plain approval lifts it
+    for (const by of [credit('N'), credit('B'), credit('G', 'FP9'), new Map<string, AddedBy>()]) {
+      expect(await judge(by, 'none')).toBe(FORGET_UNTRUSTED);
+      expect(await judge(by, 'plain')).toBe('active');
+    }
+    // unverifiable: only an approval naming the commit lifts it
+    for (const status of ['E', 'U', 'X', 'Y', 'R', '?', '']) {
+      expect(await judge(credit(status), 'none')).toBe(FORGET_UNVERIFIABLE);
+      expect(await judge(credit(status), 'plain')).toBe(FORGET_UNVERIFIABLE);
+      expect(await judge(credit(status), 'commit')).toBe('active');
+    }
   });
 
   it('an unsigned edit of a committed tombstone with a local twin does not supersede anything', async () => {

@@ -18,20 +18,27 @@ export interface Context {
   /**
    * Incremental load: a no-op without the lock when nothing changed; otherwise index new files
    * with indexRecord and delete rows whose file is gone, under the write lock. Never throws
-   * CacheBusyError: when the lock is busy it returns a warning and the cache stays as it was.
+   * CacheBusyError and never waits for the lock: when it is held it returns a warning at once
+   * and the cache stays as it was.
    * `full` re-reads every record file even when nothing seems to have changed.
    */
   sync(opts?: { full?: boolean }): Promise<string[]>;
-  /** The records this worktree sees (§5): gate.viewOf over the shared cache rows. */
+  /** The records this worktree sees (§5): gate.viewOf over the shared cache rows and their file stamps. */
   view(): RecordRow[];
+  /**
+   * gate.liftedForgets as of the last sync(): approved records whose forget is untrusted, so
+   * refused (I3). Their files are indexed with text; pass this to every syncStore / viewOf.
+   */
+  lifted(): ReadonlySet<string>;
   /**
    * Deriver over `rows` (default view()), store.readTombstones(), store.readTrust(),
    * the addedBy map (empty without git), evidence bound to this worktree
    */
   deriver(rows?: readonly RecordRow[]): Promise<Deriver>;
   /**
-   * git.addedBy('.elmory'), fetched now (never memoised), minus paths whose working-tree bytes
-   * differ from HEAD; an empty map without git.
+   * git.addedBy('.elmory') for HEAD now (the history walk is reused while HEAD and its
+   * `.elmory` tree are unchanged; signatures are checked on every call), minus paths whose
+   * working-tree bytes differ from HEAD, also checked on every call; an empty map without git.
    */
   fetchAddedBy(): Promise<Map<string, AddedBy>>;
   /**

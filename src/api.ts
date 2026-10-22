@@ -1,17 +1,19 @@
 // The Elmory object (spec §3 layer 1) and the Context every flow receives.
 
 import fs from 'node:fs';
-import { Cache, CacheBusyError, type RecordRow } from './cache.js';
+import path from 'node:path';
+import { Cache, type RecordRow } from './cache.js';
 import type { Context, ElmoryEvent } from './context.js';
-import { Deriver } from './derive.js';
+import { Deriver, FORGET_UNTRUSTED, FORGET_UNVERIFIABLE, committedForgetStanding, forgetCommit } from './derive.js';
 import { Evidence } from './evidence.js';
 import { type Exec, defaultExec, gitCommonDir } from './exec.js';
 import * as gate from './gate.js';
 import { type ForgetReport, type ForgetScope, forget } from './forget.js';
-import { type AddedBy, Git } from './git.js';
+import { type AddedBy, type Credit, Git } from './git.js';
 import * as flows from './recall.js';
 import { RecordError, isRecordId } from './record.js';
 import { type Layout, Store, resolveLayout } from './store.js';
+import { resolveWorktree } from './worktree.js';
 
 export type { Context, ElmoryEvent } from './context.js';
 
@@ -44,37 +46,70 @@ const DEFAULT_OBSERVER = 'agent:unknown';
 export const INDEX_BUSY = 'index busy; results may be behind';
 
 /**
- * The top level of the work tree containing `dir` (git rev-parse --show-toplevel); `dir` itself
- * outside git. Inside a repository but outside any work tree (a bare repo, or inside `.git`)
- * there is no place for `.elmory/facts`, so that throws.
+ * Cache meta key prefix an earlier build used to persist the history walk. Trust never comes from
+ * the cache (V1, N1): such rows are deleted on open and never read.
  */
-async function workTreeRoot(exec: Exec, dir: string): Promise<string> {
-  let top: string | null = null;
-  try {
-    const res = await exec('git', ['rev-parse', '--show-toplevel'], { cwd: dir });
-    const out = res.stdout.replace(/\r?\n$/, '');
-    if (res.code === 0 && out !== '') top = out;
-  } catch {
-    // git could not run: gitCommonDir decides below
-  }
-  if (top !== null) return top;
-  if ((await gitCommonDir(exec, dir)) !== null) throw new Error(`not inside a git work tree: ${dir}`);
-  return dir;
+const LEGACY_ADDED_BY_META = 'addedby:';
+
+interface WalkEntry {
+  head: string;
+  tree: string;
+  credits: Map<string, Credit>;
 }
 
 /**
- * git's addedBy for `.elmory`, minus every path whose working-tree bytes differ from HEAD (N0):
- * the signature covers the committed bytes, not an uncommitted edit of them.
+ * git's addedBy('.elmory') per worktree. The history walk (which commit each path is credited
+ * to) is a function of HEAD's history alone, so it is reused while HEAD and HEAD's `.elmory`
+ * tree are the ones it was computed at. It decides trust, so it lives in this process's memory
+ * only, never in the cache (N1): a new process walks once. A walk is kept only when HEAD did not
+ * move during it. Signatures are never reused: every fetch asks git again for the credited
+ * commits (one batched `git log --no-walk`), so a key removed from the keyring or the allowed
+ * signers file stops counting at once. `fresh` walks again whatever the key says (verify).
  */
-async function signedAddedBy(exec: Exec, git: Git, worktree: string): Promise<Map<string, AddedBy>> {
+class CommittedAddedBy {
+  readonly #memo = new Map<string, WalkEntry>();
+
+  async get(git: Git, worktree: string, fresh: boolean): Promise<Map<string, AddedBy>> {
+    return git.signed(await this.#credits(git, worktree, fresh));
+  }
+
+  async #credits(git: Git, worktree: string, fresh: boolean): Promise<Map<string, Credit>> {
+    const key = await git.headKey('.elmory');
+    if (key === null) return git.credited('.elmory');
+    const hit = this.#memo.get(worktree);
+    if (!fresh && hit !== undefined && hit.head === key.head && hit.tree === key.tree) return hit.credits;
+    const credits = await git.credited('.elmory');
+    const after = await git.headKey('.elmory');
+    if (after !== null && after.head === key.head && after.tree === key.tree) this.#memo.set(worktree, { ...key, credits });
+    else this.#memo.delete(worktree);
+    return credits;
+  }
+}
+
+/**
+ * git's addedBy for `.elmory` (from `committed`), minus every path whose working-tree bytes
+ * differ from HEAD (N0): the signature covers the committed bytes, not an uncommitted edit of
+ * them. The diff runs every time: it depends on the working tree, not on HEAD.
+ */
+async function signedAddedBy(
+  exec: Exec,
+  git: Git,
+  worktree: string,
+  committed: CommittedAddedBy,
+  fresh = false,
+): Promise<Map<string, AddedBy>> {
   const [addedBy, diff] = await Promise.all([
-    git.addedBy('.elmory'),
+    committed.get(git, worktree, fresh),
     exec('git', ['diff', '--no-relative', '--name-only', '-z', 'HEAD', '--', ':(literal).elmory'], { cwd: worktree }),
   ]);
   if (addedBy.size === 0) return addedBy;
   if (diff.code !== 0) throw new Error(`git diff failed: ${diff.stderr.trim() || `exit ${diff.code}`}`);
   for (const p of diff.stdout.split('\0')) if (p !== '') addedBy.delete(p);
   return addedBy;
+}
+
+function sameSet(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
+  return a.size === b.size && [...a].every((x) => b.has(x));
 }
 
 /** Every worktree `git worktree list` names that exists on disk (bare entries skipped), realpath'd. */
@@ -108,8 +143,14 @@ export class Elmory implements Context {
   readonly #handlers = new Set<(e: ElmoryEvent) => void>();
   readonly #now: () => string;
   readonly #exec: Exec;
-  /** git's addedBy('.elmory'), shared by deriver() calls until the next sync() or write. */
+  /** signedAddedBy for this worktree, shared by deriver() calls until the next sync() or write. */
   #addedBy: Promise<Map<string, AddedBy>> | null = null;
+  /** git's addedBy per worktree: the history walk runs once per (HEAD, `.elmory` tree); signatures every fetch. */
+  readonly #committed: CommittedAddedBy;
+  /** Set by a full sync (verify): the next fetch walks the history again whatever HEAD is. */
+  #freshWalk = false;
+  /** gate.liftedForgets as of the last sync: approved records whose untrusted forget is refused (I3). */
+  #lifted: ReadonlySet<string> = new Set();
 
   private constructor(
     readonly layout: Layout,
@@ -123,13 +164,22 @@ export class Elmory implements Context {
   ) {
     this.#now = now;
     this.#exec = exec;
+    this.#committed = new CommittedAddedBy();
   }
 
-  /** show-toplevel → gitCommonDir → resolveLayout → Store.ensureDirs → Cache.open(projectId, cacheDir) → Git (null without git) → Evidence */
+  /**
+   * resolveWorktree (the git toplevel) → gitCommonDir → resolveLayout → Store.ensureDirs →
+   * Cache.open(projectId, cacheDir) → Git (null without git) → Evidence. Inside a repository but
+   * outside any work tree (a bare repo, or inside `.git`) there is no place for `.elmory/facts`:
+   * the directory resolveWorktree falls back to has no `.git` entry of its own, and that throws.
+   */
   static async open(opts: OpenOptions): Promise<Elmory> {
     const exec = opts.exec ?? defaultExec;
-    const worktree = await workTreeRoot(exec, opts.worktree);
+    const worktree = await resolveWorktree(opts.worktree, exec);
     const commonDir = await gitCommonDir(exec, worktree);
+    if (commonDir !== null && !fs.existsSync(path.join(worktree, '.git'))) {
+      throw new Error(`not inside a git work tree: ${opts.worktree}`);
+    }
     const layout = resolveLayout(worktree, commonDir);
     const store = new Store(layout);
     store.ensureDirs();
@@ -138,6 +188,8 @@ export class Elmory implements Context {
       const git = commonDir === null ? null : new Git(exec, layout.worktree);
       const evidence = new Evidence({ worktree: layout.worktree, cache, git });
       Elmory.#retryCompaction(cache);
+      Elmory.#sweepRetired(cache);
+      Elmory.#dropLegacyWalks(cache);
       return new Elmory(layout, store, cache, git, evidence, opts.observer ?? DEFAULT_OBSERVER, opts.now ?? (() => new Date().toISOString()), exec);
     } catch (e) {
       cache.close();
@@ -145,12 +197,57 @@ export class Elmory implements Context {
     }
   }
 
-  /** §8 step 7: a forget that left compaction pending is retried once here; failure keeps it pending. */
+  /**
+   * §8 step 7: a forget that left compaction pending is retried once here, as forget runs it:
+   * compact, then delete every other cache generation. It is `done` only when compaction
+   * finished and no other generation is left (one still held elsewhere keeps the forgotten
+   * bytes); any failure keeps it pending for the next open.
+   */
   static #retryCompaction(cache: Cache): void {
     try {
-      if (cache.getMeta('compaction') === 'pending') cache.compact();
+      if (cache.getMeta('compaction') !== 'pending') return;
     } catch {
-      // still pending: meta keeps saying so, and the next open tries again
+      return;
+    }
+    let done = false;
+    try {
+      // compact() writes `done` or `pending` itself; `done` is withdrawn below unless the sweep empties.
+      done = cache.compact() === 'done';
+      cache.sweepOld(0);
+      if (cache.otherGenerations().length > 0) done = false;
+    } catch {
+      done = false;
+    }
+    if (done) return;
+    try {
+      cache.setMeta('compaction', 'pending');
+    } catch {
+      // meta says pending unless compact() finished; the next open checks again either way
+    }
+  }
+
+  /**
+   * §9: delete cache generations retired (or left by a killed rebuild) more than 24 h ago, once
+   * per open. Never waits for the lock: a held lock leaves them for the next open.
+   */
+  static #sweepRetired(cache: Cache): void {
+    try {
+      if (cache.otherGenerations().length === 0) return;
+      cache.tryWithWriteLock(() => {
+        cache.sweepOld();
+        return true;
+      });
+    } catch {
+      // the sweep is housekeeping: a failure never fails the open
+    }
+  }
+
+  /** Delete history walks an earlier build kept in cache meta: never read, so never trusted (N1). */
+  static #dropLegacyWalks(cache: Cache): void {
+    try {
+      cache.deleteMetaPrefix(LEGACY_ADDED_BY_META);
+    } catch {
+      // ignored either way; a busy cache retries on the next open
     }
   }
 
@@ -168,20 +265,37 @@ export class Elmory implements Context {
    */
   async sync(opts: { full?: boolean } = {}): Promise<string[]> {
     this.#addedBy = null;
-    if (opts.full !== true && !gate.syncNeeded(this.store, this.cache)) return [];
-    try {
-      this.cache.withWriteLock(() => gate.syncIfChanged(this.store, this.cache, opts.full === true));
-    } catch (e) {
-      if (e instanceof CacheBusyError) return [INDEX_BUSY];
-      throw e;
-    }
-    return [];
+    if (opts.full === true) this.#freshWalk = true;
+    // Which untrusted forgets an approval refuses can change without the fingerprint moving (a
+    // key leaves the allowed signers): a change re-reads every file.
+    const lifted = await this.#liftedNow();
+    const liftMoved = !sameSet(lifted, this.#lifted);
+    this.#lifted = lifted;
+    const full = opts.full === true || liftMoved;
+    if (!full && !gate.syncNeeded(this.store, this.cache)) return [];
+    // tryWithWriteLock never waits: a held lock is null at once, not the 5 s busy timeout.
+    const ran = this.cache.tryWithWriteLock(() => {
+      gate.syncIfChanged(this.store, this.cache, full, lifted);
+      return true;
+    });
+    return ran === null ? [INDEX_BUSY] : [];
+  }
+
+  /** gate.liftedForgets now; git's addedBy is fetched (and memoised) only when an approval may apply. */
+  async #liftedNow(): Promise<ReadonlySet<string>> {
+    if (!gate.liftMayApply(this.store)) return new Set();
+    return gate.liftedForgets(this.store, await this.#memoAddedBy());
+  }
+
+  lifted(): ReadonlySet<string> {
+    return this.#lifted;
   }
 
   /**
    * A new Deriver (and a fresh evidence memo) per request over `rows` (default: the cache now);
-   * call `sync()` first. git's addedBy is memoised per instance (one `git log` instead of one per
-   * call) and dropped by `sync()` and by every write.
+   * call `sync()` first. fetchAddedBy is memoised per instance until `sync()` or a write; under
+   * it, the history walk is reused while HEAD and its `.elmory` tree stay the same (signatures
+   * are checked again on every fetch).
    */
   async deriver(rows?: readonly RecordRow[]): Promise<Deriver> {
     const addedBy = await this.#memoAddedBy();
@@ -190,11 +304,15 @@ export class Elmory implements Context {
   }
 
   view(): RecordRow[] {
-    return gate.viewOf(this.store, this.cache.allRecords());
+    return gate.viewOfCache(this.store, this.cache, this.#lifted);
   }
 
-  fetchAddedBy(): Promise<Map<string, AddedBy>> {
-    return this.git === null ? Promise.resolve(new Map()) : signedAddedBy(this.#exec, this.git, this.layout.worktree);
+  async fetchAddedBy(): Promise<Map<string, AddedBy>> {
+    if (this.git === null) return new Map();
+    const fresh = this.#freshWalk;
+    const out = await signedAddedBy(this.#exec, this.git, this.layout.worktree, this.#committed, fresh);
+    if (fresh) this.#freshWalk = false;
+    return out;
   }
 
   #memoAddedBy(): Promise<Map<string, AddedBy>> {
@@ -223,11 +341,12 @@ export class Elmory implements Context {
       const store = new Store(layout);
       const git = new Git(this.#exec, layout.worktree);
       const evidence = new Evidence({ worktree: layout.worktree, cache: this.cache, git });
+      const addedBy = await signedAddedBy(this.#exec, git, layout.worktree, this.#committed);
       const deriver = new Deriver({
-        records: new Map(gate.viewOf(store, this.cache.allRecords()).map((r) => [r.id, r])),
+        records: new Map(gate.viewOfCache(store, this.cache, gate.liftedForgets(store, addedBy)).map((r) => [r.id, r])),
         tombstones: store.readTombstones(),
         trust: store.readTrust(),
-        addedBy: await signedAddedBy(this.#exec, git, layout.worktree),
+        addedBy,
         evidence: (row) => evidence.checkAll(row.sources),
       });
       out.push({ worktree: layout.worktree, deriver });
@@ -274,43 +393,86 @@ export class Elmory implements Context {
 
   /**
    * Move pending records into this worktree's `.elmory/facts` (all pending when `ids` is
-   * omitted). Only pending moves: naming a local record is refused (`RefusedError('local')`, V25).
+   * omitted). Only pending moves: naming a local record is refused (`RefusedError('local')`,
+   * V25), and naming any other id not in pending is refused (`RefusedError('unknown-id')`).
+   * Every id is checked before anything moves.
    */
   publish(ids?: string[]): string[] {
     this.#addedBy = null;
     return this.cache.withWriteLock(() => {
+      const pending = new Set(this.store.ids('pending'));
       for (const id of ids ?? []) {
+        if (pending.has(id)) continue;
         if (this.store.readRecord(id)?.area === 'local') {
           throw new gate.RefusedError(`${id} is local and is never published`, 'local');
         }
+        throw new gate.RefusedError(`no pending record ${id} to publish`, 'unknown-id');
       }
       const moved = this.store.publish(ids);
-      gate.syncIfChanged(this.store, this.cache);
+      gate.syncIfChanged(this.store, this.cache, false, this.#lifted);
       return moved;
     });
   }
 
-  /** Every candidate with its reason, except those rejected here (reject hides). */
-  async review(): Promise<{ id: string; reason: string; title: string }[]> {
+  /**
+   * Every candidate with its reason, except those rejected here (reject hides). A record withheld
+   * by a forget (FORGET_UNTRUSTED, FORGET_UNVERIFIABLE) is indexed without text, so its title is
+   * read from its file here, for the reviewer only, and never cached; `commit` names the commit
+   * the forget is credited to, which `approve` will record for one git cannot verify.
+   */
+  async review(): Promise<{ id: string; reason: string; title: string; commit?: string }[]> {
     await this.sync();
     // One snapshot of this worktree's view: the Deriver and the loop see the same rows.
     const rows = this.view();
     const d = await this.deriver(rows);
-    const out: { id: string; reason: string; title: string }[] = [];
+    const addedBy = await this.#memoAddedBy();
+    const out: { id: string; reason: string; title: string; commit?: string }[] = [];
     for (const row of rows) {
       const s = await d.state(row.id);
       if (s.state !== 'candidate' || s.reason === 'rejected') continue;
-      out.push({ id: row.id, reason: s.reason ?? 'untrusted', title: row.title });
+      const item: { id: string; reason: string; title: string; commit?: string } = { id: row.id, reason: s.reason ?? 'untrusted', title: row.title };
+      if (s.reason === FORGET_UNTRUSTED || s.reason === FORGET_UNVERIFIABLE) {
+        const sr = this.store.readRecord(row.id);
+        item.title = sr === null ? '' : gate.indexRecord(sr).title;
+        const commit = forgetCommit(row.id, addedBy);
+        if (commit !== null && commit !== '') item.commit = commit;
+      }
+      out.push(item);
     }
     return out;
   }
 
   /**
-   * Append `approved <id>` to the trust ledger. The record must be present in this worktree. The
-   * latest ledger line for an id wins, so approving a rejected record re-trusts it.
+   * Append an approval to the trust ledger. The record must be present in this worktree. The
+   * latest ledger line for an id wins, so approving a rejected record re-trusts it. Over a forget
+   * of the record (I3, N2): a trusted one (a local tombstone, or a committed one signed by a key
+   * the ledger lists) is refused; an untrusted one is refused by this approval (`approved <id>`);
+   * one whose signature git cannot verify here is refused only for its credited commit, so the
+   * line names it (`approved <id> <commit>`) and a later forget from another commit stands.
    */
   async approve(id: string): Promise<void> {
-    this.#trustLine('approved', id);
+    this.#addedBy = null;
+    if (!isRecordId(id)) throw new RecordError(`not a record id: ${id}`, 'id');
+    const trust = this.store.readTrust();
+    const addedBy = await this.fetchAddedBy();
+    let commit: string | null = null;
+    for (const t of this.store.readTombstones()) {
+      if (t.id !== id) continue;
+      const standing = t.committed ? committedForgetStanding(id, addedBy, trust) : 'binding';
+      if (standing === 'binding') {
+        throw new gate.RefusedError(`${id} was forgotten by a trusted tombstone; an approval cannot bring it back`, 'forgotten');
+      }
+      if (standing === 'unverifiable') {
+        commit = forgetCommit(id, addedBy);
+        if (commit === null || commit === '') {
+          throw new gate.RefusedError(`${id} was forgotten by a commit git cannot name here; the forget stands`, 'forgotten');
+        }
+      }
+    }
+    this.cache.withWriteLock(() => {
+      if (this.store.readRecord(id) === null) throw new RecordError(`no record ${id} in this worktree`, 'not-found');
+      this.store.appendTrust(commit === null ? `approved ${id}` : `approved ${id} ${commit}`);
+    });
   }
 
   /** Append `rejected <id>`: hides the record here; the file stays. */
@@ -367,13 +529,18 @@ export class Elmory implements Context {
 
   /** A fresh cache generation indexed from every record file. */
   async rebuild(): Promise<void> {
+    const lifted = await this.#liftedNow();
+    this.#lifted = lifted;
     this.cache.rebuild((fresh) => {
-      gate.syncStore(this.store, fresh);
+      gate.syncStore(this.store, fresh, false, lifted);
       // Last-recall stamps are not in any file; carry them over so gc's answer does not change.
       for (const row of fresh.allRecords()) {
         const stamp = this.cache.getMeta(`recall:${row.id}`);
         if (stamp !== null) fresh.setMeta(`recall:${row.id}`, stamp);
       }
+      // A forget's pending compaction is still owed: the old generation holding those bytes is
+      // only retired here, and the next open retries (M1).
+      if (this.cache.getMeta('compaction') === 'pending') fresh.setMeta('compaction', 'pending');
     });
   }
 
