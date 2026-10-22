@@ -59,6 +59,18 @@ describe('tokenize', () => {
   it('returns no tokens for blank text', () => {
     expect(tokenize(' \n\t ')).toEqual([]);
   });
+
+  it('keeps an emoji or other astral character as one token', () => {
+    expect(tokenize('a😀b')).toEqual(['a', '😀', 'b']);
+    expect(tokenize('𝑥 = 1')).toEqual(['𝑥', '=', '1']);
+  });
+
+  it('tells two different emoji apart in quote and anchor hashes', () => {
+    const a = tokenize('const face = "😀";');
+    const b = tokenize('const face = "😎";');
+    expect(quoteHash(a)).not.toBe(quoteHash(b));
+    expect(anchorHash(a)).not.toBe(anchorHash(b));
+  });
 });
 
 describe('hashes', () => {
@@ -119,6 +131,12 @@ describe('containsSecret', () => {
     expect(containsSecret('t = xoxb-1234567890-abc')).toBe(true);
     expect(containsSecret('-----BEGIN RSA PRIVATE KEY-----')).toBe(true);
     expect(containsSecret('k = AIza' + 'b'.repeat(35))).toBe(true);
+  });
+
+  it('does not take a kebab-case identifier ending in "sk-" for an sk- key', () => {
+    expect(containsSecret('import { mount } from "./disk-management-utils-volume";')).toBe(false);
+    expect(containsSecret('const id = task-runner-scheduler-queue-worker;')).toBe(false);
+    expect(containsSecret('key: "sk-' + 'x'.repeat(24) + '"')).toBe(true);
   });
 
   it('flags a high-entropy string literal of 20+ characters', () => {
@@ -247,7 +265,9 @@ describe('locate', () => {
     expect(locateAfter(before, QUOTE, '')).toBe('not-found');
   });
 
-  it('timing: 5000 quotes over 200 files locate in under 2 s', () => {
+  // A regression guard, not a benchmark: the budget leaves room for a loaded machine. The
+  // measured time is logged; about 270 ms on an idle dev machine.
+  it('timing: 5000 quotes over 200 files locate in under 5 s', () => {
     const files: string[] = [];
     const quotes: { file: number; quote: string; anchor: string; tokens: number }[] = [];
     for (let f = 0; f < 200; f++) {
@@ -273,6 +293,6 @@ describe('locate', () => {
     expect(results).toHaveLength(5000);
     expect(results.every((r) => r === 'found')).toBe(true);
     console.log(`timing: 5000 quotes over 200 files located in ${elapsed.toFixed(0)} ms`);
-    expect(elapsed).toBeLessThan(2000);
+    expect(elapsed).toBeLessThan(5000);
   });
 });

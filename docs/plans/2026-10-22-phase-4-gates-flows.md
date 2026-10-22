@@ -40,7 +40,7 @@ export interface Context {
   observer: string;                                   // e.g. 'agent:claude-code'
   now(): string;                                      // ISO UTC, injectable for tests
   sync(): Promise<void>;                              // incremental load: store ids vs cache.knownIds(); index new files with indexRecord; delete rows whose file is gone
-  deriver(): Promise<Deriver>;                        // Deriver over cache.allRecords(), store.readTombstones(), store.readTrust(), git.addedBy('.elmory/facts') (empty map without git), evidence bound to this worktree
+  deriver(): Promise<Deriver>;                        // Deriver over cache.allRecords(), store.readTombstones(), store.readTrust(), git.addedBy('.elmory') (facts and tombstones; empty map without git), evidence bound to this worktree
   emit(event: ElmoryEvent): void;
 }
 export type ElmoryEvent =
