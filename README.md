@@ -93,10 +93,13 @@ working directory, so a global entry serves whatever repo Codex was launched in.
 project, use a project-scoped `.codex/config.toml` (trusted projects only) that sets `cwd` or
 `ELMORY_WORKTREE`.
 
-Tools: `elmory_remember`, `elmory_note`, `elmory_recall`, `elmory_about`, `elmory_history`,
-`elmory_verify`, `elmory_review`, `elmory_approve`, `elmory_publish`, `elmory_forget` (by id
-only; ids that never existed come back in `unknown`). Results are JSON text; a refused write or
-a conflict comes back as an error result with `{ error, reason | heads }`.
+Tools (nine): `elmory_remember`, `elmory_note`, `elmory_recall`, `elmory_about`,
+`elmory_history`, `elmory_verify`, `elmory_review`, `elmory_publish`, `elmory_forget` (by id
+only; ids that never existed come back in `unknown`). There is no approve tool: approving is a
+human act, done with `elmory approve <id>` (or `elmory reject <id>`) from the CLI. Review results
+are `{ candidates, note }`, and the note says the titles are untrusted data. Results are JSON
+text, with bidi marks and C1 controls written as `\uXXXX` escapes. A refused write or a conflict
+comes back as an error result with `{ error, reason | heads }`.
 
 ## The three rules for agents
 
