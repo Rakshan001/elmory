@@ -205,29 +205,30 @@ export class Evidence {
   }
 
   /**
-   * Where `relPath` as of `commit` is at HEAD, cached per (commit, HEAD tree). `unknown` is never
-   * persisted: the commit may become reachable after a fetch without the tree changing.
+   * Where `relPath` as of `commit` is at HEAD. Every result, `unknown` included, is memoised for
+   * the request, so one unreachable commit costs one lookup per path. Only the others are
+   * persisted per (commit, HEAD tree): the commit may become reachable after a fetch without the
+   * tree changing.
    */
   async #rename(commit: string, relPath: string): Promise<RenameResultJson> {
     const git = this.#git;
     if (git === null) return { status: 'deleted' };
     this.#tree ??= git.tree();
     const tree = await this.#tree;
-    if (tree === null) return git.renameLookup(commit, relPath);
 
-    const key = `${commit}\0${tree}`;
+    const key = `${commit}\0${tree ?? ''}`;
     let map = this.#renames.get(key);
     if (map === undefined) {
-      map = this.#cache.getRename(commit, tree) ?? {};
+      map = (tree === null ? null : this.#cache.getRename(commit, tree)) ?? {};
       this.#renames.set(key, map);
     }
     const known = map[relPath];
     if (known !== undefined) return known;
     const r = await git.renameLookup(commit, relPath);
     const entry: RenameResultJson = r.newPath === undefined ? { status: r.status } : { status: r.status, newPath: r.newPath };
-    if (entry.status !== 'unknown') {
-      map[relPath] = entry;
-      this.#cache.putRename(commit, tree, map);
+    map[relPath] = entry;
+    if (tree !== null && entry.status !== 'unknown') {
+      this.#cache.putRename(commit, tree, Object.fromEntries(Object.entries(map).filter(([, v]) => v.status !== 'unknown')));
     }
     return entry;
   }

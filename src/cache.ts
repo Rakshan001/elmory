@@ -78,7 +78,7 @@ INSERT INTO records_fts(records_fts, rank) VALUES('secure-delete', 1);
 CREATE TABLE IF NOT EXISTS evidence(content_id TEXT NOT NULL, quote_hash TEXT NOT NULL, result TEXT NOT NULL,
   PRIMARY KEY(content_id, quote_hash));
 CREATE TABLE IF NOT EXISTS stat(worktree TEXT NOT NULL, path TEXT NOT NULL, mtime REAL NOT NULL, ctime REAL NOT NULL,
-  size INTEGER NOT NULL, ino INTEGER NOT NULL, content_id TEXT NOT NULL, written_at REAL NOT NULL,
+  size INTEGER NOT NULL, ino TEXT NOT NULL, content_id TEXT NOT NULL, written_at REAL NOT NULL,
   PRIMARY KEY(worktree, path));
 CREATE TABLE IF NOT EXISTS renames("commit" TEXT NOT NULL, tree TEXT NOT NULL, json TEXT NOT NULL, PRIMARY KEY("commit", tree));
 CREATE TABLE IF NOT EXISTS verify_state(worktree TEXT NOT NULL, id TEXT NOT NULL, state TEXT NOT NULL, PRIMARY KEY(worktree, id));
@@ -349,7 +349,12 @@ export class Cache {
       const fresh = new Cache(this.dir, null, db, n, this.#busy);
       try {
         tx(db, () => db.exec(SCHEMA));
-        tx(db, () => fill(fresh));
+        tx(db, () => {
+          const out: unknown = fill(fresh);
+          if (typeof (out as { then?: unknown } | null)?.then === 'function') {
+            throw new TypeError('rebuild: fill must be synchronous');
+          }
+        });
       } catch (e) {
         fresh.close();
         removeDbFiles(file);
@@ -474,7 +479,7 @@ export class Cache {
   }
 
   /**
-   * Full-text search (spec §7.2 step 1). The query is escaped: every whitespace-separated term
+   * Full-text search (spec §7.2 step 1). The query is escaped: every term (split on whitespace and NUL)
    * becomes a quoted phrase, OR-joined, so FTS syntax in the query is never interpreted.
    * score = -bm25(title 4, body 1, key 2, paths 1): higher is better; results are best first.
    */
@@ -483,6 +488,7 @@ export class Cache {
       if (!Number.isSafeInteger(v) || v < 0) throw new RangeError(`search: ${k} must be a non-negative integer`);
     }
     const terms = query
+      .replaceAll('\0', ' ') // FTS5 ends a quoted string at a NUL ("unterminated string")
       .split(/\s+/)
       .filter((t) => t.length > 0)
       .map((t) => `"${t.replaceAll('"', '""')}"`);
@@ -516,14 +522,14 @@ export class Cache {
   /** Content id for an unchanged file, or null on a miss or when the entry is racy (written within 2 s of the mtime). */
   statLookup(worktree: string, relPath: string, st: StatKey): string | null {
     this.ensureCurrent();
-    const r = this.#stmt('SELECT mtime, ctime, size, ino, content_id, written_at FROM stat WHERE worktree = ? AND path = ?').get(
-      worktree,
-      relPath,
-    );
+    // ino is stored and compared as text: inode numbers above 2^53 (NTFS file ids, overlayfs
+    // xino) cannot be read back as a JS number. It is never read back.
+    const r = this.#stmt(
+      `SELECT content_id, written_at FROM stat
+        WHERE worktree = ? AND path = ? AND mtime = ? AND ctime = ? AND size = ? AND ino = ?`,
+    ).get(worktree, relPath, st.mtimeMs, st.ctimeMs, st.size, String(st.ino));
     if (!r) return null;
-    if (Number(r.mtime) !== st.mtimeMs || Number(r.ctime) !== st.ctimeMs) return null;
-    if (Number(r.size) !== st.size || Number(r.ino) !== st.ino) return null;
-    if (Number(r.written_at) - Number(r.mtime) < RACY_MS) return null;
+    if (Number(r.written_at) - st.mtimeMs < RACY_MS) return null;
     return str(r.content_id);
   }
 
@@ -531,7 +537,7 @@ export class Cache {
     this.ensureCurrent();
     this.#stmt(
       'INSERT OR REPLACE INTO stat(worktree, path, mtime, ctime, size, ino, content_id, written_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)',
-    ).run(worktree, relPath, st.mtimeMs, st.ctimeMs, st.size, st.ino, contentId, Date.now());
+    ).run(worktree, relPath, st.mtimeMs, st.ctimeMs, st.size, String(st.ino), contentId, Date.now());
   }
 
   getRename(commit: string, tree: string): Record<string, RenameResultJson> | null {
