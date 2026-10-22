@@ -22,6 +22,16 @@ function tmpFiles(dir: string): string[] {
 /** Crash a child right after `step` of the locked write; return the store reopened normally. */
 async function crashAt(step: 'ledger' | 'rename' | 'index'): Promise<{ e: Elmory; id: string; wt: string }> {
   const { wt, cacheDir } = await repo();
+  // Temp files an earlier crash left between the temp write and the rename, two hours ago.
+  const stale = new Date(Date.now() - 2 * 60 * 60 * 1000);
+  const leftovers = [path.join(wt, '.elmory', 'facts'), path.join(wt, '.git', 'elmory', 'pending')].map((dir) => {
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `.tmp-f_${'a'.repeat(26)}-1-000000000000`);
+    fs.writeFileSync(file, 'half a record');
+    fs.utimesSync(file, stale, stale);
+    return file;
+  });
+  expect(tmpFiles(path.join(wt, '.elmory'))).toHaveLength(1);
   const res = await rememberChild(wt, cacheDir, factInput(`crash at ${step}`), { env: { ELMORY_CRASH_AT: step } }).done;
   expect(res, res.err).toMatchObject({ code: 99, out: '' });
   const e = await Elmory.open({ worktree: wt, cacheDir, observer: 'agent:test' });
@@ -32,7 +42,9 @@ async function crashAt(step: 'ledger' | 'rename' | 'index'): Promise<{ e: Elmory
     .filter((l) => l.startsWith('written '))
     .map((l) => l.slice('written '.length));
   expect(written).toHaveLength(1);
-  // No temp file is left in the worktree's .elmory or the git common dir's elmory areas.
+  // No temp file is left in the worktree's .elmory or the git common dir's elmory areas: the
+  // old leftovers were swept on open, and the crashed write left none of its own.
+  for (const f of leftovers) expect(fs.existsSync(f)).toBe(false);
   expect(tmpFiles(path.join(wt, '.elmory'))).toEqual([]);
   expect(tmpFiles(path.dirname(e.layout.pending))).toEqual([]);
   return { e, id: written[0] as string, wt };
