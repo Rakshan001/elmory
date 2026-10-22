@@ -359,6 +359,19 @@ export class Store {
     return null;
   }
 
+  /**
+   * Record ids named in one visible area, from the directory listing only (no file is read or
+   * checked to be regular). An area that fails the store's directory gate lists nothing.
+   */
+  ids(area: 'facts' | 'pending' | 'local'): string[] {
+    const out: string[] = [];
+    for (const name of this.names(this.layout[area])) {
+      const id = RECORD_FILE.exec(name)?.[1];
+      if (id !== undefined) out.push(id);
+    }
+    return out;
+  }
+
   /** Every regular record file in facts, pending and local; text exactly as on disk. */
   listRecords(): StoredRecord[] {
     const out: StoredRecord[] = [];

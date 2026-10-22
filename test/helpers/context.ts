@@ -7,6 +7,7 @@ import type { Context, ElmoryEvent } from '../../src/context.js';
 import { Deriver } from '../../src/derive.js';
 import { Evidence } from '../../src/evidence.js';
 import { defaultExec, gitCommonDir } from '../../src/exec.js';
+import { viewOf } from '../../src/gate.js';
 import { Git } from '../../src/git.js';
 import { checkQuoteAtWrite } from '../../src/quote.js';
 import { type ElmoryRecord, parse, type RecordType, recordId, type Source, type Tag } from '../../src/record.js';
@@ -126,10 +127,11 @@ export async function makeContext(opts: { now?: string } = {}): Promise<TestCont
       for (const id of known) if (!seen.has(id)) cache.deleteRecord(id);
       return [];
     },
+    view: () => viewOf(store, cache.allRecords()),
     async deriver(rows) {
       evidence.resetMemo();
       return new Deriver({
-        records: new Map((rows ?? cache.allRecords()).map((r) => [r.id, r])),
+        records: new Map((rows ?? viewOf(store, cache.allRecords())).map((r) => [r.id, r])),
         tombstones: store.readTombstones(),
         trust: store.readTrust(),
         addedBy: await gitObj.addedBy('.elmory'),

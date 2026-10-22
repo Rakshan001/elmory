@@ -196,8 +196,36 @@ export function syncStore(store: Store, cache: Cache, force = false): void {
     const row = rows.get(id);
     if (force || row === undefined || row.area !== sr.area || row.text !== sr.text) cache.upsertRecord(indexRecord(sr));
   }
-  for (const id of rows.keys()) if (!files.has(id)) cache.deleteRecord(id);
+  // pending/ and local/ are shared, so a row for a file gone from them is gone for everyone. A
+  // facts row may belong to another worktree's branch (the table is shared by every worktree of
+  // the clone): it stays, and each read keeps only its own worktree's records (viewOf).
+  for (const [id, row] of rows) if (!files.has(id) && row.area !== 'facts') cache.deleteRecord(id);
   cache.setMeta(INDEX_RULES_KEY, INDEX_RULES);
+}
+
+/**
+ * §5: the records this worktree sees, from `rows` (the shared table): its own `.elmory/facts`
+ * plus pending plus local, by directory names (facts first, as `Store.readRecord`). A row of
+ * another worktree's facts is dropped; a record whose row is missing or sits in another area is
+ * indexed in memory from this worktree's file. Sorted by id, like `Cache.allRecords`.
+ */
+export function viewOf(store: Store, rows: readonly RecordRow[]): RecordRow[] {
+  const want = new Map<string, 'facts' | 'pending' | 'local'>();
+  for (const area of ['facts', 'pending', 'local'] as const) {
+    for (const id of store.ids(area)) if (!want.has(id)) want.set(id, area);
+  }
+  const byId = new Map(rows.map((r) => [r.id, r]));
+  const out: RecordRow[] = [];
+  for (const [id, area] of want) {
+    const row = byId.get(id);
+    if (row !== undefined && row.area === area) {
+      out.push(row);
+      continue;
+    }
+    const sr = store.readRecord(id);
+    if (sr !== null) out.push(indexRecord(sr));
+  }
+  return out.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 }
 
 // ---------------------------------------------------------------------------
@@ -300,10 +328,10 @@ export interface Snapshot {
   trust: Trust;
 }
 
-/** A Deriver over `rows` (default: what the cache holds now). Synchronous: `addedBy` is fetched beforehand. */
+/** A Deriver over `rows` (default: this worktree's view now). Synchronous: `addedBy` is fetched beforehand. */
 export function buildDeriver(ctx: Context, addedBy: Map<string, AddedBy>, rows?: readonly RecordRow[]): Deriver {
   return derive(ctx, addedBy, {
-    records: new Map((rows ?? ctx.cache.allRecords()).map((r) => [r.id, r])),
+    records: new Map((rows ?? ctx.view()).map((r) => [r.id, r])),
     tombstones: ctx.store.readTombstones(),
     trust: ctx.store.readTrust(),
   });
@@ -575,7 +603,7 @@ async function write(ctx: Context, type: RecordType, input: RememberInput): Prom
         syncIfChanged(ctx.store, ctx.cache);
         const tombstones = ctx.store.readTombstones();
         if (attempt === 0 && committedSignature(ctx.layout, tombstones) !== before) throw new StaleAddedBy();
-        const records = new Map(ctx.cache.allRecords().map((r) => [r.id, r]));
+        const records = new Map(viewOf(ctx.store, ctx.cache.allRecords()).map((r) => [r.id, r]));
         const trust = ctx.store.readTrust();
         const d = new Deriver({
           records,

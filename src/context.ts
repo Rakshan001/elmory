@@ -22,8 +22,10 @@ export interface Context {
    * `full` re-reads every record file even when nothing seems to have changed.
    */
   sync(opts?: { full?: boolean }): Promise<string[]>;
+  /** The records this worktree sees (§5): gate.viewOf over the shared cache rows. */
+  view(): RecordRow[];
   /**
-   * Deriver over `rows` (default cache.allRecords()), store.readTombstones(), store.readTrust(),
+   * Deriver over `rows` (default view()), store.readTombstones(), store.readTrust(),
    * the addedBy map (empty without git), evidence bound to this worktree
    */
   deriver(rows?: readonly RecordRow[]): Promise<Deriver>;

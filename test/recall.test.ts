@@ -363,15 +363,29 @@ describe('gc', () => {
     await ctx.sync();
     expect(ctx.cache.getRecord(committedOld)?.area).toBe('facts');
 
-    // A note with no recall stamp at all is not judged unused (I7): it is reported as skipped.
+    // A note with no recall stamp is not judged unused from missing data: a dry run reports it,
+    // a real run starts its clock (R2).
     const expected = [old, oldRecall].sort();
-    const skipped = [{ id: staleNote, reason: 'no recall history' }];
     const dry = await gc(ctx, { dryRun: true, now });
-    expect(dry).toEqual({ archived: expected, committed: [committedOld], staleHere: [], skipped, dryRun: true });
+    expect(dry).toEqual({
+      archived: expected,
+      committed: [committedOld],
+      staleHere: [],
+      skipped: [{ id: staleNote, reason: 'no recall history' }],
+      dryRun: true,
+    });
     for (const id of expected) expect(ctx.store.readRecord(id)).not.toBeNull();
+    expect(ctx.cache.getMeta(`recall:${staleNote}`)).toBeNull();
 
     const real = await gc(ctx, { now });
-    expect(real).toEqual({ archived: expected, committed: [committedOld], staleHere: [], skipped, dryRun: false });
+    expect(real).toEqual({
+      archived: expected,
+      committed: [committedOld],
+      staleHere: [],
+      skipped: [{ id: staleNote, reason: 'clock started' }],
+      dryRun: false,
+    });
+    expect(ctx.cache.getMeta(`recall:${staleNote}`)).toBe(now);
     for (const id of expected) {
       expect(ctx.store.readRecord(id)).toBeNull();
       expect(ctx.cache.getRecord(id)).toBeNull();

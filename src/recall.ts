@@ -95,7 +95,10 @@ export interface GcResult {
   committed: string[];
   /** superseded or stale here, but not in another worktree of this repository: left in place */
   staleHere: string[];
-  /** old notes gc cannot judge, e.g. reason 'no recall history' (no stamp, as after a rebuild) */
+  /**
+   * old notes gc cannot judge yet: reason 'clock started' (no recall stamp, so a real gc stamped
+   * it now; it is due once the window passes unused) or, on a dry run, 'no recall history'
+   */
   skipped: { id: string; reason: string }[];
   dryRun: boolean;
 }
@@ -269,11 +272,14 @@ export function factsFirstOnTies(hits: { id: string; score: number }[], rows: Ma
 export async function recall(ctx: Context, opts: RecallOptions): Promise<RecallResult | Abstain> {
   const include = checkInclude(opts.include);
   const warnings = await ctx.sync();
-  const d = await ctx.deriver();
-  const cache = ctx.cache;
+  // This worktree's view (§5), taken once: the search runs over the table every worktree shares,
+  // so a hit is kept only when it is one of this worktree's records, and served as that record.
+  const view = ctx.view();
+  const byId = new Map(view.map((r) => [r.id, r]));
+  const d = await ctx.deriver(view);
   // The ordered id list is taken once (M4): a row another process indexes mid-request cannot
   // shift a page boundary and serve a record twice.
-  const hits = cache.search(opts.query, { limit: Number.MAX_SAFE_INTEGER, offset: 0 });
+  const hits = ctx.cache.search(opts.query, { limit: Number.MAX_SAFE_INTEGER, offset: 0 }).filter((h) => byId.has(h.id));
   function* pages(): Generator<RecordRow[]> {
     for (let i = 0; i < hits.length; ) {
       // A page never splits a run of equal scores, so facts-first holds across page boundaries.
@@ -281,10 +287,7 @@ export async function recall(ctx: Context, opts: RecallOptions): Promise<RecallR
       while (j < hits.length && sameScore((hits[j - 1] as { score: number }).score, (hits[j] as { score: number }).score)) j++;
       const page = hits.slice(i, j);
       const rows = new Map<string, RecordRow>();
-      for (const h of page) {
-        const row = cache.getRecord(h.id);
-        if (row !== null) rows.set(h.id, row);
-      }
+      for (const h of page) rows.set(h.id, byId.get(h.id) as RecordRow);
       yield factsFirstOnTies(page, rows).flatMap((id) => rows.get(id) ?? []);
       i = j;
     }
@@ -295,7 +298,7 @@ export async function recall(ctx: Context, opts: RecallOptions): Promise<RecallR
 /** Records quoting the path, or in the chain of the records with that key; then §7.2 steps 2–5. */
 export async function about(ctx: Context, pathOrKey: string): Promise<RecallResult | Abstain> {
   const warnings = await ctx.sync();
-  const rows = ctx.cache.allRecords();
+  const rows = ctx.view();
   const d = await ctx.deriver(rows);
   const byId = new Map(rows.map((r) => [r.id, r]));
   const target = normPath(pathOrKey);
@@ -314,7 +317,8 @@ export async function about(ctx: Context, pathOrKey: string): Promise<RecallResu
 /** The chain of an id or key, oldest root first (topological over supersedes; ties by id). */
 export async function history(ctx: Context, idOrKey: string): Promise<HistoryResult> {
   const warnings = await ctx.sync();
-  const d = await ctx.deriver();
+  const view = new Map(ctx.view().map((r) => [r.id, r]));
+  const d = await ctx.deriver([...view.values()]);
   const chain = d.chainOf(idOrKey);
   if (chain.length === 0) return { entries: [], warnings };
   const members = new Set(chain);
@@ -329,7 +333,7 @@ export async function history(ctx: Context, idOrKey: string): Promise<HistoryRes
   const entries = new Map<string, HistoryEntry>();
   const preds = new Map<string, Set<string>>();
   for (const id of chain) {
-    const row = ctx.cache.getRecord(id);
+    const row = view.get(id);
     const tomb = tombs.get(id);
     const supersedes = row?.supersedes ?? [...(tomb?.supersedes ?? [])];
     const derived = await stateOf(d, id);
@@ -370,7 +374,7 @@ export async function history(ctx: Context, idOrKey: string): Promise<HistoryRes
  */
 export async function verify(ctx: Context, opts: { files?: string[] } = {}): Promise<VerifyResult> {
   const warnings = await ctx.sync({ full: true });
-  const rows = ctx.cache.allRecords();
+  const rows = ctx.view();
   const d = await ctx.deriver(rows);
   const worktree = ctx.layout.worktree;
   const files = opts.files === undefined ? null : new Set(opts.files.map(normPath));
@@ -399,8 +403,9 @@ export async function verify(ctx: Context, opts: { files?: string[] } = {}): Pro
  *
  * pending/ and local/ are shared by every worktree, but superseded and stale depend on the
  * worktree (§6.3): such a record is archived only when it is superseded or stale in every
- * worktree of the repository; otherwise it is reported in `staleHere` and left in place. A note
- * with no recall stamp (e.g. after a cache rebuild) is never archived for disuse: `skipped`.
+ * worktree of the repository; otherwise it is reported in `staleHere` and left in place. An old
+ * note with no recall stamp is not judged unused from missing data: a real gc stamps it now
+ * (`skipped`, 'clock started'), so it is due once 180 more days pass without a recall.
  */
 export async function gc(ctx: Context, opts: { dryRun?: boolean; now?: string } = {}): Promise<GcResult> {
   const dryRun = opts.dryRun ?? false;
@@ -408,7 +413,7 @@ export async function gc(ctx: Context, opts: { dryRun?: boolean; now?: string } 
   if (Number.isNaN(nowMs)) throw new RangeError('gc: now must be an ISO timestamp');
   // gc acts on what it sees: an index that could not be brought up to date is an error here.
   if ((await ctx.sync()).length > 0) throw new CacheBusyError();
-  const rows = ctx.cache.allRecords();
+  const rows = ctx.view();
   const d = await ctx.deriver(rows);
   const olderThan = (iso: string, days: number): boolean => {
     const t = Date.parse(iso);
@@ -421,6 +426,7 @@ export async function gc(ctx: Context, opts: { dryRun?: boolean; now?: string } 
   const staleHere: string[] = [];
   const skipped: GcResult['skipped'] = [];
   const checkElsewhere: string[] = [];
+  const startClock: string[] = [];
   for (const row of rows) {
     if (Number.isNaN(Date.parse(row.recorded))) continue;
     const derived = await stateOf(d, row.id);
@@ -430,7 +436,12 @@ export async function gc(ctx: Context, opts: { dryRun?: boolean; now?: string } 
     if (row.type === 'memory/note' && olderThan(row.recorded, GC_NOTE_DAYS)) {
       const stamp = ctx.cache.getMeta(`recall:${row.id}`);
       if (stamp !== null) unused = olderThan(stamp, GC_NOTE_DAYS);
-      else if (!replaced) skipped.push({ id: row.id, reason: 'no recall history' });
+      else if (!replaced) {
+        // No stamp (never recalled, or the cache was lost): start the clock rather than judge
+        // disuse from missing data. A dry run reports it and writes nothing.
+        skipped.push({ id: row.id, reason: dryRun ? 'no recall history' : 'clock started' });
+        if (!dryRun) startClock.push(row.id);
+      }
     }
     if (!replaced && !unused) continue;
     if (row.area === 'facts') committed.push(row.id);
@@ -456,6 +467,8 @@ export async function gc(ctx: Context, opts: { dryRun?: boolean; now?: string } 
   if (dryRun) return { archived: due, committed, staleHere, skipped, dryRun };
 
   const archived = ctx.cache.withWriteLock(() => {
+    const stampedAt = new Date(nowMs).toISOString();
+    for (const id of startClock) ctx.cache.setMeta(`recall:${id}`, stampedAt);
     const moved: string[] = [];
     for (const id of due) {
       try {

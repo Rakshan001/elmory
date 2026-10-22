@@ -10,7 +10,7 @@ import * as gate from './gate.js';
 import { type AddedBy, Git } from './git.js';
 import * as flows from './recall.js';
 import { RecordError, isRecordId } from './record.js';
-import { type Layout, Store, type StoredRecord, resolveLayout } from './store.js';
+import { type Layout, Store, resolveLayout } from './store.js';
 
 export type { Context, ElmoryEvent } from './context.js';
 
@@ -177,6 +177,10 @@ export class Elmory implements Context {
     return gate.buildDeriver(this, addedBy, rows);
   }
 
+  view(): RecordRow[] {
+    return gate.viewOf(this.store, this.cache.allRecords());
+  }
+
   fetchAddedBy(): Promise<Map<string, AddedBy>> {
     return this.git === null ? Promise.resolve(new Map()) : signedAddedBy(this.#exec, this.git, this.layout.worktree);
   }
@@ -195,8 +199,8 @@ export class Elmory implements Context {
 
   /**
    * Every other worktree of this repository, each with a Deriver over its own facts and
-   * tombstones plus the shared pending/local records, trust and cache-backed evidence. Rows are
-   * indexed in memory: the shared cache rows (this worktree's view) are not touched.
+   * tombstones plus the shared pending/local records, trust and cache-backed evidence. Its view
+   * reuses the shared rows where they match and indexes the rest in memory; the cache is not written.
    */
   async peerDerivers(): Promise<{ worktree: string; deriver: Deriver }[]> {
     if (this.git === null || this.layout.commonDir === null) return [];
@@ -205,12 +209,10 @@ export class Elmory implements Context {
       if (wt === this.layout.worktree) continue;
       const layout = resolveLayout(wt, this.layout.commonDir);
       const store = new Store(layout);
-      const files = new Map<string, StoredRecord>();
-      for (const sr of store.listRecords()) if (!files.has(sr.id)) files.set(sr.id, sr);
       const git = new Git(this.#exec, layout.worktree);
       const evidence = new Evidence({ worktree: layout.worktree, cache: this.cache, git });
       const deriver = new Deriver({
-        records: new Map([...files.values()].map((sr) => [sr.id, gate.indexRecord(sr)])),
+        records: new Map(gate.viewOf(store, this.cache.allRecords()).map((r) => [r.id, r])),
         tombstones: store.readTombstones(),
         trust: store.readTrust(),
         addedBy: await signedAddedBy(this.#exec, git, layout.worktree),
@@ -279,8 +281,8 @@ export class Elmory implements Context {
   /** Every candidate with its reason, except those rejected here (reject hides). */
   async review(): Promise<{ id: string; reason: string; title: string }[]> {
     await this.sync();
-    // One snapshot: the Deriver and the loop see the same rows, whatever another process indexes.
-    const rows = this.cache.allRecords();
+    // One snapshot of this worktree's view: the Deriver and the loop see the same rows.
+    const rows = this.view();
     const d = await this.deriver(rows);
     const out: { id: string; reason: string; title: string }[] = [];
     for (const row of rows) {

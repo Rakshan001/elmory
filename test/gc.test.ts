@@ -100,3 +100,56 @@ describe('gc and the recall stamp (I7)', () => {
     expect(lost.skipped.map((s) => s.id).sort()).toEqual([used.id, never.id].sort());
   }, 30000);
 });
+
+describe('gc starts the clock on a never-recalled note (R2)', () => {
+  it('first gc stamps it, a later gc past the window archives it; a dry run writes nothing', async () => {
+    const { wt, cacheDir } = await repo();
+    const e = await open(wt, cacheDir);
+    const n = await e.note({ title: 'Nobody reads this', text: 'An old decision nobody asks about.' });
+    expect(await e.gc({ dryRun: true, now: days(200) })).toMatchObject({ archived: [], skipped: [{ id: n.id, reason: 'no recall history' }] });
+    expect(e.cache.getMeta(`recall:${n.id}`)).toBeNull();
+    expect(await e.gc({ now: days(200) })).toMatchObject({ archived: [], skipped: [{ id: n.id, reason: 'clock started' }] });
+    expect(e.cache.getMeta(`recall:${n.id}`)).toBe(days(200));
+    expect(await e.gc({ now: days(300) })).toMatchObject({ archived: [], skipped: [] });
+    expect(await e.gc({ now: days(381) })).toMatchObject({ archived: [n.id], skipped: [] });
+    expect(e.store.readRecord(n.id)).toBeNull();
+  }, 30000);
+});
+
+describe('worktrees share the rows, never the view (R1)', () => {
+  it('A syncs, B syncs, A reads: A sees only its own facts, and still sees them', async () => {
+    const { wt, cacheDir } = await repo();
+    const base = (await defaultExec('git', ['rev-parse', 'HEAD'], { cwd: wt })).stdout.trim();
+    const A = await open(wt, cacheDir);
+    const fa = await A.remember(factInput('alpha rule on branch A'));
+    A.publish([fa.id]);
+    await git(wt, 'add', '-A');
+    await git(wt, 'commit', '-q', '--no-verify', '-m', 'A fact');
+    const wtB = path.join(path.dirname(wt), 'wtB');
+    await git(wt, 'worktree', 'add', '-q', '-b', 'b', wtB, base);
+    const B = await open(wtB, cacheDir);
+    const fb = await B.remember(factInput('alpha rule on branch B'));
+    B.publish([fb.id]);
+    await git(wtB, 'add', '-A');
+    await git(wtB, 'commit', '-q', '--no-verify', '-m', 'B fact');
+
+    // Interleave: every time A syncs, B syncs right after, so the shared table holds B's view.
+    const syncA = A.sync.bind(A);
+    A.sync = async (opts) => {
+      const w = await syncA(opts);
+      await B.sync();
+      return w;
+    };
+    const ids = (r: Awaited<ReturnType<Elmory['recall']>>) => (r.abstain ? [] : r.served.map((s) => s.id));
+    expect(ids(await A.recall({ query: 'alpha' }))).toEqual([fa.id]);
+    expect(ids(await A.about('src/auth.ts'))).toEqual([fa.id]);
+    expect((await A.history(fb.id)).entries).toEqual([]);
+    expect((await A.verify()).states.active).toBe(1);
+    expect(ids(await B.recall({ query: 'alpha' }))).toEqual([fb.id]);
+
+    // A write in A while the table holds B's view: the CAS sees A's records only.
+    const next = await A.remember({ ...factInput('alpha rule on branch A, v2'), supersedes: [fa.id] });
+    expect(next.state).toBe('active');
+    expect(ids(await A.recall({ query: 'alpha' }))).toEqual([next.id]);
+  }, 30000);
+});
