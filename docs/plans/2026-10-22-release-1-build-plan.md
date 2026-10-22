@@ -30,7 +30,7 @@ Out of this plan, by ruling (see below): Phase 0 (A/B harness and 90-day replay)
   `createRequire` (as Baton's `memory-rank.ts` does) so the import survives bundlers.
 - **Dependencies:** the core (`src/*.ts` except `src/mcp.ts`) has **zero runtime dependencies**:
   only `node:*` modules. `src/mcp.ts` may import `@modelcontextprotocol/sdk`.
-- **Git access:** only through the injectable `Exec` type in `src/git.ts` (shell-free
+- **Git access:** only through the injectable `Exec` type in `src/exec.ts` (shell-free
   `execFile`). Never `exec` with a shell string.
 - **Immutability:** a record file is never rewritten. Writes are temp → fsync → rename.
 - **Id:** `f_` + first 26 chars of lowercase base32 (alphabet `abcdefghijklmnopqrstuvwxyz234567`)
