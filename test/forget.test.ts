@@ -5,6 +5,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { afterEach, describe, expect, it } from 'vitest';
 import { Elmory, RefusedError } from '../src/api.js';
 import { defaultExec } from '../src/exec.js';
+import { previewForget } from '../src/forget.js';
 import { type ElmoryRecord, FORMAT_VERSION, recordId } from '../src/record.js';
 
 const dirs: string[] = [];
@@ -260,6 +261,126 @@ describe('forget', () => {
     const all = await e.forget({ all: true, confirm: true });
     expect(all.deleted).toEqual([other]);
     expect(e.store.listRecords()).toEqual([]);
+  });
+
+  it('an archived record citing the seed is cascaded', async () => {
+    const { wt, cacheDir, e } = await setup();
+    const a = (await e.note({ title: 'Seed decision', text: 'Releases are cut on Tuesdays.' })).id;
+    const b = (await e.note({ title: 'Restates the seed', text: 'Tuesday cut, as the seed says: plover7marker.', cites: [a] })).id;
+    const c = (await e.note({ title: 'Restates the restatement', text: 'Second hand: plover7marker again.', cites: [b] })).id;
+    const kept = (await e.note({ title: 'Unrelated archived', text: 'Lunch is at noon.' })).id;
+    for (const id of [b, c, kept]) e.store.archive(id); // as gc would
+    await e.sync();
+    const roots = [cacheDir, path.join(wt, '.elmory'), path.join(e.layout.commonDir as string, 'elmory')];
+    expect(occurrences(roots, 'plover7marker')).toBeGreaterThan(0);
+
+    const r = await e.forget({ ids: [a] });
+    expect(r.deleted).toEqual([a]);
+    expect(r.cascaded).toEqual([b, c].sort());
+    expect(r.compaction).toBe('done');
+    for (const id of [b, c]) {
+      expect(exists(path.join(e.layout.archive, `${id}.md`))).toBe(false);
+      expect(fs.readFileSync(path.join(e.layout.localTombstones, id), 'utf8')).toBe('supersedes: []\n');
+      expect(exists(path.join(e.layout.tombstones, id))).toBe(false); // never published
+    }
+    expect(exists(path.join(e.layout.archive, `${kept}.md`))).toBe(true);
+    expect(occurrences(roots, 'plover7marker')).toBe(0);
+    await expect(e.gcRestore(b)).rejects.toMatchObject({ reason: 'not-found' });
+  });
+
+  it('forget --all reaches archived records', async () => {
+    const { e } = await setup();
+    const archived = (await e.note({ title: 'Old note', text: 'Archived long ago.' })).id;
+    e.store.archive(archived);
+    const r = await e.forget({ all: true, confirm: true });
+    expect(r.deleted).toEqual([archived]);
+    expect(exists(path.join(e.layout.archive, `${archived}.md`))).toBe(false);
+  });
+
+  it('ids that never existed are reported as unknown, not deleted or tombstoned', async () => {
+    const { e } = await setup();
+    const real = (await e.note({ title: 'Real note', text: 'This one exists.' })).id;
+    const typo = `f_${'a'.repeat(26)}`;
+    const r = await e.forget({ ids: [real, typo] });
+    expect(r.deleted).toEqual([real]);
+    expect(r.unknown).toEqual([typo]);
+    expect(exists(path.join(e.layout.localTombstones, typo))).toBe(false);
+    expect(exists(path.join(e.layout.tombstones, typo))).toBe(false);
+
+    // an id forgotten before still has its tombstone: forgetting it again is not "unknown"
+    const again = await e.forget({ ids: [real] });
+    expect(again).toMatchObject({ deleted: [real], unknown: [] });
+  });
+
+  it('previewForget lists the seeds and the cascade with titles and deletes nothing', async () => {
+    const { e } = await setup();
+    const a = (await e.note({ title: 'Deploy freeze', text: 'No deploys on Fridays.' })).id;
+    const citer = (await e.note({ title: 'Why Fridays', text: 'Because of the freeze.', cites: [a] })).id;
+    const archivedCiter = (await e.note({ title: 'Archived why', text: 'Old reasoning.', cites: [a] })).id;
+    e.store.archive(archivedCiter);
+    const other = (await e.note({ title: 'Lunch', text: 'Noon.' })).id;
+
+    const p = await previewForget(e, { query: 'Deploy' });
+    expect(p.seeds).toEqual([{ id: a, title: 'Deploy freeze' }]);
+    expect(p.cascaded).toEqual(
+      [
+        { id: citer, title: 'Why Fridays' },
+        { id: archivedCiter, title: 'Archived why' },
+      ].sort((x, y) => x.id.localeCompare(y.id)),
+    );
+    for (const id of [a, citer, other]) expect(e.store.readRecord(id)).not.toBeNull();
+    expect(exists(path.join(e.layout.archive, `${archivedCiter}.md`))).toBe(true);
+
+    const all = await previewForget(e, { all: true });
+    expect(all.seeds.map((s) => s.id).sort()).toEqual([a, citer, archivedCiter, other].sort());
+    expect(all.cascaded).toEqual([]);
+
+    const r = await e.forget({ query: 'Deploy', confirm: true });
+    expect(r.deleted).toEqual(p.seeds.map((s) => s.id));
+    expect(r.cascaded).toEqual(p.cascaded.map((s) => s.id));
+  });
+
+  it('a compaction that throws is reported pending, after the deletion, and kept pending in meta', async () => {
+    const { e } = await setup();
+    const id = (await e.note({ title: 'Doomed note', text: 'Gone either way.' })).id;
+    e.cache.compact = () => {
+      throw new Error('SQLITE_BUSY: database is locked');
+    };
+    const r = await e.forget({ ids: [id] });
+    expect(r).toMatchObject({ deleted: [id], compaction: 'pending' });
+    expect(e.store.readRecord(id)).toBeNull();
+    expect(e.cache.getMeta('compaction')).toBe('pending');
+  });
+
+  it('forget removes a newer cache generation left by a killed rebuild; a held one keeps compaction pending', async () => {
+    const { cacheDir, e } = await setup();
+    const id = (await e.note({ title: 'Stray copy', text: 'heron7marker in the body.' })).id;
+    const stray = path.join(cacheDir, `cache-${e.cache.generation + 1}.db`);
+    const fill = (file: string): DatabaseSync => {
+      const db = new DatabaseSync(file);
+      db.exec("PRAGMA journal_mode=WAL; CREATE TABLE records(body TEXT); INSERT INTO records VALUES('heron7marker in the body.')");
+      return db;
+    };
+    fill(stray).close();
+    expect(occurrences([cacheDir], 'heron7marker')).toBeGreaterThan(0);
+    const r = await e.forget({ ids: [id] });
+    expect(r.compaction).toBe('done');
+    expect(exists(stray)).toBe(false);
+    expect(occurrences([cacheDir], 'heron7marker')).toBe(0);
+
+    const id2 = (await e.note({ title: 'Held copy', text: 'Another body.' })).id;
+    const holder = fill(stray);
+    try {
+      holder.exec('BEGIN');
+      holder.prepare('SELECT count(*) AS n FROM records').get();
+      const held = await e.forget({ ids: [id2] });
+      expect(held.compaction).toBe('pending');
+      expect(exists(stray)).toBe(true);
+      expect(e.cache.getMeta('compaction')).toBe('pending');
+    } finally {
+      if (holder.isTransaction) holder.exec('COMMIT');
+      holder.close();
+    }
   });
 
   it('the unreachable list is the seven spec strings', async () => {

@@ -6,4 +6,5 @@ export { base32 } from './base32.js';
 export * from './api.js';
 export { DEFAULT_BUDGET_TOKENS, estimateTokens } from './recall.js';
 export type { Derived, State, TrustSource } from './derive.js';
-export { UNREACHABLE } from './forget.js';
+export { UNREACHABLE, previewForget } from './forget.js';
+export type { ForgetPreview, ForgetPreviewScope } from './forget.js';
