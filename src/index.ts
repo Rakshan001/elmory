@@ -16,3 +16,6 @@ export {
 } from './derive.js';
 export * from './api.js';
 export { DEFAULT_BUDGET_TOKENS, estimateTokens } from './recall.js';
+export { UNREACHABLE, previewForget } from './forget.js';
+export type { ForgetPreview, ForgetPreviewScope } from './forget.js';
+export { resolveWorktree } from './worktree.js';

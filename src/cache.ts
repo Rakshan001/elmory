@@ -135,6 +135,31 @@ function removeDbFiles(file: string): void {
   for (const suffix of ['', '-wal', '-shm', '-journal']) fs.rmSync(file + suffix, { force: true });
 }
 
+/**
+ * Whether another connection is inside a transaction on `file`. BEGIN EXCLUSIVE is busy while
+ * any writer holds it (and, in rollback-journal mode, any reader); a TRUNCATE checkpoint reports
+ * busy while a WAL reader pins it. Never waits.
+ */
+function inUse(file: string): boolean {
+  let db: DatabaseSync;
+  try {
+    db = new sqlite.DatabaseSync(file);
+  } catch (e) {
+    return isBusy(e);
+  }
+  try {
+    db.exec('PRAGMA busy_timeout=0');
+    db.exec('BEGIN EXCLUSIVE');
+    db.exec('ROLLBACK');
+    return Number(db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get()?.busy) !== 0;
+  } catch (e) {
+    if (isBusy(e)) return true;
+    return false; // not a database we can read (e.g. a torn file): nobody holds it as one
+  } finally {
+    db.close();
+  }
+}
+
 function readGen(lock: DatabaseSync): number | null {
   const r = lock.prepare("SELECT n FROM gen WHERE k = 'generation'").get();
   return r ? Number(r.n) : null;
@@ -367,27 +392,48 @@ export class Cache {
     this.ensureCurrent();
   }
 
-  /** Delete cache-<k>.db (k < current) older than maxAgeMs (default 24 h). Returns the deleted paths. */
+  /**
+   * Delete every cache-<k>.db other than the current generation (read from lock.db under the
+   * write lock, as `open` does) once older than maxAgeMs (default 24 h). Older ones are retired
+   * generations. Newer ones can only be left by a rebuild killed during its fill (a running
+   * rebuild holds the write lock); one another connection still holds is left in place.
+   * Returns the deleted paths.
+   */
   sweepOld(maxAgeMs: number = DAY_MS): string[] {
     const lock = this.#lock;
     if (lock === null) return [];
     return this.withWriteLock(() => {
+      const current = readGen(lock) ?? this.generation;
       const retired = new Map<string, number>();
       for (const r of lock.prepare('SELECT path, retired_at FROM old').all()) retired.set(str(r.path), Number(r.retired_at));
       const now = Date.now();
       const deleted: string[] = [];
       for (const f of fs.readdirSync(this.dir)) {
         const m = /^cache-(\d+)\.db$/.exec(f);
-        if (!m || Number(m[1]) >= this.generation) continue;
+        if (!m || Number(m[1]) === current) continue;
         const p = path.join(this.dir, f);
+        // maxAgeMs 0 means every one: an mtime a fraction of a ms ahead of Date.now() must not keep it
         const at = retired.get(p) ?? fs.statSync(p).mtimeMs;
-        if (now - at < maxAgeMs) continue;
+        if (maxAgeMs > 0 && now - at < maxAgeMs) continue;
+        if (Number(m[1]) > current && inUse(p)) continue;
         removeDbFiles(p);
         lock.prepare('DELETE FROM old WHERE path = ?').run(p);
         deleted.push(p);
       }
       return deleted;
     });
+  }
+
+  /** Paths of every cache-<k>.db on disk other than the current generation. */
+  otherGenerations(): string[] {
+    this.ensureCurrent();
+    return fs
+      .readdirSync(this.dir)
+      .filter((f) => {
+        const m = /^cache-(\d+)\.db$/.exec(f);
+        return m !== null && Number(m[1]) !== this.generation;
+      })
+      .map((f) => path.join(this.dir, f));
   }
 
   close(): void {

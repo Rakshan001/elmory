@@ -449,6 +449,39 @@ describe('Cache', () => {
     expect(tables(path.join(dir, 'cache-2.db'))).toEqual(['junk']);
   });
 
+  it('sweepOld(0) removes a newer generation left by a killed rebuild', () => {
+    const dir = tmp();
+    const c = open(dir);
+    const strayFile = path.join(dir, 'cache-2.db');
+    const stray: DatabaseSync = new Database(strayFile);
+    stray.exec("PRAGMA journal_mode=WAL; CREATE TABLE junk(x); INSERT INTO junk VALUES('half-filled rebuild')");
+    stray.close();
+    expect(c.otherGenerations()).toEqual([strayFile]);
+    expect(c.sweepOld(0)).toEqual([strayFile]);
+    expect(fs.existsSync(strayFile)).toBe(false);
+    expect(c.otherGenerations()).toEqual([]);
+    expect(c.generation).toBe(1);
+  });
+
+  it('sweepOld(0) leaves a newer generation another connection holds', () => {
+    const dir = tmp();
+    const c = open(dir);
+    const strayFile = path.join(dir, 'cache-2.db');
+    const holder: DatabaseSync = new Database(strayFile);
+    try {
+      holder.exec("PRAGMA journal_mode=WAL; CREATE TABLE junk(x); INSERT INTO junk VALUES('held')");
+      holder.exec('BEGIN');
+      holder.prepare('SELECT count(*) AS n FROM junk').get();
+      expect(c.sweepOld(0)).toEqual([]);
+      expect(fs.existsSync(strayFile)).toBe(true);
+      expect(c.otherGenerations()).toEqual([strayFile]);
+      holder.exec('COMMIT');
+    } finally {
+      holder.close();
+    }
+    expect(c.sweepOld(0)).toEqual([strayFile]);
+  });
+
   it('compact returns done when no reader holds the wal', () => {
     const c = open(tmp());
     c.upsertRecord(row('f_a'));

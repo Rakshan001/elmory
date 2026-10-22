@@ -7,6 +7,7 @@ import { Deriver } from './derive.js';
 import { Evidence } from './evidence.js';
 import { type Exec, defaultExec, gitCommonDir } from './exec.js';
 import * as gate from './gate.js';
+import { type ForgetReport, type ForgetScope, forget } from './forget.js';
 import { type AddedBy, Git } from './git.js';
 import * as flows from './recall.js';
 import { RecordError, isRecordId } from './record.js';
@@ -25,6 +26,7 @@ export interface OpenOptions {
 
 export type { RememberInput, WriteResult } from './gate.js';
 export { ConflictError, RefusedError } from './gate.js';
+export type { ForgetReport, ForgetScope } from './forget.js';
 export type {
   Abstain,
   GcResult,
@@ -135,10 +137,20 @@ export class Elmory implements Context {
     try {
       const git = commonDir === null ? null : new Git(exec, layout.worktree);
       const evidence = new Evidence({ worktree: layout.worktree, cache, git });
+      Elmory.#retryCompaction(cache);
       return new Elmory(layout, store, cache, git, evidence, opts.observer ?? DEFAULT_OBSERVER, opts.now ?? (() => new Date().toISOString()), exec);
     } catch (e) {
       cache.close();
       throw e;
+    }
+  }
+
+  /** §8 step 7: a forget that left compaction pending is retried once here; failure keeps it pending. */
+  static #retryCompaction(cache: Cache): void {
+    try {
+      if (cache.getMeta('compaction') === 'pending') cache.compact();
+    } catch {
+      // still pending: meta keeps saying so, and the next open tries again
     }
   }
 
@@ -346,6 +358,11 @@ export class Elmory implements Context {
   /** Bring one archived record back into the area it was archived from and index it. */
   gcRestore(id: string): Promise<void> {
     return this.#writing(() => flows.gcRestore(this, id));
+  }
+
+  /** §8: delete the scope and every record citing it; report what could not be reached. */
+  forget(scope: ForgetScope): Promise<ForgetReport> {
+    return this.#writing(() => forget(this, scope));
   }
 
   /** A fresh cache generation indexed from every record file. */
