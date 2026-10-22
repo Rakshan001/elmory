@@ -54,9 +54,9 @@ export class RecordError extends Error {
 }
 
 const BARE = /^[A-Za-z0-9_./@-]+$/;
-const KEY_LINE = /^([a-z][a-z0-9-]*):(?: (.*))?$/;
-const ITEM_START = /^\s+- ([a-z][a-z0-9-]*):(?: (.*))?$/;
-const ITEM_FIELD = /^\s+([a-z][a-z0-9-]*):(?: (.*))?$/;
+const KEY_LINE = /^([a-z][a-z0-9-]*):(?: ([^]*))?$/;
+const ITEM_START = /^\s+- ([a-z][a-z0-9-]*):(?: ([^]*))?$/;
+const ITEM_FIELD = /^\s+([a-z][a-z0-9-]*):(?: ([^]*))?$/;
 const ID_RE = /^f_[a-z2-7]{26}$/;
 const RECORDED_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/;
 const KEY_RE = /^[a-z0-9_.-]+$/;
@@ -64,8 +64,15 @@ const KEY_RE = /^[a-z0-9_.-]+$/;
 // ---------------------------------------------------------------------------
 // serialize
 
+/**
+ * Bare when safe, else JSON-quoted. JSON.stringify leaves U+2028 and U+2029 raw; they are escaped
+ * too so every frontmatter value stays on one line for any reader. A non-string (untyped input
+ * such as an `undefined` field) is refused rather than written as the text "undefined".
+ */
 function str(s: string): string {
-  return BARE.test(s) ? s : JSON.stringify(s);
+  if (typeof s !== 'string') throw new RecordError(`expected a string, got ${typeof s}`, 'frontmatter');
+  if (BARE.test(s)) return s;
+  return JSON.stringify(s).replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
 }
 
 function list(xs: readonly string[]): string {
@@ -89,8 +96,9 @@ function normalizeBody(body: string): string {
   return lines.join('\n');
 }
 
+/** A legacy source has a string `legacyFile`; `legacyFile: undefined` counts as absent. */
 function isLegacy(s: Source): s is LegacyFileSource {
-  return 'legacyFile' in s;
+  return typeof (s as Partial<LegacyFileSource>).legacyFile === 'string';
 }
 
 /** The canonical text of a record. Its sha256 is the record id (§4.1). */
@@ -422,10 +430,21 @@ export function lint(r: ElmoryRecord): string[] {
   for (const id of r.cites) if (!isRecordId(id)) errors.push(`cites has a bad id: ${id}`);
   if (r.type === 'memory/fact' && r.sources.length === 0) errors.push('a fact needs at least one source');
   if (r.type === 'memory/note' && r.sources.length > 0) errors.push('a note has no sources');
+  const filled = (v: unknown): boolean => typeof v === 'string' && v !== '';
   for (const s of r.sources) {
-    if (badResource(s.resource)) errors.push(`resource must be a relative path without '..': ${s.resource}`);
-    if (!isLegacy(s) && (!Number.isSafeInteger(s.tokens) || s.tokens < 0)) {
-      errors.push(`tokens must be a non-negative integer: ${s.resource}`);
+    if (typeof s.resource !== 'string' || badResource(s.resource)) {
+      errors.push(`resource must be a relative path without '..': ${String(s.resource)}`);
+    }
+    if (isLegacy(s)) {
+      if (s.legacyFile === '') errors.push(`a legacy source needs x-elmory-legacy-file: ${s.resource}`);
+      continue;
+    }
+    const q = s as Partial<QuoteSource>;
+    if (!filled(q.quote) || !filled(q.anchor) || !filled(q.commit)) {
+      errors.push(`a quote source needs quote, anchor and commit: ${String(s.resource)}`);
+    }
+    if (!Number.isSafeInteger(q.tokens) || (q.tokens ?? -1) < 0) {
+      errors.push(`tokens must be a non-negative integer: ${String(s.resource)}`);
     }
   }
   return errors;

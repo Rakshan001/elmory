@@ -383,3 +383,124 @@ describe('Store trust and tombstones', () => {
     expect(store.readTombstones()).toEqual([{ id: a, supersedes: [], committed: false }]);
   });
 });
+
+describe('review fixes', () => {
+  const A = 'f_' + 'a'.repeat(26);
+  const B = 'f_' + 'b'.repeat(26);
+  const posixOnly = it.skipIf(process.platform === 'win32');
+
+  it('appendTrust adds a missing newline before appending', () => {
+    const store = plainStore();
+    fs.writeFileSync(store.layout.trust, `written ${A}`);
+    store.appendTrust(`approved ${B}`);
+    expect(fs.readFileSync(store.layout.trust, 'utf8')).toBe(`written ${A}\napproved ${B}\n`);
+    const t = store.readTrust();
+    expect(t.written).toEqual(new Set([A]));
+    expect(t.approved).toEqual(new Set([B]));
+  });
+
+  it('malformed trust lines are skipped with a warning', () => {
+    const store = plainStore();
+    fs.writeFileSync(
+      store.layout.trust,
+      [`written  ${A}`, 'written garbage', 'bogus line', `written ${A}  `, `approved ${B}\r`, 'signer key one', '', ''].join('\n'),
+    );
+    const t = store.readTrust();
+    expect(t.written).toEqual(new Set([A]));
+    expect(t.approved).toEqual(new Set([B]));
+    expect(t.signers).toEqual(new Set(['key one']));
+    expect(store.warnings).toHaveLength(3);
+    expect(store.warnings.every((w) => w.includes('trust'))).toBe(true);
+  });
+
+  it('malformed tombstone files still count (fail closed) with a warning; non-id names are skipped', () => {
+    const store = plainStore();
+    const C = 'f_' + 'c'.repeat(26);
+    store.writeTombstone(A, [B], 'local');
+    fs.writeFileSync(path.join(store.layout.localTombstones, B), 'garbage\n');
+    fs.writeFileSync(path.join(store.layout.localTombstones, C), 'supersedes: ["x", f_nope]\n');
+    fs.writeFileSync(path.join(store.layout.localTombstones, 'not-an-id'), 'supersedes: []\n');
+    expect(store.readTombstones()).toEqual([
+      { id: A, supersedes: [B], committed: false },
+      { id: B, supersedes: [], committed: false },
+      { id: C, supersedes: [], committed: false },
+    ]);
+    expect(store.warnings).toHaveLength(2);
+    expect(store.warnings.join('\n')).toContain(B);
+    expect(store.warnings.join('\n')).toContain(C);
+  });
+
+  it('writeRecord leaves a hand-edited <id>.md untouched (records are immutable)', () => {
+    const store = plainStore();
+    const id = store.writeRecord('pending', note(1));
+    const file = path.join(store.layout.pending, `${id}.md`);
+    fs.appendFileSync(file, 'edited\n');
+    const before = fs.readFileSync(file, 'utf8');
+    expect(store.writeRecord('pending', note(1))).toBe(id);
+    expect(fs.readFileSync(file, 'utf8')).toBe(before);
+  });
+
+  it('ensureDirs removes .tmp-* files older than an hour in every area', () => {
+    const store = plainStore();
+    const l = store.layout;
+    const old = new Date(Date.now() - 2 * 3600_000);
+    const areas = [l.facts, l.tombstones, l.pending, l.local, l.archive, l.localTombstones];
+    for (const dir of areas) {
+      fs.writeFileSync(path.join(dir, `.tmp-${A}-1-old`), 'x');
+      fs.utimesSync(path.join(dir, `.tmp-${A}-1-old`), old, old);
+      fs.writeFileSync(path.join(dir, `.tmp-${A}-1-new`), 'x');
+    }
+    fs.writeFileSync(path.join(l.pending, 'keep.txt'), 'x');
+    fs.utimesSync(path.join(l.pending, 'keep.txt'), old, old);
+    store.ensureDirs();
+    for (const dir of areas) expect(tmpFiles(dir)).toEqual([`.tmp-${A}-1-new`]);
+    expect(fs.existsSync(path.join(l.pending, 'keep.txt'))).toBe(true);
+  });
+
+  posixOnly('a symlinked <worktree>/.elmory: reads return nothing, writes and publish throw', async () => {
+    const { wt, common } = await gitWorktree();
+    const elsewhere = tmp();
+    const id = recordId(note(1));
+    fs.mkdirSync(path.join(elsewhere, 'facts'));
+    fs.mkdirSync(path.join(elsewhere, 'tombstones'));
+    fs.writeFileSync(path.join(elsewhere, 'facts', `${id}.md`), serialize(note(1)));
+    fs.writeFileSync(path.join(elsewhere, 'tombstones', A), 'supersedes: []\n');
+    fs.symlinkSync(elsewhere, path.join(wt, '.elmory'));
+
+    const store = new Store(resolveLayout(wt, common));
+    expect(store.listRecords()).toEqual([]);
+    expect(store.readRecord(id)).toBeNull();
+    expect(store.readTombstones()).toEqual([]);
+
+    const pid = store.writeRecord('pending', note(2)); // pending lives under the common dir: fine
+    const symlinkError = (fn: () => unknown): void => {
+      try {
+        fn();
+      } catch (e) {
+        expect(e).toBeInstanceOf(RecordError);
+        expect((e as RecordError).reason).toBe('symlink');
+        return;
+      }
+      throw new Error('expected a RecordError');
+    };
+    symlinkError(() => store.publish());
+    symlinkError(() => store.writeTombstone(B, [], 'committed'));
+    symlinkError(() => store.ensureDirs());
+    expect(store.readRecord(pid)?.area).toBe('pending');
+    expect(fs.readdirSync(path.join(elsewhere, 'facts'))).toEqual([`${id}.md`]);
+    expect(fs.readdirSync(path.join(elsewhere, 'tombstones'))).toEqual([A]);
+  });
+
+  posixOnly('without git a symlinked .elmory also refuses pending writes and trust', () => {
+    const wt = tmp();
+    const elsewhere = tmp();
+    fs.mkdirSync(path.join(elsewhere, 'pending'));
+    fs.writeFileSync(path.join(elsewhere, 'trust'), `approved ${A}\n`);
+    fs.symlinkSync(elsewhere, path.join(wt, '.elmory'));
+    const store = new Store(resolveLayout(wt, null));
+    expect(() => store.writeRecord('pending', note(1))).toThrow(RecordError);
+    expect(() => store.appendTrust(`written ${A}`)).toThrow(RecordError);
+    expect(store.readTrust().approved).toEqual(new Set());
+    expect(fs.readdirSync(path.join(elsewhere, 'pending'))).toEqual([]);
+  });
+});
