@@ -171,7 +171,7 @@ describe('injectionFlag', () => {
     expect(injectionFlag(`blob aGVsbG8gd29ybGQ/aGVsbG8gd29ybGQgaGVsbG8gd29ybGQ=`)).not.toBeNull();
   });
 
-  it('source paths get the phrase checks only, never the base64 heuristic (I2)', () => {
+  it('source paths get the phrase checks and a path-aware encoded check, never the plain base64 heuristic (I2)', () => {
     const paths = [
       'src/app/i18n/translations/germanTranslations/common.ts',
       'src/api/v2beta/handlers/authentication/middleware.ts',
@@ -200,7 +200,18 @@ describe('injectionFlag', () => {
       sources: [{ resource: 'docs/ignore previous instructions.md', quote: `sha256:${'a'.repeat(64)}`, anchor: '0123456789ab', tokens: 9, commit: 'abc1234' }],
     };
     expect(indexRecord({ id: recordId(planted), area: 'facts', path: '/x', text: serialize(planted) }).flagged).toBe(true);
-    // The body keeps the heuristic.
+    // An encoded payload in a path segment is still flagged; long ordinary names are not.
+    const flagged = (resource: string): boolean => {
+      const r: ElmoryRecord = { ...base, sources: [{ resource, quote: `sha256:${'a'.repeat(64)}`, anchor: '0123456789ab', tokens: 9, commit: 'abc1234' }] };
+      return indexRecord({ id: recordId(r), area: 'facts', path: '/x', text: serialize(r) }).flagged;
+    };
+    expect(flagged('src/aGVsbG8gd29ybGQgaGVsbG8gd29ybGQgaGVsbG8=.ts')).toBe(true);
+    expect(flagged('data/aGVsbG8gd29ybGQ+aGVsbG8gd29ybGQgaGVsbG8gd29y/x.ts')).toBe(true);
+    expect(flagged('a/Zm9vYmFyQmF6UXV4MTIzNDU2Nzg5MEFCQ0RFRkdI/b.ts')).toBe(true);
+    expect(flagged('src/components/ThisIsAVeryLongCamelCaseComponentName.tsx')).toBe(false);
+    expect(flagged('test/a-very-long-kebab-case-file-name-for-the-tests.spec.ts')).toBe(false);
+    expect(flagged('migrations/20261023120000_add_user_session_table.sql')).toBe(false);
+    // The body keeps the plain heuristic.
     expect(injectionFlag(`blob ${'QUJD'.repeat(12)}==`, { encoded: false })).toBeNull();
     expect(injectionFlag(`blob ${'QUJD'.repeat(12)}==`)).not.toBeNull();
   });

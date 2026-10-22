@@ -121,12 +121,47 @@ function recordStrings(r: ElmoryRecord): string[] {
   return out.filter((x): x is string => typeof x === 'string');
 }
 
+/** A path segment this long or longer may be an encoded payload (see encodedPathSegment). */
+const ENCODED_SEGMENT_MIN = 32;
+
+/**
+ * The first path segment (split on '/' and '.') that looks like an encoded payload rather than a
+ * name, or null: at least 32 characters and either ending in '=' padding, holding a '+', or
+ * mixing digits, upper and lower case at a rate names do not (≥ 3 of each, and a class change at
+ * least every fourth character). `i18n`, `k8s`, `oauth2Client`, `v2beta`, long camelCase or
+ * kebab-case names are not flagged.
+ */
+function encodedPathSegment(paths: readonly string[]): string | null {
+  for (const p of paths) {
+    for (const seg of p.split(/[/\\.]/)) {
+      if (seg.length < ENCODED_SEGMENT_MIN) continue;
+      if (/=$/.test(seg) || seg.includes('+')) return seg;
+      const cls = (c: string): number => (/[0-9]/.test(c) ? 0 : /[A-Z]/.test(c) ? 1 : /[a-z]/.test(c) ? 2 : 3);
+      const counts = [0, 0, 0, 0];
+      let changes = 0;
+      for (let i = 0; i < seg.length; i++) {
+        const k = cls(seg[i] as string);
+        counts[k] = (counts[k] as number) + 1;
+        if (i > 0 && k !== cls(seg[i - 1] as string)) changes++;
+      }
+      if ((counts[0] as number) >= 3 && (counts[1] as number) >= 3 && (counts[2] as number) >= 3 && changes * 4 >= seg.length) return seg;
+    }
+  }
+  return null;
+}
+
 /**
  * The injection flag over the fields served to an agent: title, body and observer with every
- * check, source paths with the phrase checks only (never the base64 heuristic, I2).
+ * check, source paths with the phrase checks and a path-aware encoded check (I2: the plain
+ * base64-run heuristic flags ordinary paths). The flag is per field by design: it is advisory and
+ * never refuses, and a phrase split across fields is not looked for.
  */
 function servedFlag(r: { title: string; body: string; observer: string; paths: readonly string[] }): string | null {
-  return injectionFlag([r.title, r.body, r.observer].join('\n')) ?? injectionFlag(r.paths.join('\n'), { encoded: false });
+  return (
+    injectionFlag([r.title, r.body, r.observer].join('\n')) ??
+    injectionFlag(r.paths.join('\n'), { encoded: false }) ??
+    encodedPathSegment(r.paths)
+  );
 }
 
 /** The one-line fields the control check covers, named for its message. */
@@ -156,7 +191,7 @@ function controlProblem(fields: { name: string; value: string | undefined }[], b
  * control, bidi or line-separator character the write gate refuses in title, observer, key, tag
  * or body), 'secret' (a secret in any field, or a quote field that
  * is not a hash, i.e. code copied into memory). `flagged` covers title, body and observer, and
- * the source paths for instruction phrases only.
+ * the source paths (instruction phrases, and segments that look encoded).
  *
  * The version check runs before the name check (the plan lists it after): a newer-format record
  * keeps keys this version drops when re-serialising, so its name never matches here and it would
