@@ -91,6 +91,8 @@ CREATE TABLE IF NOT EXISTS old(path TEXT PRIMARY KEY, retired_at REAL NOT NULL);
 `;
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+/** `#locked`'s answer when the lock is held and the caller would not wait. */
+const BUSY: unique symbol = Symbol('busy');
 /** A stat entry written within this many ms of the file's mtime is not trusted (§4.3 read step 1). */
 const RACY_MS = 2000;
 const GEN_FILE = /^cache-(\d+)\.db(?:-wal|-shm)?$/;
@@ -136,9 +138,11 @@ function removeDbFiles(file: string): void {
 }
 
 /**
- * Whether another connection is inside a transaction on `file`. BEGIN EXCLUSIVE is busy while
- * any writer holds it (and, in rollback-journal mode, any reader); a TRUNCATE checkpoint reports
- * busy while a WAL reader pins it. Never waits.
+ * Whether another connection visibly holds `file`: a writer (BEGIN EXCLUSIVE is busy), or a
+ * reader that pins WAL frames (a TRUNCATE checkpoint reports busy). Cache files are in WAL mode,
+ * where readers never block BEGIN EXCLUSIVE, so a reader of a file whose WAL holds no frames is
+ * NOT detected. sweepOld probes only generations newer than the current one, which lock.db never
+ * pointed a reader at. Never waits.
  */
 function inUse(file: string): boolean {
   let db: DatabaseSync;
@@ -335,13 +339,33 @@ export class Cache {
    * fn must be synchronous. Throws CacheBusyError after the busy timeout. Re-entrant.
    */
   withWriteLock<T>(fn: () => T): T {
+    return this.#locked(fn, true) as T; // waiting never answers BUSY
+  }
+
+  /**
+   * Like `withWriteLock`, but never waits: when another connection holds the write lock it
+   * returns null at once, without running fn (so fn should not itself return null). Re-entrant:
+   * inside a held lock fn just runs.
+   */
+  tryWithWriteLock<T>(fn: () => T): T | null {
+    const out = this.#locked(fn, false);
+    return out === BUSY ? null : (out as T);
+  }
+
+  #locked<T>(fn: () => T, wait: boolean): T | typeof BUSY {
     const lock = this.#lock;
     if (lock === null || this.#lockDepth > 0) return fn();
     try {
-      lock.exec('BEGIN IMMEDIATE');
+      if (!wait) lock.exec('PRAGMA busy_timeout=0');
+      try {
+        lock.exec('BEGIN IMMEDIATE');
+      } finally {
+        if (!wait) lock.exec(`PRAGMA busy_timeout=${this.#busy}`);
+      }
     } catch (e) {
-      if (isBusy(e)) throw new CacheBusyError();
-      throw e;
+      if (!isBusy(e)) throw e;
+      if (wait) throw new CacheBusyError();
+      return BUSY;
     }
     this.#lockDepth++;
     try {
