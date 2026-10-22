@@ -16,8 +16,8 @@ small immutable Markdown records.
 Release 1 covers coding agents only. The core is TypeScript on Node ≥ 24 with no runtime
 dependencies (`node:sqlite`, `node:crypto`); the MCP server adds the MCP SDK.
 
-**Status:** release 1 is being built. It is not on npm yet; until it is, install from source
-(below).
+**Status:** release 1 core complete, unpublished. It is not on npm yet; until it is, install
+from source (below).
 
 ## Install
 
@@ -112,16 +112,18 @@ The same rules are in the `elmory_recall` tool description and in [AGENTS.md](AG
 
 Every verb takes `--json`, `--worktree <path>` (the git toplevel of that path; default: the
 current directory) and `--observer <s>` (default: `cli:$USER`; one printable line). These global
-flags go before or after the verb. Human output shows control characters in record text as
-visible escapes (`\x1b`), so a record cannot drive your terminal; `--json` output is unchanged.
+flags go before or after the verb. Human output shows control characters, bidi controls and the
+Unicode line/paragraph separators (U+2028/2029) in record text as visible escapes (`\x1b`,
+`\u202e`), so a record cannot drive your terminal or reorder what it shows; `--json` output is
+unchanged.
 
 | Command | What it does |
 |---|---|
 | `elmory remember <text> --title <t> --quote <file>:<text> … [--tag t] [--key k] [--supersedes id,…] [--cites id,…] [--local]` | save a fact that quotes the code it relies on |
 | `elmory note <text> --title <t> [--tag t] [--key k] [--supersedes id,…] [--cites id,…] [--local]` | save a decision or preference (not code-checked) |
-| `elmory recall <query> [--budget n] [--include state,…]` | the records that hold here, within a token budget, or "I don't know" |
+| `elmory recall <query> [--budget n] [--include state,…]` | the records that hold here, within a token budget, or "I don't know"; `--include` may add `superseded`, `stale`, `suspect`, `unknown` (`candidate` and `forgotten` are refused, exit `2`: candidates are seen through `review`) |
 | `elmory about <path\|key>` | the records quoting a path, or in a key's chain |
-| `elmory history <id\|key>` | a record's supersedes chain, oldest first, with each state here |
+| `elmory history <id\|key>` | a record's supersedes chain, oldest first, with each state here; `--json` gives `{ entries, warnings }` |
 | `elmory verify [--files a,b]` | re-check records against this worktree; report what changed |
 | `elmory forget <id…> \| --query <q> [--confirm] \| --all [--confirm]` | delete, cascade to citing records (archived ones too), report what could not be reached |
 | `elmory publish [id…]` | move pending records into `.elmory/facts/` to commit with the work |
@@ -131,10 +133,12 @@ visible escapes (`\x1b`), so a record cannot drive your terminal; `--json` outpu
 | `elmory rebuild` | rebuild the cache from the record files |
 | `elmory help` | list every verb (`--json` for a machine-readable list) |
 
-Exit codes: `0` ok, `1` error, `2` refused, `3` conflict, `4` abstain.
+Exit codes: `0` ok, `1` error, `2` refused, `3` conflict, `4` abstain. A `forget` whose ids all
+never existed here exits `1` (nothing was written).
 
 `forget --query` matches every record containing **any** of the words (they are OR-joined, as in
-`recall`), in every state, plus every record citing a match. So `forget --query` and
+`recall`), in every state (candidates included, so they appear in the preview), plus archived
+record files whose text matches, plus every record citing a match. So `forget --query` and
 `forget --all` without `--confirm` only list the matches and the cascade, then exit `2`; check
 the list, then run the same command with `--confirm`. Ids that never existed are reported as
 `unknown` and nothing is written for them.
@@ -155,7 +159,8 @@ the list, then run the same command with `--confirm`. Ids that never existed are
   lock.db  cache-<n>.db
 ```
 
-- A worktree sees its own `.elmory/facts`, plus `pending`, plus `local`.
+- A worktree sees its own `.elmory/facts`, plus `pending`, plus `local`. After a branch switch
+  or checkout, the next call re-reads that worktree's records.
 - `remember` writes to `pending` (or `local`); `publish` moves pending records into the
   worktree's `.elmory/facts/`, ready to commit. Records are immutable and named by id, so there
   is no merge conflict.
@@ -173,7 +178,15 @@ the list, then run the same command with `--confirm`. Ids that never existed are
 - **Comment insertions and real syntax changes inside a quote** make it suspect; only
   whitespace, quote-style and trailing-comma changes are tolerated.
 - **Trust by commit signature** stops forged authors, but not a trusted signer acting
-  maliciously.
+  maliciously. A signed record or tombstone file stays trusted only while every later commit in
+  the branch's history keeps its bytes: if one changed, deleted or replaced it (a merge adopting
+  another version counts), bytes brought back later by a merge or an unsigned commit are
+  untrusted.
+- **Sync notices record files by stat, not by reading them.** A record file edited in place
+  within the 2 s racy window can be missed by sync and served from the cache; `elmory verify`
+  re-reads the files and catches it. Tools that restore mtimes (`rsync -t`, `tar -p`,
+  `touch -r`) can hide an edit, and an added or removed record file, the same way. Both need
+  local write access.
 - **Forget cannot reach copies outside Elmory.** The report names them.
 - **The cache directory is not pinned per project.** Processes with different `XDG_CACHE_HOME`
   values keep separate caches; a forget drops the text from another cache only when a process
