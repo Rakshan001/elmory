@@ -447,8 +447,9 @@ export class Store {
 
   /**
    * Tombstones from both dirs. `committed` is true for the worktree dir. Without git both dirs
-   * are the same `.elmory/tombstones`, read once, and nothing there is committed. A file whose
-   * body is not `supersedes: [<ids>]` is skipped with a warning.
+   * are the same `.elmory/tombstones`, read once, and nothing there is committed. Only files
+   * named by a record id count. One whose body is not `supersedes: [<ids>]` still counts as a
+   * tombstone with `supersedes: []` (fail closed: the record stays hidden), plus a warning.
    */
   readTombstones(): Tombstone[] {
     const l = this.layout;
@@ -469,7 +470,9 @@ export class Store {
         const inner = TOMBSTONE_BODY.exec(text)?.[1]?.trim();
         const items = inner === undefined ? null : inner === '' ? [] : inner.split(',').map((s) => s.trim());
         if (items === null || !items.every(isRecordId)) {
-          this.warn(`tombstone: skipped malformed ${file}`);
+          // Fail closed: the id stays forgotten, with no supersedes, and the problem is reported.
+          this.warn(`tombstone: malformed ${file}; counted as a tombstone with supersedes: []`);
+          out.push({ id: name, supersedes: [], committed });
           continue;
         }
         out.push({ id: name, supersedes: items, committed });

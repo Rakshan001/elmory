@@ -413,13 +413,18 @@ describe('review fixes', () => {
     expect(store.warnings.every((w) => w.includes('trust'))).toBe(true);
   });
 
-  it('malformed tombstone files are skipped with a warning', () => {
+  it('malformed tombstone files still count (fail closed) with a warning; non-id names are skipped', () => {
     const store = plainStore();
     const C = 'f_' + 'c'.repeat(26);
     store.writeTombstone(A, [B], 'local');
     fs.writeFileSync(path.join(store.layout.localTombstones, B), 'garbage\n');
     fs.writeFileSync(path.join(store.layout.localTombstones, C), 'supersedes: ["x", f_nope]\n');
-    expect(store.readTombstones()).toEqual([{ id: A, supersedes: [B], committed: false }]);
+    fs.writeFileSync(path.join(store.layout.localTombstones, 'not-an-id'), 'supersedes: []\n');
+    expect(store.readTombstones()).toEqual([
+      { id: A, supersedes: [B], committed: false },
+      { id: B, supersedes: [], committed: false },
+      { id: C, supersedes: [], committed: false },
+    ]);
     expect(store.warnings).toHaveLength(2);
     expect(store.warnings.join('\n')).toContain(B);
     expect(store.warnings.join('\n')).toContain(C);
