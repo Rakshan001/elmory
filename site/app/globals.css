@@ -1,0 +1,148 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+/* Theme follows the OS setting; there is no manual toggle. */
+@custom-variant dark (@media (prefers-color-scheme: dark));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+  --font-heading: var(--font-geist-sans);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --color-panel: var(--panel);
+  --color-panel-foreground: var(--panel-foreground);
+  --color-panel-muted: var(--panel-muted);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+/*
+ * Sage and olive, with one accent: pale lime.
+ * Shape rule: surfaces 28px, nested blocks 16px, buttons and badges full pill.
+ */
+:root {
+  --background: #e8ece3;
+  --foreground: #1a2216;
+  --card: #f5f7f1;
+  --card-foreground: #1a2216;
+  --popover: #f5f7f1;
+  --popover-foreground: #1a2216;
+  --primary: #24301f;
+  --primary-foreground: #e2f5a4;
+  --secondary: #dce3d4;
+  --secondary-foreground: #24301f;
+  --muted: #dde4d6;
+  --muted-foreground: #4f5c49;
+  --accent: #dcf29a;
+  --accent-foreground: #1a2216;
+  --destructive: #a3412c;
+  --border: #ccd5c4;
+  --input: #ccd5c4;
+  --ring: #6b7c5f;
+  --panel: #3b4834;
+  --panel-foreground: #eef2ea;
+  --panel-muted: #bcc7b4;
+  --radius: 0.75rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #131910;
+    --foreground: #e9efe3;
+    --card: #1b2317;
+    --card-foreground: #e9efe3;
+    --popover: #1b2317;
+    --popover-foreground: #e9efe3;
+    --primary: #dcf29a;
+    --primary-foreground: #1a2216;
+    --secondary: #222c1d;
+    --secondary-foreground: #e9efe3;
+    --muted: #222b1d;
+    --muted-foreground: #a2ae99;
+    --accent: #dcf29a;
+    --accent-foreground: #1a2216;
+    --destructive: #e08a72;
+    --border: rgb(255 255 255 / 0.09);
+    --input: rgb(255 255 255 / 0.12);
+    --ring: #8fa07f;
+    --panel: #26311f;
+    --panel-foreground: #eef2ea;
+    --panel-muted: #a9b5a0;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html {
+    @apply font-sans;
+    scroll-behavior: smooth;
+    scroll-padding-top: 5rem;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+  pre {
+    scrollbar-width: thin;
+    scrollbar-color: rgb(255 255 255 / 0.18) transparent;
+  }
+  ::selection {
+    background: var(--accent);
+    color: var(--accent-foreground);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+}
+
+/* Frosted panel: a backdrop-filter approximation of glass, solid when transparency is reduced. */
+@utility glass {
+  background: color-mix(in oklab, var(--card) 62%, transparent);
+  backdrop-filter: blur(20px) saturate(140%);
+  -webkit-backdrop-filter: blur(20px) saturate(140%);
+  border: 1px solid color-mix(in oklab, var(--foreground) 9%, transparent);
+  box-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 0.35),
+    0 24px 60px -30px color-mix(in oklab, var(--panel) 55%, transparent);
+  @media (prefers-color-scheme: dark) {
+    box-shadow:
+      inset 0 1px 0 rgb(255 255 255 / 0.06),
+      0 24px 60px -30px rgb(0 0 0 / 0.6);
+  }
+  @media (prefers-reduced-transparency: reduce) {
+    background: var(--card);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+}
