@@ -127,3 +127,29 @@ export function SpotlightSection({
     </section>
   );
 }
+
+/**
+ * A card with a soft light that follows the pointer, tinted by the card's own text colour so it
+ * works on ink and paper alike. Sets CSS variables directly, so moving the pointer never re-renders.
+ */
+export function SpotlightCard({ children, className = "" }: { children: React.ReactNode; className?: string }) {
+  return (
+    <motion.div
+      whileHover={{ y: -3 }}
+      transition={{ type: "spring", stiffness: 300, damping: 24 }}
+      onPointerMove={(e) => {
+        const r = e.currentTarget.getBoundingClientRect();
+        e.currentTarget.style.setProperty("--x", `${e.clientX - r.left}px`);
+        e.currentTarget.style.setProperty("--y", `${e.clientY - r.top}px`);
+      }}
+      className={`group/spot relative overflow-hidden ${className}`}
+    >
+      {children}
+      {/* Painted over the content, faint enough not to touch contrast. */}
+      <span
+        aria-hidden
+        className="pointer-events-none absolute inset-0 opacity-0 transition-opacity duration-300 group-hover/spot:opacity-100 [background:radial-gradient(360px_circle_at_var(--x)_var(--y),color-mix(in_oklab,currentColor_9%,transparent),transparent_70%)]"
+      />
+    </motion.div>
+  );
+}

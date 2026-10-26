@@ -1,7 +1,6 @@
 import Link from "next/link";
 import { ArrowRight } from "lucide-react";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { CopyButton } from "./copy-button";
+import { InstallTabs } from "./install-tabs";
 import { Reveal } from "./reveal";
 
 // Commands match the Install and MCP sections of the README.
@@ -54,25 +53,7 @@ export function Install() {
           </Link>
         </Reveal>
         <Reveal className="min-w-0">
-          <Tabs defaultValue="source">
-            <TabsList className="h-10 p-1">
-              {OPTIONS.map((o) => (
-                <TabsTrigger key={o.id} value={o.id} className="px-3 sm:px-4">
-                  {o.label}
-                </TabsTrigger>
-              ))}
-            </TabsList>
-            {OPTIONS.map((o) => (
-              <TabsContent key={o.id} value={o.id} className="mt-3 min-w-0">
-                <div className="relative rounded-lg bg-panel text-panel-foreground">
-                  <CopyButton text={o.code} />
-                  <pre className="code-wrap p-5 pt-14 font-mono text-[12.5px] leading-6 sm:pt-5 sm:pr-28">
-                    <code>{o.code}</code>
-                  </pre>
-                </div>
-              </TabsContent>
-            ))}
-          </Tabs>
+          <InstallTabs options={OPTIONS} />
         </Reveal>
       </div>
     </section>

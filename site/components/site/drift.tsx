@@ -1,4 +1,5 @@
 import { Reveal } from "./reveal";
+import { Timeline } from "./timeline";
 
 const DAYS = [
   { day: "Monday", text: "Your agent learns the session TTL is 15 minutes and saves it to memory." },
@@ -15,23 +16,7 @@ export function Drift() {
           Agent memory goes stale without telling anyone.
         </h2>
       </Reveal>
-      <ol className="relative mt-14 grid gap-10 md:grid-cols-3 md:gap-8">
-        <span aria-hidden className="absolute top-[7px] right-0 left-0 hidden h-px bg-border md:block" />
-        {DAYS.map((d, i) => (
-          <li key={d.day} className="relative pl-7 md:pt-9 md:pl-0">
-            <Reveal>
-              <span
-                aria-hidden
-                className={`absolute top-1.5 left-0 size-3.5 rounded-full border-2 md:top-0 ${
-                  i === 2 ? "border-foreground bg-foreground" : "border-foreground/30 bg-background"
-                }`}
-              />
-              <p className="font-mono text-xs text-muted-foreground">{d.day}</p>
-              <p className="mt-2 max-w-[32ch] leading-relaxed">{d.text}</p>
-            </Reveal>
-          </li>
-        ))}
-      </ol>
+      <Timeline days={DAYS} />
       <Reveal>
         <p className="mt-14 max-w-[62ch] rounded-xl bg-primary px-6 py-5 leading-relaxed text-primary-foreground md:px-8">
           With Elmory, Friday’s recall answers “I don’t know”, because the quoted line no longer exists. The agent
