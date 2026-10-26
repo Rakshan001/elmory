@@ -1,0 +1,95 @@
+export const meta = { title: "Connect agents", description: "Run the elmory-mcp server and connect Claude Code, Cursor or Codex to it.", order: 3 };
+
+## The MCP server
+
+`elmory-mcp` is a stdio MCP server. It is installed alongside the `elmory` CLI (see the [Quickstart](/docs/quickstart); Elmory is not on npm yet, so install from source).
+
+Clients do not promise to start the server in the project root, so the server resolves its directory to the git toplevel. A server started in a subdirectory still serves the whole repo.
+
+## Environment variables
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `ELMORY_WORKTREE` | `CLAUDE_PROJECT_DIR`, else the server's working directory | The worktree whose memory it serves, resolved to the git toplevel of that path. |
+| `ELMORY_OBSERVER` | `agent:mcp` | Who is writing, stamped on every record. Must be one printable line, or writes are refused. |
+| `XDG_CACHE_HOME` | platform default | Where the cache lives (see [Storage](/docs/storage)). Give the CLI and the server the same value. |
+
+## Claude Code
+
+Claude Code sets `CLAUDE_PROJECT_DIR` in the server's environment, and Elmory uses it.
+
+```bash
+claude mcp add --env ELMORY_OBSERVER=agent:claude-code --transport stdio elmory -- elmory-mcp
+```
+
+Keep `--transport stdio` between `--env` and the name. A name placed right after `--env` is read as another `KEY=value` pair.
+
+Or add it to the project's `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "elmory": { "command": "elmory-mcp", "env": { "ELMORY_OBSERVER": "agent:claude-code" } }
+  }
+}
+```
+
+## Cursor
+
+In the project's `.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "elmory": {
+      "type": "stdio",
+      "command": "elmory-mcp",
+      "env": { "ELMORY_WORKTREE": "${workspaceFolder}", "ELMORY_OBSERVER": "agent:cursor" }
+    }
+  }
+}
+```
+
+Keep this in the project-level file. `${workspaceFolder}` is the folder that contains `.cursor/mcp.json`, so in the global `~/.cursor/mcp.json` it would be your home folder.
+
+## Codex
+
+In `~/.codex/config.toml`:
+
+```text
+[mcp_servers.elmory]
+command = "elmory-mcp"
+env_vars = ["XDG_CACHE_HOME"]          # forwarded only if set; keeps the CLI and MCP on one cache
+env = { ELMORY_OBSERVER = "agent:codex" }
+```
+
+Or from the command line:
+
+```bash
+codex mcp add elmory --env ELMORY_OBSERVER=agent:codex -- elmory-mcp
+```
+
+Codex starts servers with a cleared environment (hence `env_vars`). Without `cwd` it starts them in its own working directory, so a global entry serves whatever repo Codex was launched in. To pin one project, use a project-scoped `.codex/config.toml` (trusted projects only) that sets `cwd` or `ELMORY_WORKTREE`.
+
+## The nine tools
+
+| Tool | What it does |
+|---|---|
+| `elmory_remember` | Save a fact that rests on code. Each quote is text copied exactly from a git-tracked file; the fact is served only while every quote is still found. |
+| `elmory_note` | Save a decision or preference that has no code to quote. Notes are labelled "not code-checked" and ranked below facts. |
+| `elmory_recall` | Search memory for this worktree. Returns only the records that hold here, or an abstain. |
+| `elmory_about` | The records that quote a file path, or are in the chain of a key, and hold in this worktree. |
+| `elmory_history` | The supersedes chain of a record id or key, oldest first. |
+| `elmory_verify` | Re-check every record (or only those quoting given files) against this worktree and report what changed. Run it after editing code that facts quote. |
+| `elmory_review` | List records not yet trusted here (pulled from others, edited, flagged, or withheld by an unsigned forget). |
+| `elmory_publish` | Move pending records into this worktree's `.elmory/facts/` so they are committed with the work. |
+| `elmory_forget` | Delete records by id, with every record that cites them. Only on a human's say-so. |
+
+There is no approve tool. Approving is a human act, done from the CLI with `elmory approve <id>` (or `elmory reject <id>`).
+
+## Results
+
+- Results are JSON text. Bidi marks and C1 controls are written as `\uXXXX` escapes.
+- `elmory_review` results are `{ candidates, note }`, and the note says the titles are untrusted data.
+- `elmory_forget` takes ids only. Ids that never existed come back in `unknown`.
+- A refused write or a conflict comes back as an error result with `{ error, reason | heads }`. On a conflict, read the heads it names and write again with them in `supersedes`.

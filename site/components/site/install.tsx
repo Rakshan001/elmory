@@ -1,3 +1,5 @@
+import Link from "next/link";
+import { ArrowRight } from "lucide-react";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { CopyButton } from "./copy-button";
 import { Reveal } from "./reveal";
@@ -43,6 +45,13 @@ export function Install() {
             Needs Node 24 or newer and git 2.31 or newer. Elmory is not on npm yet, so install from source until the
             first release.
           </p>
+          <Link
+            href="/docs/quickstart"
+            className="mt-6 inline-flex items-center gap-1.5 text-sm font-medium underline decoration-foreground/30 underline-offset-4 hover:decoration-foreground"
+          >
+            Read the quickstart
+            <ArrowRight className="size-3.5" />
+          </Link>
         </Reveal>
         <Reveal className="min-w-0">
           <Tabs defaultValue="source">

@@ -1,0 +1,161 @@
+export const meta = { title: "CLI reference", description: "Every elmory verb, its flags, the global flags and the exit codes.", order: 5 };
+
+## Global flags
+
+Every verb takes these flags. They can go before or after the verb.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--json` | off | Machine-readable output. |
+| `--worktree <path>` | the current directory | The worktree to use: the git toplevel of that path. |
+| `--observer <s>` | `cli:$USER` | Who is writing, stamped on records. Must be one printable line. |
+
+Human output shows control characters, bidi controls and the Unicode line and paragraph separators (U+2028, U+2029) in record text as visible escapes (`\x1b`, `‮`). A record cannot drive your terminal or reorder what it shows. `--json` output is unchanged.
+
+## Writing records
+
+### remember
+
+```text
+elmory remember <text> --title <t> --quote <file>:<text> … [--tag t] [--key k] [--supersedes id,…] [--cites id,…] [--local]
+```
+
+Save a fact that quotes the code it relies on. Repeat `--quote` for more than one quote.
+
+### note
+
+```text
+elmory note <text> --title <t> [--tag t] [--key k] [--supersedes id,…] [--cites id,…] [--local]
+```
+
+Save a decision or preference. Notes are not code-checked.
+
+For both verbs, `--tag` is one of `decision`, `gotcha`, `convention`, `reference` or `preference`. `--local` keeps the record private to this clone; it is never published.
+
+## Reading records
+
+### recall
+
+```text
+elmory recall <query> [--budget n] [--include state,…]
+```
+
+Return the records that hold here, within a token budget, or "I don't know". `--include` may add `superseded`, `stale`, `suspect` or `unknown`. `candidate` and `forgotten` are refused (exit `2`): candidates are seen through `review`.
+
+### about
+
+```text
+elmory about <path|key>
+```
+
+The records quoting a path, or in a key's chain.
+
+### history
+
+```text
+elmory history <id|key>
+```
+
+A record's supersedes chain, oldest first, with each state here. `--json` gives `{ entries, warnings }`.
+
+### verify
+
+```text
+elmory verify [--files a,b]
+```
+
+Re-check records against this worktree and report what changed.
+
+## Publishing
+
+### publish
+
+```text
+elmory publish [id…]
+```
+
+Move pending records into `.elmory/facts/` so you can commit them with the work.
+
+## Trust
+
+### review
+
+```text
+elmory review
+```
+
+List records not yet trusted here, with the reason.
+
+### approve and reject
+
+```text
+elmory approve <id>
+elmory reject <id>
+```
+
+`approve` trusts a record. `reject` hides it here.
+
+For a record withheld by a forget:
+
+- `reject` accepts the forget.
+- `approve` refuses a forget that is untrusted (`forget requested by an untrusted commit`: unsigned, badly signed, or signed by a key the ledger does not list).
+- For a forget whose signature cannot be verified here (`…cannot be verified here`, for example when gpg or the allowed signers file is missing), `review` shows the forgetting commit, and `approve` records it (`approved <id> <commit>`), refusing that forget only.
+- A local forget, or one signed by a listed key, cannot be approved away (refused, exit `2`).
+
+Approving is a human act. There is no MCP tool for it.
+
+## Deleting records
+
+### forget
+
+```text
+elmory forget <id…> | --query <q> [--confirm] | --all [--confirm]
+```
+
+Delete records, cascade to the records that cite them (archived ones too), and report what could not be reached.
+
+- `--query` matches every record containing **any** of the words (they are OR-joined, as in `recall`), in every state (candidates included, so they appear in the preview), plus archived record files whose text matches, plus every record citing a match.
+- `forget --query` and `forget --all` without `--confirm` only list the matches and the cascade, then exit `2`. Check the list, then run the same command with `--confirm`.
+- Ids that never existed are reported as `unknown`, and nothing is written for them. A `forget` whose ids all never existed here exits `1`.
+- An id whose file is in another worktree's `.elmory/facts` (or only in HEAD) is forgotten too. Both tombstones are written, its cache row is deleted, and every worktree stops serving it at its next sync. A `note:` line says its file stays there until it is deleted in that worktree.
+
+## Maintenance
+
+### gc
+
+```text
+elmory gc [--dry-run] [--restore id]
+```
+
+Archive old superseded or stale records and unused notes.
+
+### rebuild
+
+```text
+elmory rebuild
+```
+
+Rebuild the cache from the record files.
+
+### help and version
+
+```text
+elmory help
+elmory --version
+```
+
+`help` lists every verb (`--json` for a machine-readable list). `--version` prints the installed version.
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | ok |
+| `1` | error |
+| `2` | refused |
+| `3` | conflict |
+| `4` | abstain |
+
+## Outside a store
+
+Outside a git repository, in a directory with no `.elmory`, the read-only verbs (`recall`, `about`, `history`, `verify`, `review`) answer "no Elmory store here" and create nothing. `recall` and `about` exit `4`. A write creates the store there.

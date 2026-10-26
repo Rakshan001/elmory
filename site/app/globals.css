@@ -156,3 +156,13 @@
     }
   }
 }
+
+/* Docs tables: identifiers in the first column stay on one line once there is room. */
+@media (min-width: 640px) {
+  .docs-table td:first-child {
+    white-space: nowrap;
+  }
+  .docs-table td:first-child code {
+    overflow-wrap: normal;
+  }
+}

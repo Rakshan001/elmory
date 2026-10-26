@@ -1,0 +1,50 @@
+export const meta = { title: "Storage", description: "Where Elmory keeps records, tombstones, trust and its cache.", order: 6 };
+
+## Layout
+
+Elmory keeps its data in three places: the worktree, the clone's git common directory, and a cache directory.
+
+```text
+<worktree>/.elmory/                       committed; read per worktree, so branch-correct
+  facts/<id>.md                           published records
+  tombstones/<id>                         one file per forgotten id: "supersedes: [...]"
+<git-common-dir>/elmory/                  per clone, seen by every worktree, never in a work tree
+  pending/<id>.md                         written here, not yet published
+  local/<id>.md                           private; never published
+  trust                                   ledger, approvals, trusted signers (append-only)
+  tombstones/<id>                         local forgets, effective at once in every worktree
+  archive/<id>.md                         gc'd pending records, recoverable
+  archive/local/<id>.md                   gc'd local records, restored as local
+~/Library/Caches/elmory/<project-id>/     $XDG_CACHE_HOME/elmory/... when set; ~/.cache/elmory/... off macOS
+  lock.db  cache-<n>.db
+```
+
+## The worktree: `.elmory/`
+
+This folder is committed with your code. Each worktree reads its own copy, so what it sees follows its branch.
+
+- `facts/` holds published records.
+- `tombstones/` holds one file per forgotten id.
+
+## The clone: `<git-common-dir>/elmory/`
+
+This folder is per clone. Every worktree of the clone sees it, and it is never inside a work tree.
+
+- `pending/` holds records written here but not yet published.
+- `local/` holds private records that are never published.
+- `trust` is the append-only ledger of approvals and trusted signers.
+- `tombstones/` holds local forgets, which take effect at once in every worktree.
+- `archive/` holds pending records collected by `gc`, which can be recovered. `archive/local/` holds collected local records, which are restored as local.
+
+## How the areas fit together
+
+- A worktree sees its own `.elmory/facts`, plus `pending`, plus `local`. After a branch switch or checkout, the next call re-reads that worktree's records.
+- `remember` writes to `pending` (or `local`). `publish` moves pending records into the worktree's `.elmory/facts/`, ready to commit. Records are immutable and named by id, so there is no merge conflict.
+- Without git, `<root>/.elmory/` holds every area and trust is local.
+
+## The cache
+
+The cache lives in `~/Library/Caches/elmory/<project-id>/` on macOS, in `~/.cache/elmory/` elsewhere, or under `$XDG_CACHE_HOME/elmory/` when that variable is set.
+
+- The cache is disposable. Delete it and a rebuild gives identical answers. State is never stored; it is derived for the worktree that asks.
+- The cache directory follows `XDG_CACHE_HOME` in each process. A forget compacts only the cache of the process that ran it, so give the CLI and every MCP server the same `XDG_CACHE_HOME`. Codex needs `env_vars` for this (see [Connect agents](/docs/connect-agents)).
