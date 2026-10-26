@@ -40,57 +40,57 @@
 }
 
 /*
- * Sage and olive, with one accent: pale lime.
- * Shape rule: surfaces 28px, nested blocks 16px, buttons and badges full pill.
+ * Monochrome: ink on near-white, near-white on ink in dark mode. No accent colour.
+ * Shape rule: cards 12px (rounded-xl), nested blocks 8px (rounded-lg), buttons and badges full pill.
  */
 :root {
-  --background: #e8ece3;
-  --foreground: #1a2216;
-  --card: #f5f7f1;
-  --card-foreground: #1a2216;
-  --popover: #f5f7f1;
-  --popover-foreground: #1a2216;
-  --primary: #24301f;
-  --primary-foreground: #e2f5a4;
-  --secondary: #dce3d4;
-  --secondary-foreground: #24301f;
-  --muted: #dde4d6;
-  --muted-foreground: #4f5c49;
-  --accent: #dcf29a;
-  --accent-foreground: #1a2216;
-  --destructive: #a3412c;
-  --border: #ccd5c4;
-  --input: #ccd5c4;
-  --ring: #6b7c5f;
-  --panel: #3b4834;
-  --panel-foreground: #eef2ea;
-  --panel-muted: #bcc7b4;
-  --radius: 0.75rem;
+  --background: #fafafa;
+  --foreground: #171717;
+  --card: #ffffff;
+  --card-foreground: #171717;
+  --popover: #ffffff;
+  --popover-foreground: #171717;
+  --primary: #171717;
+  --primary-foreground: #ffffff;
+  --secondary: #f2f2f2;
+  --secondary-foreground: #171717;
+  --muted: #f2f2f2;
+  --muted-foreground: #4d4d4d;
+  --accent: #f2f2f2;
+  --accent-foreground: #171717;
+  --destructive: #d50000;
+  --border: #e6e6e6;
+  --input: #e6e6e6;
+  --ring: #a1a1a1;
+  --panel: #171717;
+  --panel-foreground: #ededed;
+  --panel-muted: #a1a1a1;
+  --radius: 0.5rem;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --background: #131910;
-    --foreground: #e9efe3;
-    --card: #1b2317;
-    --card-foreground: #e9efe3;
-    --popover: #1b2317;
-    --popover-foreground: #e9efe3;
-    --primary: #dcf29a;
-    --primary-foreground: #1a2216;
-    --secondary: #222c1d;
-    --secondary-foreground: #e9efe3;
-    --muted: #222b1d;
-    --muted-foreground: #a2ae99;
-    --accent: #dcf29a;
-    --accent-foreground: #1a2216;
-    --destructive: #e08a72;
-    --border: rgb(255 255 255 / 0.09);
-    --input: rgb(255 255 255 / 0.12);
-    --ring: #8fa07f;
-    --panel: #26311f;
-    --panel-foreground: #eef2ea;
-    --panel-muted: #a9b5a0;
+    --background: #0a0a0a;
+    --foreground: #ededed;
+    --card: #111111;
+    --card-foreground: #ededed;
+    --popover: #111111;
+    --popover-foreground: #ededed;
+    --primary: #ededed;
+    --primary-foreground: #0a0a0a;
+    --secondary: #1a1a1a;
+    --secondary-foreground: #ededed;
+    --muted: #1a1a1a;
+    --muted-foreground: #a1a1a1;
+    --accent: #1f1f1f;
+    --accent-foreground: #ededed;
+    --destructive: #ff6166;
+    --border: #262626;
+    --input: #2e2e2e;
+    --ring: #737373;
+    --panel: #141414;
+    --panel-foreground: #ededed;
+    --panel-muted: #a1a1a1;
   }
 }
 
@@ -110,13 +110,9 @@
   [role="button"]:not(:disabled) {
     cursor: pointer;
   }
-  pre {
-    scrollbar-width: thin;
-    scrollbar-color: rgb(255 255 255 / 0.18) transparent;
-  }
   ::selection {
-    background: var(--accent);
-    color: var(--accent-foreground);
+    background: var(--foreground);
+    color: var(--background);
   }
 }
 
@@ -126,23 +122,37 @@
   }
 }
 
-/* Frosted panel: a backdrop-filter approximation of glass, solid when transparency is reduced. */
-@utility glass {
-  background: color-mix(in oklab, var(--card) 62%, transparent);
-  backdrop-filter: blur(20px) saturate(140%);
-  -webkit-backdrop-filter: blur(20px) saturate(140%);
-  border: 1px solid color-mix(in oklab, var(--foreground) 9%, transparent);
+/* Card chrome: a hairline ring plus small stacked shadows, never one heavy drop. */
+@utility surface {
+  background: var(--card);
   box-shadow:
-    inset 0 1px 0 rgb(255 255 255 / 0.35),
-    0 24px 60px -30px color-mix(in oklab, var(--panel) 55%, transparent);
+    0 0 0 1px var(--border),
+    0 2px 2px rgb(0 0 0 / 0.04),
+    0 8px 16px -4px rgb(0 0 0 / 0.04);
   @media (prefers-color-scheme: dark) {
-    box-shadow:
-      inset 0 1px 0 rgb(255 255 255 / 0.06),
-      0 24px 60px -30px rgb(0 0 0 / 0.6);
+    box-shadow: 0 0 0 1px var(--border);
   }
-  @media (prefers-reduced-transparency: reduce) {
-    background: var(--card);
-    backdrop-filter: none;
-    -webkit-backdrop-filter: none;
+}
+
+/* Code never scrolls sideways: long lines wrap. */
+@utility code-wrap {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+@keyframes reveal {
+  from {
+    opacity: 0;
+    transform: translateY(16px);
+  }
+}
+
+@supports (animation-timeline: view()) {
+  @media (prefers-reduced-motion: no-preference) {
+    .reveal {
+      animation: reveal linear both;
+      animation-timeline: view();
+      animation-range: entry 0% entry 35%;
+    }
   }
 }
