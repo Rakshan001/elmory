@@ -12,6 +12,7 @@ import {
   type ElmoryRecord,
   FORMAT_VERSION,
   type QuoteSource,
+  type LegacyFileSource,
   type RecordType,
   type Source,
   type Tag,
@@ -688,13 +689,14 @@ function buildRecord(
   input: RememberInput,
   observer: string,
   recorded: string,
-  sources: QuoteSource[],
+  sources: Source[],
+  imp?: ImportExtra,
 ): ElmoryRecord {
   const r: ElmoryRecord = {
     type,
     title: input.title,
     version: FORMAT_VERSION,
-    recorded,
+    recorded: imp?.recorded ?? recorded,
     observer,
     supersedes: [...new Set(input.supersedes ?? [])],
     cites: [...new Set(input.cites ?? [])],
@@ -703,6 +705,10 @@ function buildRecord(
   };
   if (input.tag !== undefined) r.tag = input.tag;
   if (input.key !== undefined) r.key = input.key;
+  if (imp !== undefined) {
+    r.imported = true;
+    r.legacyId = imp.legacyId;
+  }
   return r;
 }
 
@@ -717,11 +723,12 @@ async function prepare(
   input: RememberInput,
   observer: string,
   notes: string[],
-): Promise<QuoteSource[]> {
+  imp?: ImportExtra,
+): Promise<Source[]> {
   if (typeof input !== 'object' || input === null) throw new RefusedError('input must be an object', 'shape');
   const quotes = input.quotes ?? [];
   if (!Array.isArray(quotes)) throw new RefusedError('quotes must be a list', 'shape');
-  if (type === 'memory/fact' && quotes.length === 0) {
+  if (type === 'memory/fact' && quotes.length === 0 && imp === undefined) {
     throw new RefusedError('a fact needs at least one quote; use note() for a decision or preference', 'shape');
   }
   if (type === 'memory/note' && quotes.length > 0) throw new RefusedError('a note takes no quotes', 'shape');
@@ -758,13 +765,16 @@ async function prepare(
   }));
   let problems: string[];
   try {
-    const provisional = buildRecord(type, input, observer, ctx.now(), placeholders);
+    const provisional = buildRecord(type, input, observer, ctx.now(), imp?.sources ?? placeholders, imp);
     problems = [...lint(provisional), ...sourceProblems(provisional.sources)];
   } catch (e) {
     if (e instanceof RecordError) throw new RefusedError(e.message, 'shape');
     throw e;
   }
   if (problems.length > 0) throw new RefusedError(problems.join('; '), 'shape');
+
+  // An import carries its legacy sources as given; there is no quote to locate.
+  if (imp !== undefined) return finishPrepare(ctx, type, input, observer, notes, imp.sources, imp);
 
   // 2 quotes (§4.3 at write): tracked, ≤ 1 MiB, long enough, no secret, exactly one occurrence.
   const head = ctx.git === null ? null : await ctx.git.head();
@@ -783,10 +793,22 @@ async function prepare(
   }
   const sourceShape = sourceProblems(sources);
   if (sourceShape.length > 0) throw new RefusedError(sourceShape.join('; '), 'shape');
+  return finishPrepare(ctx, type, input, observer, notes, sources);
+}
 
+/** Steps 3–4 of §7.1: secrets and injection. Shared by remember, note and import. */
+function finishPrepare(
+  ctx: Context,
+  type: RecordType,
+  input: RememberInput,
+  observer: string,
+  notes: string[],
+  sources: Source[],
+  imp?: ImportExtra,
+): Source[] {
   // 3 secrets: the same rule the index applies to every field, so a written record is never
   // `candidate: secret`.
-  if (recordStrings(buildRecord(type, input, observer, ctx.now(), sources)).some(containsSecret)) {
+  if (recordStrings(buildRecord(type, input, observer, ctx.now(), sources, imp)).some(containsSecret)) {
     throw new RefusedError('the record looks like it contains a secret', 'secret');
   }
 
@@ -823,10 +845,10 @@ function blockingHeads(d: Deriver, records: Map<string, RecordRow>, tombstones: 
   });
 }
 
-async function write(ctx: Context, type: RecordType, input: RememberInput): Promise<WriteResult> {
+async function write(ctx: Context, type: RecordType, input: RememberInput, imp?: ImportExtra): Promise<WriteResult> {
   const notes: string[] = [];
   const observer = input.observer ?? ctx.observer;
-  const sources = await prepare(ctx, type, input, observer, notes);
+  const sources = await prepare(ctx, type, input, observer, notes, imp);
   const area = input.local === true ? 'local' : 'pending';
   const supersedes = [...new Set(input.supersedes ?? [])];
   const cites = [...new Set(input.cites ?? [])];
@@ -892,7 +914,7 @@ async function write(ctx: Context, type: RecordType, input: RememberInput): Prom
         }
 
         // 8 stamp
-        const record = buildRecord(type, { ...input, supersedes, cites }, observer, ctx.now(), sources);
+        const record = buildRecord(type, { ...input, supersedes, cites }, observer, ctx.now(), sources, imp);
         const newId = recordId(record);
         // 9 ledger, before the file exists: a crash here leaves a harmless id with no file
         ctx.store.appendTrust(`written ${newId}`);
@@ -970,4 +992,51 @@ export function remember(ctx: Context, input: RememberInput): Promise<WriteResul
 /** Write a note (`memory/note`): no quotes; holds always, labelled "not code-checked". */
 export function note(ctx: Context, input: Omit<RememberInput, 'quotes'>): Promise<WriteResult> {
   return write(ctx, 'memory/note', input);
+}
+
+/** What a host (Baton) migrates: an old whole-file-anchored fact (§4.2, §10). */
+export interface ImportInput {
+  text: string;
+  title: string;
+  tag?: Tag;
+  key?: string;
+  /** repo-relative paths with sha1(bytes)[:12]; none writes a note */
+  legacyFiles: { file: string; sha1_12: string }[];
+  supersedes?: string[];
+  local?: boolean;
+  observer?: string;
+  /** ISO date-time of the original record, stored as `recorded` */
+  recorded: string;
+  /** the host's old id, stored as x-elmory-legacy-id */
+  legacyId: string;
+}
+
+interface ImportExtra {
+  sources: LegacyFileSource[];
+  recorded: string;
+  legacyId: string;
+}
+
+const ISO_DATETIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
+
+/** Write an imported record: `legacy-file` evidence (or a note when there is none), `imported: true`. */
+export function importRecord(ctx: Context, input: ImportInput): Promise<WriteResult> {
+  if (typeof input !== 'object' || input === null) throw new RefusedError('input must be an object', 'shape');
+  if (!Array.isArray(input.legacyFiles)) throw new RefusedError('legacyFiles must be a list', 'shape');
+  if (typeof input.legacyId !== 'string' || input.legacyId === '') {
+    throw new RefusedError('legacyId must be a non-empty string', 'shape');
+  }
+  if (typeof input.recorded !== 'string' || !ISO_DATETIME.test(input.recorded) || Number.isNaN(Date.parse(input.recorded))) {
+    throw new RefusedError('recorded must be an ISO date-time', 'shape');
+  }
+  const sources: LegacyFileSource[] = [];
+  for (const f of input.legacyFiles) {
+    if (typeof f?.file !== 'string' || typeof f.sha1_12 !== 'string' || !LEGACY_FILE.test(f.sha1_12)) {
+      throw new RefusedError('each legacy file needs a file and a sha1_12 of 12 lowercase hex characters', 'shape');
+    }
+    sources.push({ resource: f.file, legacyFile: f.sha1_12 });
+  }
+  const { legacyFiles: _l, recorded, legacyId, ...rest } = input;
+  const imp: ImportExtra = { sources, recorded: new Date(recorded).toISOString(), legacyId };
+  return write(ctx, sources.length > 0 ? 'memory/fact' : 'memory/note', rest, imp);
 }

@@ -11,6 +11,7 @@
   "files": ["dist", "README.md", "LICENSE"],
   "scripts": {
     "build": "tsc",
+    "prepare": "tsc",
     "lint": "tsc --noEmit",
     "pretest": "tsc",
     "prepublishOnly": "npm run build && npm test",

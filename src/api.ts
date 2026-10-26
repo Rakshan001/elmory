@@ -26,7 +26,7 @@ export interface OpenOptions {
   now?: () => string;
 }
 
-export type { RememberInput, WriteResult } from './gate.js';
+export type { ImportInput, RememberInput, WriteResult } from './gate.js';
 export { ConflictError, RefusedError } from './gate.js';
 export type { ForgetReport, ForgetScope } from './forget.js';
 export type {
@@ -389,6 +389,14 @@ export class Elmory implements Context {
 
   note(input: Omit<gate.RememberInput, 'quotes'>): Promise<gate.WriteResult> {
     return this.#writing(() => gate.note(this, input));
+  }
+
+  /**
+   * Migrate a host's old whole-file-anchored fact as a `legacy-file` record (a note when it has
+   * no files). Same secret / injection / CAS gate as `remember`; `imported: true`.
+   */
+  import(input: gate.ImportInput): Promise<gate.WriteResult> {
+    return this.#writing(() => gate.importRecord(this, input));
   }
 
   /**

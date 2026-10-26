@@ -329,6 +329,22 @@ export async function about(ctx: Context, pathOrKey: string): Promise<RecallResu
     if (r.key !== pathOrKey) continue;
     for (const m of d.chainOf(r.id)) if (byId.has(m)) ids.add(m);
   }
+  // A host's old id (x-elmory-legacy-id) finds the record it was imported as.
+  const legacyLine = `x-elmory-legacy-id: `;
+  for (const r of rows) {
+    if (!r.text.includes(legacyLine)) continue;
+    // frontmatter only: a body line must not match
+    const end = r.text.indexOf('\n---', 4);
+    const m = /^x-elmory-legacy-id: (.*)$/m.exec(end < 0 ? r.text : r.text.slice(0, end));
+    if (m === null) continue;
+    let legacy: string = m[1] as string;
+    try {
+      if (legacy.startsWith('"')) legacy = JSON.parse(legacy) as string;
+    } catch {
+      continue;
+    }
+    if (legacy === pathOrKey) ids.add(r.id);
+  }
   const ordered = [...ids]
     .map((id) => byId.get(id) as RecordRow)
     .sort((a, b) => Number(b.type === 'memory/fact') - Number(a.type === 'memory/fact') || (a.id < b.id ? -1 : 1));
