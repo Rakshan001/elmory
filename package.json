@@ -13,7 +13,6 @@
     "build": "tsc",
     "prepare": "tsc",
     "lint": "tsc --noEmit",
-    "prepare": "tsc",
     "pretest": "tsc",
     "prepublishOnly": "npm run build && npm test",
     "test": "vitest run"
