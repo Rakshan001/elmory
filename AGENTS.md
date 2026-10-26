@@ -32,3 +32,39 @@ server is connected, otherwise through the `elmory` CLI (add `--json` for machin
 - Replacing a value: pass the old record's id in `supersedes`. If the write returns CONFLICT,
   read the heads it names and write again with them in `supersedes`.
 - Never put secrets in a record; the write is refused.
+
+<!-- baton:coordination r2 -->
+## Multi-agent coordination (Baton)
+
+Baton coordinates the agent sessions in this repo via the `baton` MCP tools.
+
+- Orient first: read `CODEBASE.md` (the repo map) and call `recall_memory`
+  with your topic: evidence-checked facts, stale ones withheld. Don't re-scan.
+- Before editing shared files: `check_files`. Busy → work elsewhere and
+  re-check. After waiting, `get_report`: your issue may already be fixed.
+- While editing: `touch_files` on the files you start, and keep a one-line
+  `report_progress` fresh, so sibling sessions route around you.
+- Navigate with the `graphify-*` tools (`query_graph`), not broad scans;
+  re-read files a graph-freshness warning flags.
+- Learned a decision, gotcha or convention? `save_memory` (1-3 sentences +
+  its files). Never secrets or code-derivable facts.
+- Near your usage/context limit, or blocked? `create_handoff`; the next
+  agent continues with `baton resume`.
+- Baton has more: tasks, team, skills, handoff, review, memory, graph. Call
+  `baton_features` (or run `baton features`). When a user's request matches
+  a feature, tell them Baton has it and ask before using it.
+<!-- /baton:coordination -->
+
+<!-- baton:orient:start -->
+## Baton — start here
+
+At the start of a session in this repo, call the `orient` MCP tool before
+exploring. It returns a budgeted brief: what this project is, the decisions
+and gotchas already recorded, what shipped recently, and where things live.
+
+Then `recall_memory` before you go looking, and `check_files` before editing
+a file others may be in. Other agents are working here too.
+
+Added by Baton. Edit freely outside this block; delete the block (both marker
+comments included) to remove it. Re-running `baton connect` restores it.
+<!-- baton:orient:end -->
