@@ -5,11 +5,18 @@ import { FactDemo } from "./fact-demo";
 
 export function Hero() {
   return (
-    <section id="top" className="relative mx-auto w-full max-w-6xl px-4 pt-14 pb-20 md:pt-20 lg:pb-28">
-      <div className="grid items-center gap-14 lg:grid-cols-[1.1fr_1fr] lg:gap-14">
+    <section id="top" className="relative overflow-hidden border-b border-border">
+      {/* Faint grid, fading out toward the edges. */}
+      <div
+        aria-hidden
+        className="pointer-events-none absolute inset-0 [background-image:linear-gradient(to_right,var(--border)_1px,transparent_1px),linear-gradient(to_bottom,var(--border)_1px,transparent_1px)] [background-size:56px_56px] [mask-image:radial-gradient(ellipse_70%_60%_at_50%_0%,black,transparent_75%)] opacity-70"
+      />
+      <div className="relative mx-auto grid w-full max-w-6xl items-center gap-12 px-4 pt-14 pb-20 md:px-6 md:pt-20 lg:grid-cols-[1.1fr_1fr] lg:gap-14 lg:pb-24">
         <div>
-          <p className="text-sm font-medium text-muted-foreground">Open-source memory for coding agents</p>
-          <h1 className="mt-5 text-4xl leading-[1.05] font-semibold tracking-tighter md:text-5xl">
+          <p className="inline-flex items-center rounded-full border border-border bg-card px-3 py-1 font-mono text-xs text-muted-foreground">
+            Open source, MIT licensed
+          </p>
+          <h1 className="mt-6 text-[2.5rem] leading-[1.05] font-semibold tracking-[-0.05em] md:text-5xl lg:text-[3.5rem]">
             Memory that checks the code first.
           </h1>
           <p className="mt-6 max-w-[46ch] text-lg leading-relaxed text-muted-foreground">
@@ -23,7 +30,7 @@ export function Hero() {
                 <ArrowRight data-icon="inline-end" />
               </a>
             </Button>
-            <Button asChild size="lg" variant="outline" className="bg-transparent">
+            <Button asChild size="lg" variant="outline" className="surface">
               <a href={SITE.repo} target="_blank" rel="noreferrer">
                 GitHub
                 <ArrowUpRight data-icon="inline-end" />

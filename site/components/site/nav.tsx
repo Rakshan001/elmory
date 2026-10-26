@@ -1,32 +1,33 @@
+import Link from "next/link";
 import { ArrowUpRight } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { SITE } from "@/lib/site";
 import { Logo } from "./logo";
 
 const LINKS = [
-  { href: "#how", label: "How it works" },
-  { href: "#states", label: "States" },
-  { href: "#compare", label: "Compare" },
-  { href: "#faq", label: "FAQ" },
+  { href: "/#how", label: "How it works" },
+  { href: "/#states", label: "States" },
+  { href: "/#compare", label: "Compare" },
+  { href: "/#faq", label: "FAQ" },
 ];
 
 export function Nav() {
   return (
-    <header className="sticky top-0 z-40 px-4 pt-4">
-      <nav className="glass mx-auto flex h-14 max-w-6xl items-center justify-between rounded-full pr-2 pl-5">
-        <a href="#top" aria-label="Elmory home">
+    <header className="sticky top-0 z-40 border-b border-border bg-background/80 backdrop-blur-md">
+      <nav className="mx-auto flex h-16 max-w-6xl items-center justify-between gap-4 px-4 md:px-6">
+        <Link href="/" aria-label="Elmory home">
           <Logo />
-        </a>
-        <ul className="hidden items-center gap-7 text-sm text-muted-foreground md:flex">
+        </Link>
+        <ul className="hidden items-center gap-1 text-sm text-muted-foreground md:flex">
           {LINKS.map((l) => (
             <li key={l.href}>
-              <a href={l.href} className="transition-colors hover:text-foreground">
+              <Link href={l.href} className="rounded-full px-3 py-2 transition-colors hover:bg-muted hover:text-foreground">
                 {l.label}
-              </a>
+              </Link>
             </li>
           ))}
         </ul>
-        <Button asChild size="lg" variant="outline" className="h-10 bg-transparent">
+        <Button asChild variant="outline" className="surface h-9 px-4">
           <a href={SITE.repo} target="_blank" rel="noreferrer">
             GitHub
             <ArrowUpRight data-icon="inline-end" />

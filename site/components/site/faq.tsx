@@ -26,12 +26,12 @@ const FAQ = [
 
 export function Faq() {
   return (
-    <section id="faq" className="mx-auto w-full max-w-6xl px-4 py-20 md:py-28">
+    <section id="faq" className="mx-auto w-full max-w-6xl px-4 py-20 md:px-6 md:py-28">
       <div className="grid gap-10 lg:grid-cols-[0.8fr_1.2fr] lg:gap-14">
         <Reveal>
-          <h2 className="text-3xl font-semibold tracking-tighter md:text-5xl">Questions</h2>
+          <h2 className="text-3xl font-semibold tracking-[-0.04em] md:text-[2.5rem]">Questions</h2>
         </Reveal>
-        <Reveal delay={0.06}>
+        <Reveal>
           <Accordion type="single" collapsible defaultValue="item-0">
             {FAQ.map((f, i) => (
               <AccordionItem key={f.q} value={`item-${i}`} className="border-border">

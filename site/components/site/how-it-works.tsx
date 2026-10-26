@@ -40,43 +40,49 @@ $ echo $?
 
 export function HowItWorks() {
   return (
-    <section id="how" className="mx-auto w-full max-w-6xl px-4 py-20 md:py-28">
-      <Reveal>
-        <h2 className="text-3xl font-semibold tracking-tighter md:text-5xl">How it works</h2>
-        <p className="mt-4 max-w-[52ch] text-lg leading-relaxed text-muted-foreground">
-          Three moments from a real terminal session. Agents do the same through nine MCP tools.
-        </p>
-      </Reveal>
-      <Reveal className="mt-12">
-        <Tabs defaultValue="remember" orientation="vertical" className="grid gap-6 lg:grid-cols-[minmax(0,0.85fr)_minmax(0,1.5fr)]">
-          <TabsList className="h-fit w-full gap-2 bg-transparent p-0">
+    <section id="how" className="border-y border-border bg-card/60">
+      <div className="mx-auto w-full max-w-6xl px-4 py-20 md:px-6 md:py-28">
+        <Reveal>
+          <h2 className="text-3xl font-semibold tracking-[-0.04em] md:text-[2.5rem]">How it works</h2>
+          <p className="mt-4 max-w-[52ch] text-lg leading-relaxed text-muted-foreground">
+            Three moments from a real terminal session. Agents do the same through nine MCP tools.
+          </p>
+        </Reveal>
+        <Reveal className="mt-12">
+          <Tabs
+            defaultValue="remember"
+            orientation="vertical"
+            className="grid gap-4 lg:grid-cols-[minmax(0,0.85fr)_minmax(0,1.5fr)] lg:gap-6"
+          >
+            <TabsList className="h-fit w-full gap-2 bg-transparent p-0">
+              {STEPS.map((s) => (
+                <TabsTrigger
+                  key={s.id}
+                  value={s.id}
+                  className="h-auto w-full flex-col items-start gap-1 rounded-xl border border-border bg-transparent px-5 py-4 text-left whitespace-normal data-active:surface dark:data-active:bg-card"
+                >
+                  <span className="text-base font-semibold text-foreground">{s.title}</span>
+                  <span className="text-sm leading-relaxed font-normal text-muted-foreground">{s.text}</span>
+                </TabsTrigger>
+              ))}
+            </TabsList>
             {STEPS.map((s) => (
-              <TabsTrigger
-                key={s.id}
-                value={s.id}
-                className="h-auto w-full flex-col items-start gap-1 rounded-2xl border border-border px-5 py-4 text-left whitespace-normal data-active:border-transparent data-active:bg-card data-active:shadow-sm dark:data-active:bg-card"
-              >
-                <span className="text-base font-semibold text-foreground">{s.title}</span>
-                <span className="text-sm leading-relaxed font-normal text-muted-foreground">{s.text}</span>
-              </TabsTrigger>
-            ))}
-          </TabsList>
-          {STEPS.map((s) => (
-            <TabsContent key={s.id} value={s.id} className="min-w-0">
-              <div className="h-full rounded-[28px] bg-panel p-2 text-panel-foreground">
-                <div className="flex gap-1.5 px-4 py-3" aria-hidden>
-                  <span className="size-2.5 rounded-full bg-white/15" />
-                  <span className="size-2.5 rounded-full bg-white/15" />
-                  <span className="size-2.5 rounded-full bg-white/15" />
+              <TabsContent key={s.id} value={s.id} className="min-w-0">
+                <div className="h-full rounded-xl bg-panel p-2 text-panel-foreground">
+                  <div className="flex gap-1.5 px-3 py-2.5" aria-hidden>
+                    <span className="size-2.5 rounded-full bg-white/15" />
+                    <span className="size-2.5 rounded-full bg-white/15" />
+                    <span className="size-2.5 rounded-full bg-white/15" />
+                  </div>
+                  <pre className="code-wrap rounded-lg bg-white/[0.04] p-5 font-mono text-[12.5px] leading-6">
+                    <code>{s.out}</code>
+                  </pre>
                 </div>
-                <pre className="overflow-x-auto rounded-2xl bg-black/20 p-5 font-mono text-[12.5px] leading-6">
-                  <code>{s.out}</code>
-                </pre>
-              </div>
-            </TabsContent>
-          ))}
-        </Tabs>
-      </Reveal>
+              </TabsContent>
+            ))}
+          </Tabs>
+        </Reveal>
+      </div>
     </section>
   );
 }

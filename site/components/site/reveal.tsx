@@ -1,30 +1,7 @@
-"use client";
-
-import { motion } from "motion/react";
-
 /**
- * Fades a section in once as it enters the viewport. Reduced motion is handled by the
- * MotionConfig in Providers (the fade stays, the movement goes), so server and client
- * render the same markup.
+ * Fades a block in as it scrolls into view, with a CSS scroll-driven animation. Content is
+ * visible by default; browsers without view timelines, and reduced-motion users, just see it.
  */
-export function Reveal({
-  children,
-  delay = 0,
-  className,
-}: {
-  children: React.ReactNode;
-  delay?: number;
-  className?: string;
-}) {
-  return (
-    <motion.div
-      className={className}
-      initial={{ opacity: 0, y: 20 }}
-      whileInView={{ opacity: 1, y: 0 }}
-      viewport={{ once: true, amount: 0.2 }}
-      transition={{ duration: 0.6, delay, ease: [0.16, 1, 0.3, 1] }}
-    >
-      {children}
-    </motion.div>
-  );
+export function Reveal({ children, className = "" }: { children: React.ReactNode; className?: string }) {
+  return <div className={`reveal ${className}`}>{children}</div>;
 }
