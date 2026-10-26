@@ -5,8 +5,8 @@
 - **Date:** 2026-10-21
 - **Combines:** the hash + OKF + graph plan of 2026-10-08 (councils 1–4) and the five-type
   design of 2026-10-21 (councils 6–7). Both are advisory.
-- **Research behind it:** [combined report](../../research/2026-10-21-memory-types-research.md),
-  [source reports](../../research/memory-types/), and §17 (sources re-checked on
+- **Research behind it:** combined report (`research/2026-10-21-memory-types-research.md`, private `elmory-internal` repo),
+  source reports (`research/memory-types/`, same repo), and §17 (sources re-checked on
   the web today).
 - **Builds on (Baton):** `src/memory.ts`, `src/memory-rank.ts`, `src/memory-repair.ts`,
   `src/events.ts`, `web/src/components/GraphCanvas.tsx`, `web/src/styles/tokens.css`.
@@ -600,5 +600,5 @@ here depends on it.
 - The OKF `excerpt` proposal (an open, unmerged proposal that matches §4.3).
 - Index timings.
 
-All are in `docs/research/memory-types/` and the auto-memory notes. The session's
+All are in `research/memory-types/` of the private `elmory-internal` repo and the auto-memory notes. The session's
 web-search quota was used up, so today's checks were direct page fetches.

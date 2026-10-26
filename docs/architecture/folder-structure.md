@@ -52,6 +52,6 @@ elmory/
   folders with one file in each. Add a folder only when a module needs more than one file
   (the MCP server is the likely first case: `src/mcp/`).
 - Nothing in `src/` imports from `test/`, `docs/` or `dist/`.
-- `docs/plans/` is append-only history: a plan is dated and is not rewritten after its phase
+- `plans/` (private `elmory-internal` repo, see `docs/INTERNAL.md`) is append-only history: a plan is dated and is not rewritten after its phase
   merges; a change gets a new dated plan.
 - `docs/architecture/` is kept current: when the spec changes, the HLD changes in the same PR.
