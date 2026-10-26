@@ -153,3 +153,17 @@ export function SpotlightCard({ children, className = "" }: { children: React.Re
     </motion.div>
   );
 }
+
+/** Wraps a decorative element that turns and rises a little as its section scrolls through. */
+export function ScrollDrift({ children, className = "" }: { children: React.ReactNode; className?: string }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const reduce = useReducedMotion();
+  const { scrollYProgress } = useScroll({ target: ref, offset: ["start end", "end start"] });
+  const rotate = useTransform(scrollYProgress, [0, 1], [-14, 6]);
+  const y = useTransform(scrollYProgress, [0, 1], [60, -30]);
+  return (
+    <motion.div ref={ref} aria-hidden style={reduce ? undefined : { rotate, y }} className={className}>
+      {children}
+    </motion.div>
+  );
+}

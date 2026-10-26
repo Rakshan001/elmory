@@ -10,7 +10,7 @@ Every verb takes these flags. They can go before or after the verb.
 | `--worktree <path>` | the current directory | The worktree to use: the git toplevel of that path. |
 | `--observer <s>` | `cli:$USER` | Who is writing, stamped on records. Must be one printable line. |
 
-Human output shows control characters, bidi controls and the Unicode line and paragraph separators (U+2028, U+2029) in record text as visible escapes (`\x1b`, `‮`). A record cannot drive your terminal or reorder what it shows. `--json` output is unchanged.
+Human output shows control characters, bidi controls and the Unicode line and paragraph separators (U+2028, U+2029) in record text as visible escapes (`\x1b`, `\u202e`). A record cannot drive your terminal or reorder what it shows. `--json` output is unchanged.
 
 ## Writing records
 
