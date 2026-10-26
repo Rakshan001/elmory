@@ -1,5 +1,5 @@
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Reveal } from "./reveal";
+import { Steps } from "./steps";
 
 // Transcripts are copied from a real run of the CLI; nothing here is mocked.
 const STEPS = [
@@ -49,34 +49,7 @@ export function HowItWorks() {
           </p>
         </Reveal>
         <Reveal className="mt-12">
-          <Tabs
-            defaultValue="remember"
-            orientation="vertical"
-            className="grid gap-4 lg:grid-cols-[minmax(0,0.85fr)_minmax(0,1.5fr)] lg:gap-6"
-          >
-            <TabsList className="h-fit w-full gap-2 bg-transparent p-0">
-              {STEPS.map((s) => (
-                <TabsTrigger
-                  key={s.id}
-                  value={s.id}
-                  className="h-auto w-full flex-col items-start gap-1 rounded-xl border border-border bg-transparent px-5 py-4 text-left whitespace-normal data-active:surface dark:data-active:bg-card"
-                >
-                  <span className="text-base font-semibold text-foreground">{s.title}</span>
-                  <span className="text-sm leading-relaxed font-normal text-muted-foreground">{s.text}</span>
-                </TabsTrigger>
-              ))}
-            </TabsList>
-            {STEPS.map((s) => (
-              <TabsContent key={s.id} value={s.id} className="min-w-0">
-                <div className="h-full rounded-xl bg-panel p-2 text-panel-foreground">
-                  <p className="px-3 py-2.5 font-mono text-xs text-panel-muted">terminal</p>
-                  <pre className="code-wrap rounded-lg bg-white/[0.04] p-5 font-mono text-[12.5px] leading-6">
-                    <code>{s.out}</code>
-                  </pre>
-                </div>
-              </TabsContent>
-            ))}
-          </Tabs>
+          <Steps steps={STEPS} />
         </Reveal>
       </div>
     </section>

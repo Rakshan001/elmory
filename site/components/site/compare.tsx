@@ -46,7 +46,7 @@ export function Compare() {
               </thead>
               <tbody>
                 {ROWS.map((r, ri) => (
-                  <tr key={r.label}>
+                  <tr key={r.label} className="transition-colors hover:[&>td:not(:last-child)]:bg-muted/60 hover:[&>th]:bg-muted/60">
                     <th scope="row" className="border-t border-border p-5 align-top font-medium">
                       {r.label}
                     </th>

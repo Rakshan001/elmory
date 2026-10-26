@@ -1,4 +1,5 @@
 import { CircleCheck, CircleHelp, FileX, NotebookPen } from "lucide-react";
+import { SpotlightCard } from "./motion";
 import { Reveal } from "./reveal";
 
 export function States() {
@@ -11,7 +12,7 @@ export function States() {
       </Reveal>
       <div className="mt-12 grid gap-4 md:grid-cols-6">
         <Reveal className="md:col-span-4">
-          <div className="flex h-full min-h-60 flex-col justify-between rounded-xl bg-primary p-7 text-primary-foreground md:p-9">
+          <SpotlightCard className="flex h-full min-h-60 flex-col justify-between rounded-xl bg-primary p-7 text-primary-foreground md:p-9">
             <CircleCheck className="size-6" strokeWidth={1.75} />
             <div>
               <h3 className="text-2xl font-semibold tracking-tight">Holds</h3>
@@ -20,10 +21,10 @@ export function States() {
                 confirmed.
               </p>
             </div>
-          </div>
+          </SpotlightCard>
         </Reveal>
         <Reveal className="md:col-span-2">
-          <div className="surface flex h-full min-h-60 flex-col justify-between rounded-xl p-7 [background-image:repeating-linear-gradient(135deg,color-mix(in_oklab,var(--foreground)_4%,transparent)_0_6px,transparent_6px_12px)]">
+          <SpotlightCard className="surface flex h-full min-h-60 flex-col justify-between rounded-xl p-7 [background-image:repeating-linear-gradient(135deg,color-mix(in_oklab,var(--foreground)_4%,transparent)_0_6px,transparent_6px_12px)]">
             <CircleHelp className="size-6" strokeWidth={1.75} />
             <div>
               <h3 className="text-2xl font-semibold tracking-tight">Suspect</h3>
@@ -31,10 +32,10 @@ export function States() {
                 A quoted line changed or moved out of reach. Withheld from recall.
               </p>
             </div>
-          </div>
+          </SpotlightCard>
         </Reveal>
         <Reveal className="md:col-span-2">
-          <div className="flex h-full min-h-60 flex-col justify-between rounded-xl border border-dashed border-foreground/25 p-7">
+          <SpotlightCard className="flex h-full min-h-60 flex-col justify-between rounded-xl border border-dashed border-foreground/25 p-7">
             <FileX className="size-6" strokeWidth={1.75} />
             <div>
               <h3 className="text-2xl font-semibold tracking-tight">Stale</h3>
@@ -42,19 +43,19 @@ export function States() {
                 The quoted file was deleted. Withheld, and listed by verify.
               </p>
             </div>
-          </div>
+          </SpotlightCard>
         </Reveal>
         <Reveal className="md:col-span-4">
-          <div className="surface relative flex h-full min-h-60 flex-col justify-between overflow-hidden rounded-xl p-7 md:p-9">
-            <NotebookPen className="relative size-6" strokeWidth={1.75} />
-            <div className="relative">
+          <SpotlightCard className="surface flex h-full min-h-60 flex-col justify-between overflow-hidden rounded-xl p-7 md:p-9">
+            <NotebookPen className="size-6" strokeWidth={1.75} />
+            <div>
               <h3 className="text-2xl font-semibold tracking-tight">Note</h3>
               <p className="mt-2 max-w-[44ch] leading-relaxed text-muted-foreground">
                 Decisions and preferences have no code to quote. They are served, ranked below facts, and labelled
                 “not code-checked”.
               </p>
             </div>
-          </div>
+          </SpotlightCard>
         </Reveal>
       </div>
     </section>
