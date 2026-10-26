@@ -1,0 +1,39 @@
+export const meta = { title: "Known limits", description: "What Elmory does not catch or guarantee in release 1.", order: 8 };
+
+These are the known limits of release 1.
+
+## Unchanged evidence does not make a claim true
+
+The evidence being unchanged does not make the claim true. The label says so, and agents are told to open the quoted file.
+
+## Edits inside a quote make it suspect
+
+Comment insertions and real syntax changes inside a quote make it suspect. Only whitespace, quote-style and trailing-comma changes are tolerated.
+
+## Trust by commit signature has limits
+
+Trust by commit signature stops forged authors, but not a trusted signer acting maliciously.
+
+A signed record or tombstone file stays trusted only while every later commit in the branch's history keeps its bytes. If one changed, deleted or replaced it (a merge adopting another version counts), bytes brought back later by a merge or an unsigned commit are untrusted.
+
+## Sync notices record files by stat, not by reading them
+
+A record file edited in place within the 2 s racy window can be missed by sync and served from the cache. `elmory verify` re-reads the files and catches it.
+
+Tools that restore mtimes (`rsync -t`, `tar -p`, `touch -r`) can hide an edit, and an added or removed record file, the same way. Both need local write access.
+
+## Forget cannot reach copies outside Elmory
+
+The report names them.
+
+## The cache directory is not pinned per project
+
+Processes with different `XDG_CACHE_HOME` values keep separate caches. A forget drops the text from another cache only when a process using it next syncs, and does not compact it.
+
+## Notes are not code-checked
+
+They are labelled so, ranked lower, and collected by `gc`.
+
+## Switching worktrees re-reads record files
+
+The cache is shared by every worktree of a clone and remembers one sync stamp. So the first read after another worktree synced re-reads this worktree's record files (about 0.15 s at 5 000 records) instead of trusting the stamp.

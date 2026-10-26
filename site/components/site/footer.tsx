@@ -33,7 +33,15 @@ export function Footer() {
         </div>
         <div className="relative mt-20 flex flex-wrap items-center justify-between gap-4 border-t border-white/10 pt-6 text-sm text-panel-muted">
           <Logo className="text-panel-foreground" />
-          <p>MIT licensed. Built in the open.</p>
+          <div className="flex flex-wrap items-center gap-x-6 gap-y-2">
+            <Link href="/docs" className="hover:text-panel-foreground">
+              Docs
+            </Link>
+            <a href={SITE.repo} target="_blank" rel="noreferrer" className="hover:text-panel-foreground">
+              GitHub
+            </a>
+            <span>MIT licensed</span>
+          </div>
         </div>
       </div>
     </footer>

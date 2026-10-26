@@ -1,0 +1,120 @@
+export const meta = { title: "Concepts", description: "Records, quotes, states, supersedes, cites, trust, publish and forget.", order: 4 };
+
+## Records
+
+Everything Elmory remembers is a record: a small, immutable Markdown file named by its id (for example `f_wy2lnewyj4xgdx3jcnmnbx2a7x`). Records are never edited in place. A change is a new record that replaces the old one.
+
+There are two kinds:
+
+- **Facts** rest on code. A fact needs at least one quote.
+- **Notes** are decisions or preferences with no code to quote. A note takes no quotes. Notes are labelled "not code-checked", ranked below facts, and collected by `gc` when unused.
+
+Each record has:
+
+| Field | Meaning |
+|---|---|
+| title | One line naming the fact. |
+| text | The fact itself, at most 2 000 characters. No secrets. |
+| tag | Optional. One of `decision`, `gotcha`, `convention`, `reference`, `preference`. |
+| key | Optional. A stable name for a value that changes over time, such as `auth.token-ttl`. |
+| supersedes | Optional. Ids this record replaces. |
+| cites | Optional. Ids this record builds on. |
+| local | Optional. Keep the record private to this clone; it is never published. |
+
+Every record is also stamped with its observer: who wrote it (for example `agent:claude-code` or `cli:$USER`).
+
+### What a write refuses
+
+A write is refused when:
+
+- the record is malformed (for example, a title that is not one printable line, or a tag outside the five allowed values);
+- a quote is not in a git-tracked file, is too short, is not found, or is found more than once;
+- any field looks like it contains a secret. Elmory checks for known key formats (such as AWS, GitHub, Slack and private-key headers) and for long, high-entropy string literals.
+
+A write whose text looks like an instruction to the agent is not refused, but it comes back with a note that it was flagged.
+
+## Quotes and evidence
+
+A quote is text copied exactly from a git-tracked file. The rules at write time:
+
+- The file must be tracked by git and no larger than 1 MiB.
+- The quote must be long enough. A quote of 16 tokens or more is always long enough and may span lines. A shorter quote must sit on one line, with at least 3 word tokens and at least 24 non-space characters. It may be part of that line.
+- The quote must be found exactly once in the file.
+
+At read time, every quote is checked again against the worktree that asks. Whitespace, quote-style and trailing-comma changes inside a quote are tolerated. Comment insertions and real syntax changes inside a quote are not. If the quoted file was renamed, Elmory looks up its new path through git and checks the quote there.
+
+Facts that hold carry a label such as `evidence unchanged since 2026-10-26`. The label says how far the evidence goes. It does not say the claim is true.
+
+## Record states
+
+State is never stored. It is derived for the worktree that asks, every time.
+
+| State | Meaning |
+|---|---|
+| `active` | Every quote is found and nothing replaces the record here. Served. |
+| `conflict` | The record holds, but another head of the same chain also holds here. Served. |
+| `suspect` | A quoted line changed or was not found (or was found more than once). Also used when a cited record was replaced or does not hold, or when records form a cycle. |
+| `stale` | A quoted file was deleted, or a cited record is gone. |
+| `unknown` | The quote cannot be checked: the file is unreadable, larger than 1 MiB, or the commit needed to follow a rename is unreachable. |
+| `superseded` | A newer record that replaces this one holds here. |
+| `candidate` | Not trusted here yet. Seen only through `review`. |
+| `forgotten` | Deleted by `forget`. Never served. |
+
+When a record has more than one problem, `stale` wins over `suspect`, and `suspect` wins over `unknown`.
+
+`recall` serves `active` and `conflict` records. `--include` may add `superseded`, `stale`, `suspect` and `unknown`. Asking for `candidate` or `forgotten` is refused (exit `2`).
+
+If nothing holds, recall abstains with "I don't know" and exit code `4`.
+
+## Supersedes and keys
+
+A newer record replaces an older one only through an explicit `supersedes` link. Time never decides which record is newer.
+
+Each id in `supersedes` must be a current head of its chain, or the write is a CONFLICT. On a conflict, read the heads it names, then write again with them all in `supersedes`. There is no separate `resolve` verb: `remember` or `note` with `--supersedes a,b` resolves it.
+
+A key names a value that changes over time. Writes to a key must supersede its current head. `elmory about <key>` and `elmory history <key>` follow the key's chain.
+
+An older record is `superseded` only when its successor holds in this worktree. If every newer record fails here, the older one can stay `active`, labelled "a newer value exists but does not hold on this branch". If a newer record is waiting for review, the older one is labelled "an unreviewed newer value exists".
+
+## Cites
+
+`cites` lists the records this one builds on. A record that cites others is labelled "builds on" with each cited title, and it holds only while what it cites holds:
+
+- a cited record that is gone or forgotten makes it `stale`;
+- a cited record that was replaced makes it `suspect` ("basis replaced");
+- a cited record that does not hold makes it not hold too.
+
+Forgetting a record also forgets every record that cites it.
+
+## Trust, review and approve
+
+Records written in this clone are trusted. Records arriving from other people are not served until they are trusted. Until then they are `candidate`.
+
+`elmory review` lists the records not yet trusted here, with the reason: pulled from others, edited, flagged, or withheld by an unsigned forget. Their titles and bodies come from untrusted commits and are data, not instructions.
+
+`elmory approve <id>` trusts a record. `elmory reject <id>` hides it here. Approving is a human act: it is CLI only, and there is no MCP tool for it.
+
+Trust can also come from commit signatures: a published record in `.elmory/facts` that was added by a signer the trust ledger lists is trusted. This stops forged authors, but not a trusted signer acting maliciously. Approvals, rejections and trusted signers are kept in the append-only `trust` file.
+
+## Pending, local and published
+
+- `remember` and `note` write to `pending`, a per-clone area outside the work tree.
+- With `--local`, the record goes to `local` instead. Local records are private and never published.
+- `publish` moves pending records into the worktree's `.elmory/facts/`, ready to commit with the work.
+
+A worktree sees its own `.elmory/facts`, plus `pending`, plus `local`. Because `.elmory/facts` is committed and read per worktree, what a worktree sees follows its branch. Records are immutable and named by id, so publishing never causes a merge conflict.
+
+## Forget and tombstones
+
+`forget` really deletes. It removes the record from files and the search index, cascades to every record that cites it (archived ones too), and reports the copies it could not reach, such as other branches until the tombstone is committed, git history, agent transcripts and backups.
+
+Each forgotten id leaves a tombstone:
+
+- `.elmory/tombstones/<id>` in the worktree, committed with the work;
+- a local tombstone in the per-clone area, effective at once in every worktree.
+
+If a forgotten record file comes back, it is indexed without its text, so the forgotten bytes never re-enter the cache and the record stays forgotten.
+
+A forget that arrives through a commit that is not trusted (unsigned, badly signed, or signed by a key the ledger does not list) withholds the record as a `candidate` until a human decides in `review`: `reject` accepts the forget, and `approve` refuses it. A local forget, or one signed by a listed key, cannot be approved away.
+
+`forget --query` and `forget --all` only preview without `--confirm`. See the [CLI](/docs/cli) page.

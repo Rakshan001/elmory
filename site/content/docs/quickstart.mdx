@@ -1,0 +1,80 @@
+export const meta = { title: "Quickstart", description: "Install Elmory from source, save a first fact, recall it, and see an abstain.", order: 2 };
+
+## Requirements
+
+- Node 24 or newer. The core has no runtime dependencies beyond Node itself (`node:sqlite`, `node:crypto`). The MCP server adds the MCP SDK.
+- git 2.31 or newer. Signature attribution uses `git log --diff-merges=separate`.
+
+## Install from source
+
+Elmory is not on npm yet. Until it is, clone the repository, build it, and link it:
+
+```bash
+git clone https://github.com/Rakshan001/elmory.git && cd elmory
+npm install && npm run build && npm link
+```
+
+This gives you two commands: `elmory` (the CLI) and `elmory-mcp` (the MCP server).
+
+Once Elmory is published, `npm i -g elmory` will install the same two commands.
+
+## Save a first fact
+
+Run Elmory inside a git repository. A fact quotes code with `--quote <file>:<text>`, where the file is a repo-relative path tracked by git. The quoted text must appear exactly once in that file.
+
+```bash
+elmory remember "Sessions expire after 15 minutes idle; the TTL lives in sessionTtl()." \
+  --title "Session TTL is 15 minutes" \
+  --quote "src/session.ts:return 15 * 60 * 1000; // sessions expire after fifteen minutes of idle time" \
+  --tag gotcha
+```
+
+Elmory prints the new record's id and its state:
+
+```text
+f_wy2lnewyj4xgdx3jcnmnbx2a7x active
+```
+
+The tag is optional. When given, it must be one of `decision`, `gotcha`, `convention`, `reference` or `preference`.
+
+A quote under 16 tokens must sit on one line and have at least 3 word tokens and 24 non-space characters. Longer quotes may span lines.
+
+## Recall it
+
+```bash
+elmory recall "session ttl"
+```
+
+```text
+## Session TTL is 15 minutes
+id: f_wy2lnewyj4xgdx3jcnmnbx2a7x · state: active · fact · tag: gotcha
+labels: evidence unchanged since 2026-10-26
+quotes: src/session.ts
+
+Sessions expire after 15 minutes idle; the TTL lives in sessionTtl().
+```
+
+The label `evidence unchanged since 2026-10-26` says how far the evidence goes: the quoted code is still there. It does not say the claim is true.
+
+## What an abstain looks like
+
+Now change `15` to `30` in `src/session.ts` and ask again:
+
+```bash
+elmory recall "session ttl"
+```
+
+```text
+I don't know: 1 matches but none hold: 1 suspect
+  f_wy2lnewyj4xgdx3jcnmnbx2a7x is suspect (not-found)
+```
+
+The quoted line is no longer found, so the fact is `suspect` and is not served. Recall answers "I don't know" and exits with code `4`.
+
+An abstain means exactly that. Do not guess past it: read the code instead. If you want to see records that no longer hold, pass `--include suspect` (or `stale`, `unknown`, `superseded`).
+
+## Next steps
+
+- [Connect an agent](/docs/connect-agents) over MCP.
+- Read the [three rules for agents](/docs/agent-rules).
+- Learn the [concepts](/docs/concepts): states, supersedes, trust and publish.

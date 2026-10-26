@@ -1,0 +1,44 @@
+export const meta = { title: "Introduction", description: "What Elmory is, the problem it solves, and how quote evidence keeps agent memory honest.", order: 1 };
+
+Elmory is evidence-checked memory for coding agents. It stores what agents learn about a codebase as small, immutable Markdown records, and it serves a record only while the code it relies on is still there.
+
+Elmory is open source under the MIT license. It is a TypeScript package with a CLI (`elmory`) and a stdio MCP server (`elmory-mcp`). Release 1 covers coding agents only.
+
+Elmory is not on npm yet. Until it is, install it from source. See the [Quickstart](/docs/quickstart).
+
+## The problem: memory goes stale silently
+
+An agent learns that sessions expire after 15 minutes and writes it down. Next week someone changes the timeout to 30 minutes. The note still says 15. Nothing tells the next agent that the note is now wrong, so it acts on it.
+
+Most memory systems have no link between what they remember and the code it was about. Old answers keep being served with the same confidence as new ones.
+
+## How quote evidence works
+
+A fact in Elmory quotes the code it relies on: one or more pieces of text copied exactly from git-tracked files in the worktree.
+
+- **At write time**, each quote must be found exactly once in its file. If it is not found, appears more than once, is too short, or looks like it contains a secret, the write is refused.
+- **At read time**, Elmory checks every quote again against the worktree that is asking. A fact is served only while every quote is still found there.
+
+If a quoted line changes or disappears, the fact becomes `suspect`. If the quoted file is deleted, it becomes `stale`. Neither is served by default. If nothing holds up, recall answers "I don't know" instead of guessing.
+
+Changes to whitespace, quote style and trailing commas inside a quote are tolerated. Other edits inside a quote, including inserted comments, make the fact suspect.
+
+State is never stored. It is derived for the worktree that asks, so a branch where the code differs gets a different answer.
+
+## Facts and notes
+
+Not everything has code to quote.
+
+- **Facts** rest on code. They carry at least one quote and are served only while every quote is found.
+- **Notes** are for decisions and preferences. They have no quotes, are labelled "not code-checked", and are ranked below facts.
+
+## Other guarantees
+
+- **Explicit replacement.** A newer record replaces an older one through an explicit `supersedes` link. Time never decides which record is newer.
+- **Trust before serving.** Records arriving from other people are not served until they are trusted.
+- **Forget deletes.** `forget` really deletes the record, and reports the copies it could not reach.
+
+## What Elmory is not
+
+- **Not chat memory or RAG.** Elmory does not store conversations or index documents for retrieval. It stores small, checked records about a codebase.
+- **Not proof that a claim is true.** An unchanged quote only means the code the fact relied on is still there. It does not make the claim correct. The label on each fact says how far the evidence goes, and agents are told to open the quoted file before acting on a fact.

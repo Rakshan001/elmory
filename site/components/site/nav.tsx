@@ -9,6 +9,7 @@ const LINKS = [
   { href: "/#states", label: "States" },
   { href: "/#compare", label: "Compare" },
   { href: "/#faq", label: "FAQ" },
+  { href: "/docs", label: "Docs" },
 ];
 
 export function Nav() {
@@ -27,12 +28,17 @@ export function Nav() {
             </li>
           ))}
         </ul>
-        <Button asChild variant="outline" className="surface h-9 px-4">
-          <a href={SITE.repo} target="_blank" rel="noreferrer">
-            GitHub
-            <ArrowUpRight data-icon="inline-end" />
-          </a>
-        </Button>
+        <div className="flex items-center gap-1">
+          <Link href="/docs" className="rounded-full px-3 py-2 text-sm text-muted-foreground hover:text-foreground md:hidden">
+            Docs
+          </Link>
+          <Button asChild variant="outline" className="surface h-9 px-4">
+            <a href={SITE.repo} target="_blank" rel="noreferrer">
+              GitHub
+              <ArrowUpRight data-icon="inline-end" />
+            </a>
+          </Button>
+        </div>
       </nav>
     </header>
   );
