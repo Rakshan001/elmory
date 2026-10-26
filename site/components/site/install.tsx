@@ -55,9 +55,9 @@ export function Install() {
         </Reveal>
         <Reveal className="min-w-0">
           <Tabs defaultValue="source">
-            <TabsList className="h-10 rounded-full p-1">
+            <TabsList className="h-10 p-1">
               {OPTIONS.map((o) => (
-                <TabsTrigger key={o.id} value={o.id} className="rounded-full px-3 sm:px-4">
+                <TabsTrigger key={o.id} value={o.id} className="px-3 sm:px-4">
                   {o.label}
                 </TabsTrigger>
               ))}

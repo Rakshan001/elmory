@@ -46,10 +46,6 @@ export function States() {
         </Reveal>
         <Reveal className="md:col-span-4">
           <div className="surface relative flex h-full min-h-60 flex-col justify-between overflow-hidden rounded-xl p-7 md:p-9">
-            <div
-              aria-hidden
-              className="absolute inset-0 [background-image:radial-gradient(color-mix(in_oklab,var(--foreground)_16%,transparent)_1px,transparent_1px)] [background-size:16px_16px] [mask-image:linear-gradient(to_left,black,transparent_70%)]"
-            />
             <NotebookPen className="relative size-6" strokeWidth={1.75} />
             <div className="relative">
               <h3 className="text-2xl font-semibold tracking-tight">Note</h3>

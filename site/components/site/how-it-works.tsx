@@ -69,11 +69,7 @@ export function HowItWorks() {
             {STEPS.map((s) => (
               <TabsContent key={s.id} value={s.id} className="min-w-0">
                 <div className="h-full rounded-xl bg-panel p-2 text-panel-foreground">
-                  <div className="flex gap-1.5 px-3 py-2.5" aria-hidden>
-                    <span className="size-2.5 rounded-full bg-white/15" />
-                    <span className="size-2.5 rounded-full bg-white/15" />
-                    <span className="size-2.5 rounded-full bg-white/15" />
-                  </div>
+                  <p className="px-3 py-2.5 font-mono text-xs text-panel-muted">terminal</p>
                   <pre className="code-wrap rounded-lg bg-white/[0.04] p-5 font-mono text-[12.5px] leading-6">
                     <code>{s.out}</code>
                   </pre>

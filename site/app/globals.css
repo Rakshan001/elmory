@@ -41,7 +41,8 @@
 
 /*
  * Monochrome: ink on near-white, near-white on ink in dark mode. No accent colour.
- * Shape rule: cards 12px (rounded-xl), nested blocks 8px (rounded-lg), buttons and badges full pill.
+ * Shape rule: cards 12px (rounded-xl), nested blocks 8px (rounded-lg), buttons and controls 6px (rounded-md).
+ * No pills, badges or decorative dots.
  */
 :root {
   --background: #fafafa;
