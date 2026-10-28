@@ -1,5 +1,5 @@
-// §14 scale (I5): 5 000 records over 200 quoted files. Loose bounds so a slow machine does not
-// fail it; skipped when CI is set (shared runners are too noisy for timings).
+// §14 scale (I5): 5 000 records over 200 quoted files. Timing bounds only, so it runs under
+// `npm run test:timing` on a quiet machine and is skipped by `npm test` and in CI.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -23,7 +23,7 @@ function percentile(sorted: number[], p: number): number {
   return sorted[Math.min(sorted.length - 1, Math.ceil((p / 100) * sorted.length) - 1)] as number;
 }
 
-describe.skipIf(process.env.CI !== undefined && process.env.CI !== '')('scale (§14, I5)', () => {
+describe.skipIf(process.env.ELMORY_TIMING !== '1')('scale (§14, I5)', () => {
   let root = '';
   let e: Elmory;
 
