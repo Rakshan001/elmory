@@ -16,6 +16,7 @@ import { CallToolRequestSchema, type CallToolResult, ListToolsRequestSchema } fr
 import { ConflictError, Elmory, RefusedError, type RememberInput } from './api.js';
 import type { State } from './derive.js';
 import { RecordError, TAGS, type Tag } from './record.js';
+import { packageVersion } from './version.js';
 import { resolveWorktree } from './worktree.js';
 
 const STATES: readonly State[] = ['candidate', 'forgotten', 'superseded', 'conflict', 'stale', 'suspect', 'unknown', 'active'];
@@ -290,7 +291,7 @@ async function main(): Promise<void> {
     worktree: await resolveWorktree(process.env.ELMORY_WORKTREE || process.env.CLAUDE_PROJECT_DIR || process.cwd()),
     observer,
   });
-  const mcp = new McpServer({ name: 'elmory', version: '0.0.0' }, { capabilities: { tools: {} } });
+  const mcp = new McpServer({ name: 'elmory', version: packageVersion() }, { capabilities: { tools: {} } });
   const byName = new Map(TOOLS.map((t) => [t.name, t]));
   mcp.server.setRequestHandler(ListToolsRequestSchema, () => ({
     tools: TOOLS.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })),
