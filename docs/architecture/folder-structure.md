@@ -6,7 +6,8 @@ elmory/
 ├── LICENSE                   MIT
 ├── package.json              zero runtime deps in the core; @modelcontextprotocol/sdk for the MCP front end only
 ├── tsconfig.json             strict, NodeNext ESM, declarations into dist/
-├── vitest.config.ts          test/**/*.test.ts
+├── vitest.config.ts          test/**/*.test.ts (`npm test`; also the prepublishOnly gate)
+├── vitest.timing.config.ts   timing bounds only (`npm run test:timing`, on a quiet machine)
 ├── .gitignore                node_modules, dist, *.db*, .superpowers (agent scratch)
 │
 ├── src/                      the library — one file per responsibility (spec §3 module map)

@@ -15,7 +15,8 @@
     "lint": "tsc --noEmit",
     "pretest": "tsc",
     "prepublishOnly": "npm run build && npm test",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:timing": "vitest run --config vitest.timing.config.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.32.1"
