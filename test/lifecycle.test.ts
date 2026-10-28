@@ -64,6 +64,41 @@ const cases: [string, (wt: string) => void, Expect][] = [
     },
     'served',
   ],
+  [
+    'a move, not committed',
+    (wt) => {
+      fs.mkdirSync(path.join(wt, 'lib'));
+      fs.renameSync(path.join(wt, FILE), path.join(wt, 'lib/auth.ts'));
+    },
+    'served',
+  ],
+  [
+    'a move, staged with git mv',
+    (wt) => {
+      fs.mkdirSync(path.join(wt, 'lib'));
+      git(wt, 'mv', FILE, 'lib/auth.ts');
+    },
+    'served',
+  ],
+  [
+    'a move and edit, staged with git add -A',
+    (wt) => {
+      edit(wt, (s) => `// moved\n${s}`);
+      fs.mkdirSync(path.join(wt, 'lib'));
+      fs.renameSync(path.join(wt, FILE), path.join(wt, 'lib/auth.ts'));
+      git(wt, 'add', '-A');
+    },
+    'served',
+  ],
+  [
+    'a move, not committed, that changed the quote',
+    (wt) => {
+      edit(wt, (s) => s.replace('): boolean {', '): number {'));
+      fs.mkdirSync(path.join(wt, 'lib'));
+      fs.renameSync(path.join(wt, FILE), path.join(wt, 'lib/auth.ts'));
+    },
+    'suspect (not-found)',
+  ],
   ['the file deleted, not committed', (wt) => fs.rmSync(path.join(wt, FILE)), 'stale (deleted)'],
   [
     'the file deleted and committed',

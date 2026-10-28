@@ -10,6 +10,7 @@ const LINKS = [
   { href: "/#states", label: "States" },
   { href: "/#compare", label: "Compare" },
   { href: "/#faq", label: "FAQ" },
+  { href: "/benchmarks", label: "Benchmarks" },
   { href: "/docs", label: "Docs" },
 ];
 

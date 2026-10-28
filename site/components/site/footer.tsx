@@ -44,6 +44,9 @@ export function Footer() {
             <Link href="/docs" className="hover:text-panel-foreground">
               Docs
             </Link>
+            <Link href="/benchmarks" className="hover:text-panel-foreground">
+              Benchmarks
+            </Link>
             <a href={SITE.repo} target="_blank" rel="noreferrer" className="hover:text-panel-foreground">
               GitHub
             </a>
