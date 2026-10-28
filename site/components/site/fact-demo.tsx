@@ -153,6 +153,11 @@ export function FactDemo() {
           {edited ? "Undo the edit" : "Edit the code"}
         </button>
       </div>
+
+      {/* Says what this is, so it cannot be read as a live check or a measured result. */}
+      <p className="mt-3 border-t border-white/[0.06] px-1 pt-3 text-[11px] leading-4 text-panel-muted">
+        A replay of one real CLI run, not a live check or a benchmark.
+      </p>
     </motion.div>
   );
 }
