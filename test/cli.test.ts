@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -115,6 +115,30 @@ describe('elmory cli', () => {
     expect(human.out).toContain('## auth gate');
     expect(human.out).toContain(`id: ${written.id} · state: active`);
     expect(human.out).toContain('every request passes through checkToken');
+  }, 30000);
+
+  it('a fact on a file moved but not committed is still served, staged or not', async () => {
+    const { wt, run } = await setup();
+    const w = await run('remember', 'every request passes through checkToken', '--title', 'auth gate', '--quote', quoteArg, '--json');
+    expect(w, w.err).toMatchObject({ code: 0 });
+    fs.mkdirSync(path.join(wt, 'lib'));
+    const served = async (where: string) => {
+      const r = await run('recall', 'checkToken', '--json');
+      expect(r, `${where}: ${r.err}`).toMatchObject({ code: 0 });
+      expect((JSON.parse(r.out) as { served: { paths: string[] }[] }).served, where).toHaveLength(1);
+    };
+
+    // Plain mv: the new path is untracked.
+    fs.renameSync(path.join(wt, FILE), path.join(wt, 'lib/auth.ts'));
+    await served('plain mv');
+    // Staged with add -A.
+    execFileSync('git', ['add', '-A'], { cwd: wt });
+    await served('add -A');
+    // Back, then git mv.
+    execFileSync('git', ['reset', '-q', '--hard'], { cwd: wt });
+    fs.mkdirSync(path.join(wt, 'lib'), { recursive: true });
+    execFileSync('git', ['mv', FILE, 'lib/auth.ts'], { cwd: wt });
+    await served('git mv');
   }, 30000);
 
   it('conflict exits 3', async () => {

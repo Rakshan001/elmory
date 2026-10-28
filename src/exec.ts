@@ -8,8 +8,8 @@ export interface ExecResult {
   code: number;
 }
 
-/** Injectable process runner. Every git call in Elmory goes through one of these. */
-export type Exec = (file: string, args: string[], opts: { cwd: string }) => Promise<ExecResult>;
+/** Injectable process runner. Every git call in Elmory goes through one of these. `env` is added to the inherited environment. */
+export type Exec = (file: string, args: string[], opts: { cwd: string; env?: Record<string, string> }) => Promise<ExecResult>;
 
 const MAX_BUFFER = 64 * 1024 * 1024;
 
@@ -23,7 +23,13 @@ export const defaultExec: Exec = (file, args, opts) =>
     execFile(
       file,
       args,
-      { cwd: opts.cwd, maxBuffer: MAX_BUFFER, windowsHide: true, encoding: 'utf8' },
+      {
+        cwd: opts.cwd,
+        env: opts.env === undefined ? process.env : { ...process.env, ...opts.env },
+        maxBuffer: MAX_BUFFER,
+        windowsHide: true,
+        encoding: 'utf8',
+      },
       (err, stdout, stderr) => {
         if (err === null) {
           resolve({ stdout, stderr, code: 0 });

@@ -1,3 +1,6 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import type { Exec } from './exec.js';
 
 export interface RenameResult {
@@ -149,6 +152,42 @@ export class Git {
       }
     }
     return { status: 'same' };
+  }
+
+  /**
+   * Moves from HEAD to the working tree that are not committed yet, staged or not: HEAD path →
+   * working-tree path. Git pairs a rename only between paths it tracks, and a plain `mv` leaves
+   * the new path untracked, so the diff runs over a throwaway index holding HEAD's tree plus
+   * every non-ignored file as intent-to-add. The user's index is never written, and no file's
+   * bytes are stored: intent-to-add entries point at the empty blob, which git writes once if
+   * the repository lacks it. Any failure is an empty map, i.e. no move known.
+   */
+  async worktreeRenames(): Promise<Map<string, string>> {
+    const moves = new Map<string, string>();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'elmory-index-'));
+    const env = { GIT_INDEX_FILE: path.join(dir, 'index') };
+    try {
+      for (const args of [['read-tree', 'HEAD'], ['add', '--all', '--intent-to-add']]) {
+        if ((await this.exec('git', args, { cwd: this.worktree, env })).code !== 0) return moves;
+      }
+      const res = await this.exec('git', ['diff', '-M', '--name-status', '-z', 'HEAD'], { cwd: this.worktree, env });
+      if (res.code !== 0) return moves;
+      const parts = splitZ(res.stdout);
+      for (let i = 0; i < parts.length; ) {
+        const kind = (parts[i] ?? '').charAt(0);
+        if (kind === 'R' || kind === 'C') {
+          const from = parts[i + 1];
+          const to = parts[i + 2];
+          if (kind === 'R' && from !== undefined && to !== undefined) moves.set(from, to);
+          i += 3;
+        } else {
+          i += 2;
+        }
+      }
+      return moves;
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   }
 
   /**

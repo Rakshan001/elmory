@@ -70,6 +70,7 @@ export class Evidence {
   #maps = new Map<string, AnchorMap>();
   #renames = new Map<string, Record<string, RenameResultJson>>();
   #tree: Promise<string | null> | null = null;
+  #moves: Promise<Map<string, string>> | null = null;
 
   constructor(opts: { worktree: string; cache: Cache; git: Git | null }) {
     this.#root = fs.realpathSync(opts.worktree);
@@ -83,6 +84,7 @@ export class Evidence {
     this.#maps.clear();
     this.#renames.clear();
     this.#tree = null;
+    this.#moves = null;
   }
 
   /** sha256 hex of the file's bytes, via the stat cache (§4.3 read step 1); null when missing or unreadable. */
@@ -148,9 +150,14 @@ export class Evidence {
       if (!followRename) return report('stale', 'deleted');
       const r = await this.#rename(src.commit, relPath);
       if (r.status === 'unknown') return report('unknown', 'unreachable-commit');
-      // 'same' with the file gone means it was removed from this worktree's working tree.
-      if (r.status !== 'renamed' || r.newPath === undefined) return report('stale', 'deleted');
-      const moved = await this.#checkQuote(src, r.newPath, false);
+      // Where HEAD has the file. Deleted in HEAD's history leaves nothing to follow.
+      const atHead = r.status === 'same' ? relPath : r.status === 'renamed' ? r.newPath : undefined;
+      if (atHead === undefined) return report('stale', 'deleted');
+      // Gone from its HEAD path too: it may have been moved and not committed yet. Without such
+      // a move it was removed from this worktree's working tree.
+      const to = this.#probe(atHead).kind === 'missing' ? (await this.#worktreeMoves()).get(atHead) : atHead;
+      if (to === undefined) return { outcome: 'stale', detail: 'deleted', path: atHead };
+      const moved = await this.#checkQuote(src, to, false);
       return moved.detail === 'found' ? { ...moved, detail: 'renamed' } : moved;
     }
     if (p.kind === 'unreadable') return report('unknown', 'unreadable');
@@ -202,6 +209,15 @@ export class Evidence {
     }
     const sha1 = createHash('sha1').update(bytes).digest('hex').slice(0, 12);
     return sha1 === src.legacyFile ? report('holds', 'legacy-match') : report('suspect', 'legacy-mismatch');
+  }
+
+  /**
+   * Uncommitted moves, HEAD path → working-tree path: one lookup per request, never persisted
+   * (the working tree changes without HEAD's tree changing).
+   */
+  #worktreeMoves(): Promise<Map<string, string>> {
+    this.#moves ??= this.#git === null ? Promise.resolve(new Map()) : this.#git.worktreeRenames();
+    return this.#moves;
   }
 
   /**

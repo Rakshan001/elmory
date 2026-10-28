@@ -56,6 +56,15 @@ async function commitAll(wt: string, message: string): Promise<string> {
   return (await git(wt, 'rev-parse', 'HEAD')).trim();
 }
 
+/** The loose object ids in `wt`'s repository. */
+function looseObjects(wt: string): string[] {
+  const dir = path.join(wt, '.git', 'objects');
+  return fs
+    .readdirSync(dir)
+    .filter((d) => /^[0-9a-f]{2}$/.test(d))
+    .flatMap((d) => fs.readdirSync(path.join(dir, d)).map((f) => d + f));
+}
+
 function openCache(): Cache {
   const c = Cache.open('evidence-test', tmp());
   caches.push(c);
@@ -248,6 +257,67 @@ describe('Evidence', () => {
     const cache = openCache();
     await git(wt, 'rm', '-q', 'src/price.ts');
     await commitAll(wt, 'delete');
+    expect(await evidence(wt, cache).check(src)).toEqual({ outcome: 'stale', detail: 'deleted', path: 'src/price.ts' });
+  });
+
+  it('a file moved but not committed holds at the new path, staged or not', async () => {
+    const { wt, head, src } = await setup();
+    const cache = openCache();
+    const tree = (await git(wt, 'rev-parse', 'HEAD^{tree}')).trim();
+    const expected = { outcome: 'holds', detail: 'renamed', path: 'lib/price.ts' };
+    fs.mkdirSync(path.join(wt, 'lib'));
+
+    // Plain mv, with an edit elsewhere in the file: the new path is untracked.
+    fs.renameSync(path.join(wt, 'src/price.ts'), path.join(wt, 'lib/price.ts'));
+    fs.appendFileSync(path.join(wt, 'lib/price.ts'), 'export const VAT = 0.2;\n');
+    const status = await git(wt, 'status', '--porcelain');
+    const objects = looseObjects(wt);
+    expect(await evidence(wt, cache).check(src)).toEqual(expected);
+    // The user's index is left as it was, and no file's bytes were stored (only the empty blob).
+    expect(await git(wt, 'status', '--porcelain')).toBe(status);
+    const empty = path.join(tmp(), 'empty');
+    fs.writeFileSync(empty, '');
+    const emptyBlob = (await git(wt, 'hash-object', empty)).trim();
+    expect(looseObjects(wt).filter((o) => !objects.includes(o) && o !== emptyBlob)).toEqual([]);
+
+    await git(wt, 'add', '-A');
+    expect(await evidence(wt, cache).check(src)).toEqual(expected);
+
+    await git(wt, 'reset', '-q', '--hard');
+    fs.mkdirSync(path.join(wt, 'lib'), { recursive: true });
+    await git(wt, 'mv', 'src/price.ts', 'lib/price.ts');
+    expect(await evidence(wt, cache).check(src)).toEqual(expected);
+
+    // A working-tree move is never persisted: the tree did not change, the working tree may.
+    expect(cache.getRename(head, tree)?.['src/price.ts']).not.toMatchObject({ status: 'renamed' });
+    await git(wt, 'mv', 'lib/price.ts', 'src/price.ts');
+    expect(await evidence(wt, cache).check(src)).toEqual({ outcome: 'holds', detail: 'found', path: 'src/price.ts' });
+  });
+
+  it('a file moved but not committed is suspect when the quote changed on the way', async () => {
+    const { wt, src } = await setup();
+    const cache = openCache();
+    fs.mkdirSync(path.join(wt, 'lib'));
+    fs.rmSync(path.join(wt, 'src/price.ts'));
+    fs.writeFileSync(path.join(wt, 'lib/price.ts'), FILE.replace('taxRate: number', 'taxRate: bigint'));
+    expect(await evidence(wt, cache).check(src)).toEqual({ outcome: 'suspect', detail: 'not-found', path: 'lib/price.ts' });
+  });
+
+  it('a committed move followed by an uncommitted one holds at the latest path', async () => {
+    const { wt, src } = await setup();
+    const cache = openCache();
+    await git(wt, 'mv', 'src/price.ts', 'src/pricing.ts');
+    await commitAll(wt, 'rename');
+    fs.mkdirSync(path.join(wt, 'lib'));
+    fs.renameSync(path.join(wt, 'src/pricing.ts'), path.join(wt, 'lib/pricing.ts'));
+    expect(await evidence(wt, cache).check(src)).toEqual({ outcome: 'holds', detail: 'renamed', path: 'lib/pricing.ts' });
+  });
+
+  it('a file deleted but not committed is stale, whatever else is untracked', async () => {
+    const { wt, src } = await setup();
+    const cache = openCache();
+    fs.rmSync(path.join(wt, 'src/price.ts'));
+    fs.writeFileSync(path.join(wt, 'notes.md'), '# unrelated\n');
     expect(await evidence(wt, cache).check(src)).toEqual({ outcome: 'stale', detail: 'deleted', path: 'src/price.ts' });
   });
 

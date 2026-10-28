@@ -248,6 +248,11 @@ They are what decisions, preferences, council verdicts and handoff decisions are
    - Renamed: check the new path.
    - Commit unreachable: `unknown`.
    - Deleted: `stale`.
+   - Still at HEAD (or renamed) but missing from the working tree: the move may not be
+     committed yet. Run `git diff -M --name-status HEAD` over a throwaway index (`read-tree
+     HEAD`, then `add --all --intent-to-add`, so a plain `mv`'s untracked target is paired too),
+     once per request and never cached. Renamed: check that path. Otherwise: `stale`. The
+     user's index is not touched; only the empty blob may be written.
 5. Over 1 MB, or unreadable: `unknown`.
 
 ### 4.4 Index-time checks (every record, wherever it came from)
