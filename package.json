@@ -1,14 +1,23 @@
 {
   "name": "elmory",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Evidence-checked memory for coding agents: facts quote the code they rely on and are served only while the quote still holds.",
   "type": "module",
   "license": "MIT",
-  "engines": { "node": ">=24" },
+  "engines": {
+    "node": ">=24"
+  },
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
-  "bin": { "elmory": "dist/cli.js", "elmory-mcp": "dist/mcp.js" },
-  "files": ["dist", "README.md", "LICENSE"],
+  "bin": {
+    "elmory": "dist/cli.js",
+    "elmory-mcp": "dist/mcp.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc",
     "prepare": "tsc",
@@ -20,7 +29,22 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.32.1"
   },
-  "repository": { "type": "git", "url": "git+https://github.com/Rakshan001/elmory.git" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Rakshan001/elmory.git"
+  },
+  "homepage": "https://github.com/Rakshan001/elmory#readme",
+  "bugs": {
+    "url": "https://github.com/Rakshan001/elmory/issues"
+  },
+  "keywords": [
+    "mcp",
+    "memory",
+    "coding-agents",
+    "claude-code",
+    "agent-memory",
+    "cli"
+  ],
   "devDependencies": {
     "@types/node": "^24.0.0",
     "typescript": "^5.9.0",

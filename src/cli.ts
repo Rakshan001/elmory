@@ -14,6 +14,7 @@ import type { State } from './derive.js';
 import { type ForgetPreviewScope, type ForgetScope, previewForget } from './forget.js';
 import type { RememberInput } from './gate.js';
 import type { Tag } from './record.js';
+import { packageVersion } from './version.js';
 import { resolveWorktree } from './worktree.js';
 
 const EXIT_OK = 0;
@@ -447,16 +448,6 @@ function helpText(): string {
   ].join('\n');
 }
 
-/** The package version, from the package.json next to dist/. */
-function version(): string {
-  try {
-    const pkg = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version?: unknown };
-    return typeof pkg.version === 'string' ? pkg.version : 'unknown';
-  } catch {
-    return 'unknown';
-  }
-}
-
 /** Outside any git repository, with no `.elmory` in the directory: opening would create a store. */
 async function noStoreAt(worktree: string): Promise<boolean> {
   if (fs.existsSync(path.join(worktree, '.elmory'))) return false;
@@ -524,7 +515,7 @@ async function main(argv: string[]): Promise<number> {
   const { name, rest } = splitVerb(argv);
   let json = rest.includes('--json');
   if (name === '--version' || name === '-V') {
-    process.stdout.write(`${json ? JSON.stringify({ version: version() }) : `elmory ${version()}`}\n`);
+    process.stdout.write(`${json ? JSON.stringify({ version: packageVersion() }) : `elmory ${packageVersion()}`}\n`);
     return EXIT_OK;
   }
   if (name === undefined || name === 'help' || name === '--help' || name === '-h') {

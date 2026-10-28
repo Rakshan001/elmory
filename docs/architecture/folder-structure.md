@@ -4,6 +4,7 @@
 elmory/
 ├── README.md                 what it is, install, the three agent rules, doc index
 ├── LICENSE                   MIT
+├── .github/workflows/        publish.yml: a GitHub release publishes to npm (docs/RELEASING.md)
 ├── package.json              zero runtime deps in the core; @modelcontextprotocol/sdk for the MCP front end only
 ├── tsconfig.json             strict, NodeNext ESM, declarations into dist/
 ├── vitest.config.ts          test/**/*.test.ts
@@ -25,6 +26,7 @@ elmory/
 │   ├── forget.ts             ordered delete, cascade, compaction retry, report
 │   ├── api.ts                the Elmory object: wires everything, emits events
 │   ├── cli.ts                `elmory <verb>` (node:util.parseArgs)
+│   ├── version.ts            the package version, shared by the CLI and the MCP handshake
 │   └── mcp.ts                stdio MCP server (the only file that imports the MCP SDK)
 │
 ├── test/                     vitest; every test uses its own mkdtemp dir, never the repo
@@ -32,6 +34,7 @@ elmory/
 │   └── <module>.test.ts      one file per src module, plus integration files (worktrees, crash, forget-audit)
 │
 └── docs/
+    ├── RELEASING.md          how to publish a version to npm
     ├── architecture/         HLD and this file
     │   ├── 2026-10-22-hld.md
     │   └── folder-structure.md

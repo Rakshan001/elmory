@@ -1,22 +1,25 @@
-export const meta = { title: "Quickstart", description: "Install Elmory from source, save a first fact, recall it, and see an abstain.", order: 2 };
+export const meta = { title: "Quickstart", description: "Install Elmory from npm, save a first fact, recall it, and see an abstain.", order: 2 };
 
 ## Requirements
 
 - Node 24 or newer. The core has no runtime dependencies beyond Node itself (`node:sqlite`, `node:crypto`). The MCP server adds the MCP SDK.
 - git 2.31 or newer. Signature attribution uses `git log --diff-merges=separate`.
 
-## Install from source
+## Install
 
-Elmory is not on npm yet. Until it is, clone the repository, build it, and link it:
+```bash
+npm i -g elmory
+elmory --version
+```
+
+This gives you two commands: `elmory` (the CLI) and `elmory-mcp` (the MCP server).
+
+To work on Elmory itself, install from source instead:
 
 ```bash
 git clone https://github.com/Rakshan001/elmory.git && cd elmory
 npm install && npm run build && npm link
 ```
-
-This gives you two commands: `elmory` (the CLI) and `elmory-mcp` (the MCP server).
-
-Once Elmory is published, `npm i -g elmory` will install the same two commands.
 
 ## Save a first fact
 

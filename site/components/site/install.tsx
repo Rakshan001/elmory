@@ -6,10 +6,9 @@ import { Reveal } from "./reveal";
 // Commands match the Install and MCP sections of the README.
 const OPTIONS = [
   {
-    id: "source",
+    id: "npm",
     label: "Install",
-    code: `git clone https://github.com/Rakshan001/elmory.git && cd elmory
-npm install && npm run build && npm link`,
+    code: `npm i -g elmory`,
   },
   {
     id: "claude",
@@ -41,8 +40,8 @@ export function Install() {
             Install the CLI, then connect any agent that runs MCP servers over stdio.
           </p>
           <p className="mt-6 max-w-[40ch] text-sm leading-relaxed text-muted-foreground">
-            Needs Node 24 or newer and git 2.31 or newer. Elmory is not on npm yet, so install from source until the
-            first release.
+            Needs Node 24 or newer and git 2.31 or newer. One install gives both commands:{" "}
+            <code className="font-mono">elmory</code> and <code className="font-mono">elmory-mcp</code>.
           </p>
           <Link
             href="/docs/quickstart"

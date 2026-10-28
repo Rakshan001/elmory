@@ -48,6 +48,11 @@ async function call(client: Client, name: string, args: Record<string, unknown>)
 }
 
 describe('mcp server', () => {
+  it('reports the package version', async () => {
+    const pkg = JSON.parse(fs.readFileSync(path.join(path.dirname(SERVER), '..', 'package.json'), 'utf8')) as { version: string };
+    expect((await connect()).getServerVersion()).toEqual({ name: 'elmory', version: pkg.version });
+  });
+
   it('lists the nine tools; approving is CLI-only (I4)', async () => {
     const client = await connect();
     const { tools } = await client.listTools();

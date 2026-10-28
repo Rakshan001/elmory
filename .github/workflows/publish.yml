@@ -1,0 +1,28 @@
+# Publishing a GitHub release publishes that version to npm. No npm token is stored: npm trusts
+# this workflow through OIDC (trusted publishing), set up once on npmjs.com (docs/RELEASING.md).
+name: Publish to npm
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      # Trusted publishing needs npm 11.5.1 or newer.
+      - run: npm install -g npm@^11.5.1
+      # The tag must name the version being published: v0.1.0 publishes 0.1.0.
+      - run: test "v$(node -p "require('./package.json').version")" = "$GITHUB_REF_NAME"
+      - run: npm ci
+      # prepublishOnly builds and runs `npm test` first; a failing test stops the publish.
+      - run: npm publish

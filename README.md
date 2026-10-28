@@ -17,18 +17,23 @@ Release 1 covers coding agents only. The core is TypeScript on Node ≥ 24 with 
 dependencies (`node:sqlite`, `node:crypto`); the MCP server adds the MCP SDK. It needs git ≥ 2.31
 (signature attribution uses `git log --diff-merges=separate`).
 
-**Status:** release 1 core complete, unpublished. It is not on npm yet; until it is, install
-from source (below).
+**Status:** release 1, published on npm as [`elmory`](https://www.npmjs.com/package/elmory).
 
 ## Install
 
 ```bash
-npm i -g elmory            # once published: gives `elmory` (CLI) and `elmory-mcp` (MCP server)
+npm i -g elmory            # gives `elmory` (CLI) and `elmory-mcp` (MCP server)
+elmory --version
+```
 
-# from source, until then
+From source, to work on Elmory itself:
+
+```bash
 git clone https://github.com/Rakshan001/elmory.git && cd elmory
 npm install && npm run build && npm link
 ```
+
+Releasing a new version: [docs/RELEASING.md](docs/RELEASING.md).
 
 ## Connect an agent (MCP)
 
