@@ -50,6 +50,9 @@ export function Footer() {
             <a href={SITE.repo} target="_blank" rel="noreferrer" className="hover:text-panel-foreground">
               GitHub
             </a>
+            <a href={SITE.npm} target="_blank" rel="noreferrer" className="hover:text-panel-foreground">
+              npm
+            </a>
             <span>MIT licensed</span>
           </div>
         </div>

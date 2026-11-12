@@ -1,5 +1,5 @@
 # Publishing a GitHub release publishes that version to npm. No npm token is stored: npm trusts
-# this workflow through OIDC (trusted publishing), set up once on npmjs.com (docs/RELEASING.md).
+# this workflow through OIDC (trusted publishing), set up once on npmjs.com.
 name: Publish to npm
 
 on:
