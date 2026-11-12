@@ -1,5 +1,9 @@
 # Elmory
 
+[![npm](https://img.shields.io/npm/v/elmory)](https://www.npmjs.com/package/elmory)
+[![license](https://img.shields.io/npm/l/elmory)](LICENSE)
+[![node](https://img.shields.io/node/v/elmory)](https://nodejs.org)
+
 Evidence-checked memory for coding agents. Elmory stores what agents learn about a codebase as
 small immutable Markdown records.
 
@@ -17,23 +21,26 @@ Release 1 covers coding agents only. The core is TypeScript on Node ≥ 24 with 
 dependencies (`node:sqlite`, `node:crypto`); the MCP server adds the MCP SDK. It needs git ≥ 2.31
 (signature attribution uses `git log --diff-merges=separate`).
 
-**Status:** release 1, published on npm as [`elmory`](https://www.npmjs.com/package/elmory).
-
 ## Install
+
+Elmory is on npm as [`elmory`](https://www.npmjs.com/package/elmory). There is no need to clone
+this repository to use it:
 
 ```bash
 npm i -g elmory            # gives `elmory` (CLI) and `elmory-mcp` (MCP server)
 elmory --version
 ```
 
-From source, to work on Elmory itself:
+To work on Elmory itself, build from source:
 
 ```bash
 git clone https://github.com/Rakshan001/elmory.git && cd elmory
 npm install && npm run build && npm link
 ```
 
-Releasing a new version: [docs/RELEASING.md](docs/RELEASING.md).
+The website (landing page and docs) is a separate Next.js app in `site/`; nothing in it ships in
+the npm package. Run it with `cd site && npm install && npm run dev`, and set
+`NEXT_PUBLIC_SITE_URL` to the deployed URL for canonical links, the sitemap and robots.txt.
 
 ## Connect an agent (MCP)
 
@@ -115,7 +122,7 @@ comes back as an error result with `{ error, reason | heads }`.
    true; the label tells you how far the evidence goes.
 3. **An abstain means "I don't know".** Do not guess past it; read the code instead.
 
-The same rules are in the `elmory_recall` tool description and in [AGENTS.md](AGENTS.md).
+The same rules are in the `elmory_recall` tool description, so every connected agent sees them.
 
 ## CLI
 
@@ -213,33 +220,25 @@ there until it is deleted in that worktree.
   and remembers one sync stamp, so the first read after another worktree synced re-reads this
   worktree's record files (about 0.15 s at 5 000 records) instead of trusting the stamp.
 
-## Differences from the spec
+## Behaviour details
 
-Release 1 differs from [the spec](docs/specs/2026-10-21-elmory-memory-design.md) here:
-
-- **No `resolve` verb (§6.3).** Resolve a conflict with `remember` or `note` passing every head
+- **No `resolve` verb.** Resolve a conflict with `remember` or `note` passing every head
   in `--supersedes a,b`; the write gate's compare-and-set is the same.
-- **The short-quote rule is "one line", not "one whole line" (§4.3).** A quote under 16 tokens
+- **Short quotes sit on one line.** A quote under 16 tokens
   must sit on one line with at least 3 word tokens and 24 non-space characters, and may be part
   of that line; longer quotes may span lines. Either way it must be unique in the file.
-- **Superseded records are filtered after derivation, not in the search (§7.2).** Whether a
+- **Superseded records are filtered after derivation, not in the search.** Whether a
   record is superseded depends on whether its successor holds in this worktree, so the search
   is not pre-filtered; recall pages through the ranked hits instead.
-- **A tombstoned record file that comes back is indexed without its text (§4.6)** rather than
+- **A tombstoned record file that comes back is indexed without its text** rather than
   deleted again, so forgotten bytes never re-enter the cache and the record stays forgotten.
 - **No approve tool over MCP.** Approval is a human act, so `approve` and `reject` are CLI-only,
   and `elmory_review` results carry a note that their titles are untrusted data.
 
 ## Docs
 
-| What | Where |
-|---|---|
-| Architecture and plan (current, v3.1) | [docs/specs/2026-10-21-elmory-memory-design.md](docs/specs/2026-10-21-elmory-memory-design.md) |
-| Earlier five-type design (v2, history) | [docs/specs/history/](docs/specs/history/) |
-| Research, design reviews, decision records, prototypes | private repo `elmory-internal` (see [docs/INTERNAL.md](docs/INTERNAL.md)) |
-
-These docs were written while Elmory was planned inside the Baton repo. Paths such as
-`src/memory.ts` in the spec's Baton integration section refer to Baton, not to this repo.
+The website docs cover the quickstart, connecting agents, concepts, the CLI, storage and known
+limits. Their source is in [`site/content/docs/`](site/content/docs/).
 
 ## License
 

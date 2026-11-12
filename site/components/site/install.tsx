@@ -7,7 +7,7 @@ import { Reveal } from "./reveal";
 const OPTIONS = [
   {
     id: "npm",
-    label: "Install",
+    label: "npm",
     code: `npm i -g elmory`,
   },
   {
@@ -37,7 +37,7 @@ export function Install() {
           <p className="font-mono text-xs text-muted-foreground">Install</p>
           <h2 className="mt-3 text-3xl font-semibold tracking-[-0.04em] md:text-[2.5rem]">Get started</h2>
           <p className="mt-4 max-w-[40ch] text-lg leading-relaxed text-muted-foreground">
-            Install the CLI, then connect any agent that runs MCP servers over stdio.
+            Install the package from npm, then connect any agent that runs MCP servers over stdio.
           </p>
           <p className="mt-6 max-w-[40ch] text-sm leading-relaxed text-muted-foreground">
             Needs Node 24 or newer and git 2.31 or newer. One install gives both commands:{" "}

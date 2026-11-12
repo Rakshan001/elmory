@@ -4,7 +4,11 @@ import { useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { Check, Copy } from "lucide-react";
 
-export function CopyButton({ text }: { text: string }) {
+const PANEL =
+  "absolute top-3 right-3 inline-flex h-8 items-center gap-1.5 rounded-md bg-white/10 px-3 text-xs text-panel-foreground transition hover:bg-white/15 active:scale-[0.98] focus-visible:ring-3 focus-visible:ring-white/40 focus-visible:outline-none";
+
+/** Copies `text`. Styled for the dark code panel unless `className` replaces it. */
+export function CopyButton({ text, className = PANEL }: { text: string; className?: string }) {
   const [state, setState] = useState<"idle" | "copied" | "failed">("idle");
 
   const copy = async () => {
@@ -22,7 +26,7 @@ export function CopyButton({ text }: { text: string }) {
       type="button"
       onClick={copy}
       aria-label="Copy to clipboard"
-      className="absolute top-3 right-3 inline-flex h-8 items-center gap-1.5 rounded-md bg-white/10 px-3 text-xs text-panel-foreground transition hover:bg-white/15 active:scale-[0.98] focus-visible:ring-3 focus-visible:ring-white/40 focus-visible:outline-none"
+      className={className}
     >
       <AnimatePresence mode="wait" initial={false}>
         <motion.span
