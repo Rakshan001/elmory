@@ -5,6 +5,7 @@ import {
   buildAnchorMap,
   checkQuoteAtWrite,
   containsSecret,
+  isPathShaped,
   isLongEnough,
   locate,
   quoteHash,
@@ -171,6 +172,64 @@ describe('containsSecret', () => {
 
   it('does not flag apiKey: process.env.STRIPE_API_KEY,', () => {
     expect(containsSecret('apiKey: process.env.STRIPE_API_KEY,')).toBe(false);
+  });
+
+  it('lets a long file path in a literal through, but only a path-shaped one', () => {
+    expect(containsSecret('see `src/components/dashboard/DataTableWrapper.tsx` for it')).toBe(false);
+    expect(containsSecret('import x from "./web/src/features/settings/DesktopProjectPanel";')).toBe(false);
+    expect(containsSecret('open `src/app/(dashboard)/admin/users/[id]/page.tsx`')).toBe(false);
+    expect(isPathShaped('docs/superpowers/specs/2026-11-05-paired-benchmark-design.md')).toBe(true);
+    // not paths: URL, credentials, a token cut into chunks by "/"
+    expect(isPathShaped('https://example.com/src/quote.ts')).toBe(false);
+    expect(isPathShaped('user@host/src/quote.ts')).toBe(false);
+    expect(isPathShaped('wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY')).toBe(false);
+    expect(isPathShaped('9f8e7d6c/5b4a3f2e/1d0c9b8a/7f6e5d4c')).toBe(false);
+    expect(isPathShaped('aZ3kQ9xL/2mW7pR4t/V8bN1cF6/hJ0dG5sY')).toBe(false);
+    expect(containsSecret('const u = "https://h.example.com/k3j9x2m4/p8q1w7e5/z6r0t2y4/b5n8v1c3";')).toBe(true);
+    expect(containsSecret('const p = "aZ3kQ9xL/2mW7pR4t/V8bN1cF6/hJ0dG5sY";')).toBe(true);
+  });
+
+  it('sets aside a trailing :line[:col] and a leading @ before the path test', () => {
+    expect(containsSecret('see `src/components/dashboard/DataTable.tsx:37` for it')).toBe(false);
+    expect(containsSecret('see `src/components/dashboard/DataTable.tsx:37:12` for it')).toBe(false);
+    expect(containsSecret('import { T } from "@/components/dashboard/DataTableWrapper";')).toBe(false);
+    expect(isPathShaped('user@host/components/dashboard/DataTable')).toBe(false);
+    expect(isPathShaped('host:8080/components/dashboard/DataTable')).toBe(false);
+  });
+
+  it('still flags secrets that are laid out like a path', () => {
+    for (const w of [
+      'keys/ab12cd/ef34gh/ij56kl/mn78op/qr90st',
+      'x/ab.12.cd.34.ef.56.gh.78.ij.90.kl.12.mn',
+      'admin/Welcome2024/Summer2025Winter',
+      'secret/prod/db/CorrectHorseBatteryStaple2024',
+      'lic/jlle-9362-wdag-1576-spwe-2655',
+      'k/BMWTO-MTRJU-QPXHV-KDNSL-WZCGF',
+      'keys/QZXVKJWPFHGTRMBNLCYD',
+      'keys/qzxvkjwpfhgtrmbnlcydaeiu',
+      'k3j9/x2m4/p8q1/w7e5/z6r0/t2y4',
+      'vokuzare/mipolenu/tacifoda/buwegyxi',
+    ]) {
+      expect(isPathShaped(w), w).toBe(false);
+      expect(containsSecret('const p = `' + w + '`;'), w).toBe(true);
+    }
+  });
+
+  it('flags an AWS secret access key, Stripe live keys and npm tokens', () => {
+    const aws = 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY';
+    expect(containsSecret(`aws_secret_access_key = ${aws}`)).toBe(true);
+    expect(containsSecret(`k = ${aws}`)).toBe(true);
+    expect(containsSecret('const k = `' + aws + '`;')).toBe(true);
+    expect(containsSecret('key: sk_live_' + 'a1B2'.repeat(6))).toBe(true);
+    expect(containsSecret('key: rk_live_' + 'a1B2'.repeat(6))).toBe(true);
+    expect(containsSecret('_authToken=npm_' + 'a1B2'.repeat(9))).toBe(true);
+    expect(containsSecret('key: sk_test_' + 'a1B2'.repeat(6))).toBe(true);
+    expect(containsSecret('WEBHOOK=whsec_' + 'a1B2'.repeat(8))).toBe(true);
+    // plain mixed-case alphanumerics are not an AWS key just because "secret" is nearby
+    expect(containsSecret('the secret is handleUserAuthenticationCallbackV2Wrapper1 here')).toBe(false);
+    // a 40-char git SHA and a 40-char path run are not AWS keys, even beside the word secret
+    expect(containsSecret('secret rotation landed in 3f2a9c1b4d5e6f708192a3b4c5d6e7f8091a2b3c')).toBe(false);
+    expect(containsSecret('risk_live_dashboard_overview_panel_wrapper')).toBe(false);
   });
 });
 
