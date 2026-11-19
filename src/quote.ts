@@ -100,7 +100,103 @@ const SECRET_PATTERNS: RegExp[] = [
   /AIza[0-9A-Za-z_-]{35}/,
   /eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}/,
   /(Bearer|Basic) [A-Za-z0-9._~+/=-]{20,}/,
+  /(?<![A-Za-z0-9])[sr]k_(?:live|test)_[A-Za-z0-9]{16,}/, // Stripe secret / restricted key
+  /(?<![A-Za-z0-9])whsec_[A-Za-z0-9+/=]{24,}/, // Stripe webhook signing secret
+  /(?<![A-Za-z0-9])npm_[A-Za-z0-9]{36}/,
 ];
+
+// An AWS secret access key has no prefix: 40 base64 characters, standing alone.
+const AWS_SECRET_RE = /(?<![A-Za-z0-9/+=])[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+=])/g;
+
+/**
+ * A 40-char base64 run with upper, lower and digit (a git SHA or a plain identifier lacks one)
+ * that is not a file path, and that either carries base64 punctuation ("/" or "+") or has
+ * entropy > 4.5. The words around it are not consulted.
+ */
+function hasAwsSecret(text: string): boolean {
+  for (const m of text.matchAll(AWS_SECRET_RE)) {
+    const run = m[0];
+    if (!/[A-Z]/.test(run) || !/[a-z]/.test(run) || !/[0-9]/.test(run) || isPathShaped(run)) continue;
+    if (/[/+]/.test(run) || entropy(run) > 4.5) return true;
+  }
+  return false;
+}
+
+// One path segment made of name parts joined by . _ - ~ and route brackets.
+const PATH_WORD_RE = /^[A-Za-z0-9._~()[\]/-]+$/;
+// lower, Capitalised and ALLCAPS parts in camel order; rejects wJalrXUtn-style case noise.
+const NAME_PART_RE = /^[a-z]*(?:[A-Z][a-z]+|[A-Z]{2,}(?![a-z]))*$/;
+const HUMP_RE = /[A-Z]?[a-z]+|[A-Z]+/g;
+const MAX_HUMP = 16;
+const VOWEL_RE = /[aeiouy]/i;
+const CONSONANT_RUN_RE = /[^aeiouy]{5,}/i;
+const FILE_EXT_RE = /\.[A-Za-z][A-Za-z0-9]{0,5}$/;
+// A word glued to a year-sized number (Welcome2024, 2025Winter); sha256 and es2022 stay names.
+const WORD_NUMBER_RE = /[A-Za-z]{4,}[0-9]{3,}|[0-9]{3,}[A-Za-z]{4,}/;
+
+/** Letters that read as a name: proper camel/kebab casing, no over-long hump, pronounceable. */
+function isNamePart(letters: string): boolean {
+  if (letters.length <= 2) return true; // v2, e2e, ui
+  if (!NAME_PART_RE.test(letters)) return false;
+  // Per hump, so DashboardScreen is not read as one word. A lone short word may lack a vowel
+  // (html, pngs, src); inside camel case a vowel-less hump is case noise (gxdjIkpSg).
+  const humps = letters.match(HUMP_RE) ?? [];
+  const bare = humps.length > 1 ? 3 : 5;
+  return humps.every(
+    (h) => h.length <= MAX_HUMP && (h.length < bare || VOWEL_RE.test(h)) && !CONSONANT_RUN_RE.test(h),
+  );
+}
+
+/** Four or more neighbouring groups of one length (≥ min): XXXXX-XXXXX-XXXXX-XXXXX. */
+function isKeyGrouped(parts: string[], min: number): boolean {
+  let same = 1;
+  for (let i = 1; i < parts.length; i++) {
+    same = (parts[i] as string).length >= min && (parts[i] as string).length === (parts[i - 1] as string).length ? same + 1 : 1;
+    if (same >= 4) return true;
+  }
+  return false;
+}
+
+/**
+ * True for a word that is a file path and nothing else. A leading "@" (import alias, package
+ * scope) and a trailing ":line[:col]" are set aside first. The rest must have a "/", no URL or
+ * credential punctuation (":" "@" "+" "=" "%" "?"), a file extension or a name of ≥ 5 letters,
+ * and segments built only from name parts and short numbers. A token cut into chunks fails on
+ * its letter-digit mixing, its casing, its over-long humps or its licence-key grouping.
+ */
+export function isPathShaped(word: string): boolean {
+  const path = word.replace(/^@/, '').replace(/(?::[0-9]{1,6}){1,2}$/, '');
+  if (!path.includes('/') || !PATH_WORD_RE.test(path)) return false;
+  const segs = path.split('/');
+  if (isKeyGrouped(segs, 6)) return false; // a token cut into even chunks by "/"
+  let hasName = FILE_EXT_RE.test(path);
+  let joins = 0;
+  for (const seg of segs) {
+    if (seg === '' || seg === '.' || seg === '..') continue;
+    if (WORD_NUMBER_RE.test(seg)) return false;
+    // A letter directly against a digit: i18n has two; more per segment, or more than four in
+    // the whole word (ab12cd/ef34gh/…), is token-like.
+    const direct = (seg.match(/[A-Za-z](?=[0-9])|[0-9](?=[A-Za-z])/g) ?? []).length;
+    joins += direct;
+    if (direct > 2 || joins > 4) return false;
+    const parts = seg.split(/[^A-Za-z0-9]+/).filter((p) => p !== '');
+    if (isKeyGrouped(parts, 3)) return false;
+    let switches = 0; // letters ↔ digits across the whole segment: ab.12.cd.34 alternates
+    let last = '';
+    for (const part of parts) {
+      for (const run of part.match(/[A-Za-z]+|[0-9]+/g) ?? []) {
+        const kind = /[0-9]/.test(run) ? 'd' : 'l';
+        if (last !== '' && kind !== last && ++switches > 3) return false;
+        last = kind;
+        if (kind === 'd') {
+          if (run.length > 4) return false;
+        } else if (!isNamePart(run)) return false;
+        else if (run.length >= 5) hasName = true;
+      }
+    }
+  }
+  return hasName;
+}
 
 // A literal between matching ' " or ` quotes; backslash escapes are skipped over.
 const LITERAL_RE = /'((?:[^'\\\n]|\\.)*)'|"((?:[^"\\\n]|\\.)*)"|`((?:[^`\\]|\\.)*)`/g;
@@ -120,14 +216,16 @@ function entropy(s: string): number {
 
 /**
  * A known key format anywhere in the text, or a string literal containing a whitespace-free
- * word of ≥ 20 chars with entropy > 4.0 bits/char.
+ * word of ≥ 20 chars with entropy > 4.0 bits/char that is not a plain file path.
  */
 export function containsSecret(text: string): boolean {
   if (SECRET_PATTERNS.some((re) => re.test(text))) return true;
+  if (hasAwsSecret(text)) return true;
   for (const m of text.matchAll(LITERAL_RE)) {
     const content = m[1] ?? m[2] ?? m[3] ?? '';
     // Checked per word: prose has no qualifying word, but a key embedded in a sentence does.
-    if (content.split(/\s+/).some((w) => [...w].length >= 20 && entropy(w) > 4.0)) return true;
+    // A file path is long and varied too; it is let through only when it is path-shaped.
+    if (content.split(/\s+/).some((w) => [...w].length >= 20 && entropy(w) > 4.0 && !isPathShaped(w))) return true;
   }
   return false;
 }

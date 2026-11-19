@@ -411,8 +411,12 @@ export class Elmory implements Context {
       const pending = new Set(this.store.ids('pending'));
       for (const id of ids ?? []) {
         if (pending.has(id)) continue;
-        if (this.store.readRecord(id)?.area === 'local') {
+        const area = this.store.readRecord(id)?.area;
+        if (area === 'local') {
           throw new gate.RefusedError(`${id} is local and is never published`, 'local');
+        }
+        if (area === 'facts') {
+          throw new gate.RefusedError(`${id} is already published`, 'unknown-id');
         }
         throw new gate.RefusedError(`no pending record ${id} to publish`, 'unknown-id');
       }

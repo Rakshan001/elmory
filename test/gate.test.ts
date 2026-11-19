@@ -732,8 +732,11 @@ describe('Elmory api fixes', () => {
     expect(thrown(() => e.publish(['not-an-id']))).toMatchObject({ name: 'RefusedError', reason: 'unknown-id' });
     expect(e.store.readRecord(a.id)?.area).toBe('pending');
     expect(e.publish([a.id])).toEqual([a.id]);
-    // published: no longer pending
-    expect(thrown(() => e.publish([a.id]))).toMatchObject({ name: 'RefusedError', reason: 'unknown-id' });
+    // published: no longer pending, and the message says so rather than "no pending record"
+    const again = thrown(() => e.publish([a.id]));
+    expect(again).toMatchObject({ name: 'RefusedError', reason: 'unknown-id' });
+    expect((again as Error).message).toBe(`${a.id} is already published`);
+    expect((thrown(() => e.publish([missing])) as Error).message).toBe(`no pending record ${missing} to publish`);
     expect(e.publish([])).toEqual([]);
   });
 
